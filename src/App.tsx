@@ -859,7 +859,7 @@ function Library({
                         ) : (
                           <>
                             <Github size={11} />
-                            {skill.author || skill.source}
+                            {skill.source}
                           </>
                         )}
                       </span>

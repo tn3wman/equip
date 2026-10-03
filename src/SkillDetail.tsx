@@ -200,7 +200,7 @@ export default function SkillDetail({
             ) : (
               <>
                 <Github size={13} />
-                {skill.author}
+                {skill.source}
                 <a
                   href={
                     skill.source.startsWith("http")
