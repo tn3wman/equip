@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -57,5 +57,25 @@ test("generated Unix launcher executes from a quoted custom install path", async
     const result = await exec(launcher, ["one two", "three"]);
     assert.deepEqual(JSON.parse(result.stdout), { args: ["one two", "three"], home: `${installRoot}/state` });
     assert.ok((await readFile(launcher, "utf8")).includes("quoted'\\''boot"));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+test("installer connection works when dev tty exists without a controlling terminal", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "equip-no-tty-"));
+  try {
+    await writeFile(path.join(root, "equip"), "#!/bin/sh\nprintf 'connected\\n'\n", { mode: 0o755 });
+    const content = shellInstaller("http://127.0.0.1:4310", "1.7.0");
+    const stanza = content.slice(content.lastIndexOf('headless="";'));
+    const child = spawn("sh", ["-c", 'bin_dir="$1"; ' + stanza, "equip-test", root], {
+      detached: true, stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, EQUIP_HEADLESS: "0" },
+    });
+    let output = "", errors = "";
+    child.stdout.on("data", chunk => { output += chunk; });
+    child.stderr.on("data", chunk => { errors += chunk; });
+    const code = await new Promise<number | null>((done, reject) => { child.once("exit", done); child.once("error", reject); });
+    assert.equal(code, 0, errors);
+    assert.equal(output.trim(), "connected");
   } finally { await rm(root, { recursive: true, force: true }); }
 });

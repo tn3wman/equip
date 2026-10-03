@@ -1692,9 +1692,11 @@ function Devices({
         <div>
           <h3>Local computers and cloud agents are separate.</h3>
           <p>
-            Connecting a computer equips its local agents. Hosted agent accounts
-            are not connected automatically. No cloud account integration is
-            currently available.
+            Equip detects local agent homes and enabled T3 profiles. Claude Desktop’s
+            local Code sessions use the Claude Code skill folder. ChatGPT desktop,
+            Claude Cowork, and hosted sessions use separate account skill stores;
+            Equip cannot synchronize those accounts yet. Changing a model router
+            does not create a new skill destination unless its agent home changes.
           </p>
         </div>
       </div>

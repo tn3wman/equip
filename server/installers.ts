@@ -71,7 +71,7 @@ fi
 headless=""; no_service=""
 [ "${"$"}{EQUIP_HEADLESS:-0}" = 1 ] && headless="--headless"
 [ "${"$"}{EQUIP_NO_SERVICE:-0}" = 1 ] && no_service="--no-service"
-if [ "${"$"}{EQUIP_HEADLESS:-0}" = 1 ] || [ ! -r /dev/tty ]; then "${"$"}bin_dir/equip" connect ${"$"}headless ${"$"}no_service; else "${"$"}bin_dir/equip" connect ${"$"}headless ${"$"}no_service < /dev/tty; fi
+if [ "${"$"}{EQUIP_HEADLESS:-0}" = 1 ] || ! (: < /dev/tty) 2>/dev/null; then "${"$"}bin_dir/equip" connect ${"$"}headless ${"$"}no_service; else "${"$"}bin_dir/equip" connect ${"$"}headless ${"$"}no_service < /dev/tty; fi
 `;
 }
 
