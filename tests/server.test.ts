@@ -528,6 +528,12 @@ test("source ingestion accepts long descriptions without weakening custom publis
   );
   assert.equal(imported.files[0].content, files[0].content);
   assert.equal(imported.description, description.trim());
+  const dashboard = await call("/api/workspace?view=dashboard", {}, cookie);
+  const visible = dashboard.body.skills.find((skill: any) => skill.name === "long-description");
+  assert.deepEqual(visible.files, imported.files);
+  assert.deepEqual(visible.versions.map((version: any) => version.revision), imported.versions.map((version: any) => version.revision));
+  assert.ok(visible.versions.every((version: any) => version.files.length === 0));
+  assert.ok(imported.versions.every((version: any) => version.files.length > 0));
 
   const custom = await post(
     "/api/skills",
