@@ -5,6 +5,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname, homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { gzipSync } from "node:zlib";
 import type {
   DesiredState,
   DeviceAuthorization,
@@ -88,10 +89,14 @@ async function request<T>(
   token?: string,
   base = server,
 ): Promise<T> {
+  const compressed = typeof init.body === "string" && Buffer.byteLength(init.body) > 1_000_000
+    ? new Uint8Array(gzipSync(init.body)) : undefined;
   const response = await fetch(`${base}${path}`, {
     ...init,
+    ...(compressed ? { body: compressed } : {}),
     headers: {
       "content-type": "application/json",
+      ...(compressed ? { "content-encoding": "gzip" } : {}),
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...init.headers,
     },

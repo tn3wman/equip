@@ -70,6 +70,7 @@ test(
       await mkdir(skillRoot, { recursive: true });
       await writeFile(join(nova, "skills", "skills-sh.json"), "{}\n");
       await writeFile(join(skillRoot, "SKILL.md"), first);
+      await writeFile(join(skillRoot, "reference.txt"), "Complete skill payload.\n".repeat(65_000));
       const registration = await fetch(`${base}/api/auth/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
