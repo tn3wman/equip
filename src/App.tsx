@@ -81,7 +81,7 @@ export default function App() {
     () => (location.hash.slice(1) as Page) || "library",
   );
   const [workspace, setWorkspace] = useState<Workspace>();
-  const [emailSignIn, setEmailSignIn] = useState(false);
+  const [emailSignIn, setEmailSignIn] = useState<boolean | null>(null);
   const [authLinkError, setAuthLinkError] = useState("");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Skill>();
@@ -96,6 +96,7 @@ export default function App() {
     new URLSearchParams(location.search).get("code") || "",
   );
   const bootstrap = useRef<Promise<void> | null>(null);
+  const authConfigResolved = useRef(false);
   useEffect(() => {
     if (!menu) return;
     const previous = document.activeElement as HTMLElement;
@@ -138,6 +139,16 @@ export default function App() {
       setError((e as Error).message);
     }
   }, []);
+  const loadAuthConfig = useCallback(async () => {
+    try {
+      const result = await api<{ emailSignIn: boolean }>("/auth/config");
+      authConfigResolved.current = true;
+      setEmailSignIn(result.emailSignIn);
+    } catch {
+      // Keep the capability unknown so a transient deployment error cannot
+      // expose the unsupported password form on a hosted installation.
+    }
+  }, []);
   useEffect(() => {
     if (!bootstrap.current) {
       const search = new URLSearchParams(location.search);
@@ -149,9 +160,7 @@ export default function App() {
         history.replaceState(null, "", cleanUrl);
       }
 
-      const config = api<{ emailSignIn: boolean }>("/auth/config")
-        .then((result) => setEmailSignIn(result.emailSignIn))
-        .catch(() => undefined);
+      const config = loadAuthConfig();
       const load = token
         ? api<Workspace>("/auth/email/consume", "POST", { token })
             .then((result) => {
@@ -173,13 +182,20 @@ export default function App() {
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | undefined;
     void bootstrap.current.then(() => {
-      if (!cancelled) timer = setInterval(refresh, 5000);
+      if (!cancelled)
+        timer = setInterval(() => {
+          void refresh();
+          if (!authConfigResolved.current) void loadAuthConfig();
+        }, 5000);
     });
     return () => {
       cancelled = true;
       if (timer) clearInterval(timer);
     };
-  }, [refresh]);
+  }, [loadAuthConfig, refresh]);
+  useEffect(() => {
+    if (auth && emailSignIn === null) void loadAuthConfig();
+  }, [auth, emailSignIn, loadAuthConfig]);
   useEffect(() => {
     const hash = () => {
       const p = location.hash.slice(1) as Page;
@@ -540,6 +556,7 @@ export default function App() {
           workspace={workspace}
           emailSignIn={emailSignIn}
           initialError={authLinkError}
+          retryConfig={loadAuthConfig}
           onClose={() => setAuth(false)}
           onSuccess={async (message) => {
             await refresh();
@@ -1923,12 +1940,14 @@ function AuthDialog({
   workspace,
   emailSignIn,
   initialError,
+  retryConfig,
   onClose,
   onSuccess,
 }: {
   workspace: Workspace;
-  emailSignIn: boolean;
+  emailSignIn: boolean | null;
   initialError: string;
+  retryConfig: () => Promise<void>;
   onClose: () => void;
   onSuccess: (message: string) => Promise<void>;
 }) {
@@ -1999,11 +2018,21 @@ function AuthDialog({
         ) : (
           <>
             <p>
-              {emailSignIn
+              {emailSignIn === true
                 ? "Use your email to open your personal workspace and connect real computers."
-                : "Create a personal workspace to connect real computers. The demo library stays separate."}
+                : emailSignIn === false
+                  ? "Create a personal workspace to connect real computers. The demo library stays separate."
+                  : "Checking the available sign-in method for this workspace."}
             </p>
-            {emailSignIn && sent ? (
+            {emailSignIn === null ? (
+              <div className="auth-config-loading" role="status">
+                <Loader2 className="spin" size={18} />
+                <span>Checking sign-in options…</span>
+                <button className="button" onClick={() => void retryConfig()}>
+                  Retry now
+                </button>
+              </div>
+            ) : emailSignIn && sent ? (
               <div className="auth-sent" role="status">
                 <Check size={20} />
                 <div>

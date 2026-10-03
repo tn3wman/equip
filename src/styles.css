@@ -1835,6 +1835,17 @@ kbd {
   grid-column: 1 / -1;
   margin-top: 4px;
 }
+.auth-config-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  color: #637b51;
+  font-size: 12px;
+}
+.auth-config-loading .button {
+  margin-left: auto;
+}
 .form-error {
   color: #b47660;
   font-size: 12px;
