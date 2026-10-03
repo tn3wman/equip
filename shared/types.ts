@@ -48,6 +48,7 @@ export interface Skill {
   installs?: number;
   updatedAt: string;
   librarySourceId?: string;
+  localOrigin?: { deviceId: string; path: string };
 }
 export interface Agent {
   id: string;
@@ -85,6 +86,7 @@ export interface Device {
   disconnect?: "retain" | "remove";
   disconnectedAt?: string;
   resolutions?: Record<string, "replace" | "preserve" | "import">;
+  localSync?: { enabled: boolean; path?: string; lastImport?: string; error?: string };
 }
 export interface Activity {
   id: string;
@@ -132,6 +134,8 @@ export interface DesiredState {
   sourceRequests?: SourceRequest[];
   resolutions: Record<string, "replace" | "preserve" | "import">;
   disconnect?: "retain" | "remove";
+  localSync?: boolean;
+  localSkills?: Array<Pick<Skill, "id" | "name" | "revision" | "kind" | "librarySourceId">>;
 }
 export interface DeviceAuthorization {
   deviceCode: string;

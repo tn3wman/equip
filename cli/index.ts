@@ -23,6 +23,8 @@ import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
 import { discoverAgentProfiles } from "./profiles.ts";
 import { replaceExecutable } from "./update.ts";
 import { connectLibrary, readLibraryLink, syncLinkedLibrary } from "./library.ts";
+import { localSkill, syncLocalSkills } from "./local.ts";
+import { getDesired } from "./desired.ts";
 
 const exec = promisify(execFile);
 const args = process.argv.slice(2);
@@ -303,7 +305,7 @@ async function runSync(s: State) {
   await flushReceipts(s, base);
   let libraryError = "";
   let libraryPublished = false;
-  const desiredBeforeLibrary = await request<DesiredState>("/api/device/desired", {}, s.token, base);
+  let desiredBeforeLibrary = await getDesired(equipHome, base, s.token);
   const link = await readLibraryLink(equipHome);
   if (link && !desiredBeforeLibrary.disconnect) {
     if (link.revision && (!desiredBeforeLibrary.librarySource ||
@@ -320,6 +322,10 @@ async function runSync(s: State) {
       }
     }
   }
+  const local = await syncLocalSkills(equipHome, targets, desiredBeforeLibrary, payload => request("/api/device/local", {
+    method: "POST", body: JSON.stringify(payload),
+  }, s.token, base));
+  if (local.changed) desiredBeforeLibrary = await getDesired(equipHome, base, s.token);
   await request(
     "/api/device/heartbeat",
     {
@@ -329,6 +335,8 @@ async function runSync(s: State) {
         os: platform(),
         arch: process.arch,
         libraryError,
+        localSyncPath: join(equipHome, "skills"),
+        localSyncError: local.errors.join("\n"),
         agents: targets.map((t) => ({
           id: t.id,
           name: t.name ?? t.id,
@@ -343,7 +351,7 @@ async function runSync(s: State) {
     base,
   );
   let desired = libraryPublished
-    ? await request<DesiredState>("/api/device/desired", {}, s.token, base)
+    ? await getDesired(equipHome, base, s.token)
     : desiredBeforeLibrary;
   if (desired.sourceRequests?.length) {
     for (const sourceRequest of desired.sourceRequests) {
@@ -376,12 +384,7 @@ async function runSync(s: State) {
         ).catch(() => {});
       }
     }
-    desired = await request<DesiredState>(
-      "/api/device/desired",
-      {},
-      s.token,
-      base,
-    );
+    desired = await getDesired(equipHome, base, s.token);
   }
   if (desired.disconnect) {
     const receipts =
@@ -407,7 +410,7 @@ async function runSync(s: State) {
   await postReceipts(s, base, desired.generation, receipts);
   if (receipts.every((receipt) => receipt.status === "synchronized"))
     s.lastSync = new Date().toISOString();
-  s.lastError = libraryError || undefined;
+  s.lastError = libraryError || local.errors.join("\n") || undefined;
   await saveWorkerFields(s, {
     lastSync: s.lastSync,
     lastError: s.lastError,
@@ -479,12 +482,12 @@ async function main() {
     }
     if (!s.token) throw new Error("Connect this computer first: equip connect");
     if (operation === "connect") {
-      if (!args[1]) throw new Error("Use equip library connect /path/to/nova");
-      await connectLibrary(equipHome, args[1]);
+      if (!args[1]) throw new Error("Use equip library connect /path/to/library [--name My-library]");
+      await connectLibrary(equipHome, args[1], option("--name"));
       await runSync(s);
       const linked = await readLibraryLink(equipHome);
       if (linked?.lastError) throw new Error(linked.lastError);
-      console.log(`Nova linked. Its skills will synchronize automatically from ${linked?.root}.`);
+      console.log(`${linked?.name} linked. Its skills will synchronize automatically from ${linked?.root}.`);
       return;
     }
     if (operation === "unlink") {
@@ -494,6 +497,23 @@ async function main() {
       return;
     }
     throw new Error(`Unknown library operation: ${operation}`);
+  }
+  if (command === "local") {
+    const s = await state();
+    if (!s.token) throw new Error("Connect this computer first: equip connect");
+    if (args[0] === "add" && args[1]) {
+      const skill = await localSkill(resolve(args[1]));
+      await request("/api/device/local", { method: "POST", body: JSON.stringify({ ...skill, explicit: true }) }, s.token, s.server || server);
+      const receipts = await runSync(s);
+      console.log(`Published ${skill.name}. ${receipts.filter(r => r.status === "synchronized").length} installation(s) synchronized.`);
+      return;
+    }
+    if (args[0] === "status") {
+      const desired = await getDesired(equipHome, s.server || server, s.token);
+      console.log(`Local publishing: ${desired.localSync ? "enabled" : "disabled"}. Skill folder: ${join(equipHome, "skills")}`);
+      return;
+    }
+    throw new Error("Use equip local add /path/to/skill or equip local status. Enable automatic local publishing in Computers.");
   }
   if (command === "connect") {
     const existing = await state();

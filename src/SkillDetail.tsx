@@ -98,6 +98,14 @@ export default function SkillDetail({
       previous?.focus();
     };
   }, []);
+  useEffect(() => {
+    if (!installed) return;
+    let disposed = false;
+    setLoading(true);
+    setError("");
+    api<Skill>(`/skills/${skill.id}`).then(value => { if (!disposed) setActual(value); }).catch(error => { if (!disposed) setError(error.message); }).finally(() => { if (!disposed) setLoading(false); });
+    return () => { disposed = true; };
+  }, [skill.id, skill.revision, installed]);
   const act = async (
     fn: () => Promise<any>,
     message: string,
@@ -188,7 +196,7 @@ export default function SkillDetail({
             {libraryManaged ? (
               <>
                 <Folder size={13} />
-                From {workspace.librarySource?.name || "Nova"}
+                From {workspace.librarySource?.name || "linked library"}
                 {skill.kind === "third-party" && (
                   <a
                     href={skill.source.startsWith("http") ? skill.source : `https://github.com/${skill.source.split("@")[0]}`}
@@ -236,7 +244,7 @@ export default function SkillDetail({
                 {!libraryManaged && (skill.kind === "custom" ? (
                   <button
                     className="button primary"
-                    onClick={() => onEdit(skill)}
+                    disabled={loading} onClick={() => onEdit(data)}
                   >
                     <Pencil size={15} />
                     Edit skill
@@ -327,6 +335,8 @@ export default function SkillDetail({
             </button>
           </div>
         )}
+        {installed && skill.revision && <div className="detail-actions"><a className="button small" href={`/api/skills/${skill.id}/export?revision=${encodeURIComponent(skill.revision)}`} download><ArrowDownToLine size={14} /> Download ZIP {revision(skill.revision)}</a></div>}
+        {installed && loading && <div className="catalog-loading" role="status"><Loader2 className="spin" size={16} /> Loading skill files…</div>}
         <div
           className="tabs detail-tabs"
           role="tablist"
@@ -529,7 +539,7 @@ export default function SkillDetail({
                 <div className="source-managed-note">
                   <Folder size={16} />
                   <div>
-                    <strong>Managed by {workspace.librarySource?.name || "Nova"}</strong>
+                    <strong>Managed by {workspace.librarySource?.name || "linked library"}</strong>
                     <p>Changes and new versions come from the linked source library.</p>
                   </div>
                 </div>

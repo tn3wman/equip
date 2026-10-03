@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -109,6 +110,38 @@ test("identical revision synchronizes to two isolated devices", async () => {
   );
   assert.equal(await readFile(join(a, "demo/SKILL.md"), "utf8"), "one");
   assert.equal(await readFile(join(b, "demo/SKILL.md"), "utf8"), "one");
+  assert.equal((await lstat(join(a, "demo"))).isSymbolicLink(), true);
+  assert.equal((await lstat(join(b, "demo"))).isSymbolicLink(), true);
+  const fs = await import("node:fs/promises");
+  assert.equal(
+    await fs.realpath(join(a, "demo")),
+    await fs.realpath(join(home, "skills/demo")),
+  );
+  assert.equal(
+    await fs.realpath(join(b, "demo")),
+    await fs.realpath(join(home, "skills/demo")),
+  );
+});
+
+test("a clean legacy managed directory migrates to the canonical link", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-migrate-"));
+  const target = join(root, "agent");
+  const home = join(root, "state");
+  await mkdir(join(target, "demo/scripts"), { recursive: true });
+  await writeFile(join(target, "demo/SKILL.md"), "one");
+  await writeFile(join(target, "demo/scripts/run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+  const hashes = {
+    "SKILL.md": `${0o644}:${createHash("sha256").update("one").digest("hex")}`,
+    "scripts/run.sh": `${0o755}:${createHash("sha256").update("#!/bin/sh\n").digest("hex")}`,
+  };
+  await mkdir(home);
+  await writeFile(join(home, "ledger.json"), JSON.stringify({ generation: 1, installs: {
+    "s1:codex::": { skillId: "s1", agent: "codex", revision: "r1", files: hashes, path: join(target, "demo") },
+  } }));
+  const receipts = await synchronize(desired([skill("one")]), [{ id: "codex", path: target }], home);
+  assert.equal(receipts[0].status, "synchronized");
+  assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+  assert.equal(await readFile(join(home, "skills/demo/SKILL.md"), "utf8"), "one");
 });
 
 test("local edits conflict and preserve the last good install", async () => {
@@ -411,7 +444,7 @@ test("a symlinked skill root is conflicted without traversing or replacing its t
   assert.equal((await fs.lstat(join(target, "demo"))).isSymbolicLink(), true);
 });
 
-test("removal resolutions are isolated by profile and release preserved ownership once", async () => {
+test("a canonical edit conflicts across profiles while resolutions stay isolated", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const home = join(root, "state");
   const targets = [
@@ -419,8 +452,7 @@ test("removal resolutions are isolated by profile and release preserved ownershi
     { id: "codex", profile: "personal", path: join(root, "personal") },
   ];
   await synchronize(desired([skill("server")]), targets, home);
-  await writeFile(join(root, "work/demo/SKILL.md"), "work-local");
-  await writeFile(join(root, "personal/demo/SKILL.md"), "personal-local");
+  await writeFile(join(root, "work/demo/SKILL.md"), "shared-local");
   const first = await synchronize(
     { generation: 2, skills: [], resolutions: { "s1:codex:work:": "import" } },
     targets,
@@ -434,7 +466,7 @@ test("removal resolutions are isolated by profile and release preserved ownershi
     first
       .find((r) => r.profile === "work")
       ?.localFiles?.find((f) => f.path === "SKILL.md")?.content,
-    "work-local",
+    "shared-local",
   );
   assert.match(
     first.find((r) => r.profile === "personal")?.message ?? "",
@@ -452,7 +484,7 @@ test("removal resolutions are isolated by profile and release preserved ownershi
   assert.equal(second.filter((r) => r.profile === "personal").length, 1);
   assert.equal(
     await readFile(join(root, "work/demo/SKILL.md"), "utf8"),
-    "work-local",
+    "shared-local",
   );
 });
 
@@ -663,9 +695,40 @@ test("removal preserves a locally substituted symlink even when its contents mat
   const targets = [{ id: "codex", path: target }];
   await synchronize(desired([skill("one")]), targets, home);
   await rename(join(target, "demo"), join(root, "local-work"));
+  await rm(join(root, "local-work"));
+  await symlink(join(home, "skills/demo"), join(root, "local-work"));
   await symlink(join(root, "local-work"), join(target, "demo"));
   const receipts = await synchronize(desired([]), targets, home);
   assert.equal(receipts[0].status, "conflicted");
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
   assert.equal(await readFile(join(root, "local-work/SKILL.md"), "utf8"), "one");
+});
+
+test("releasing an observed link protects its preexisting canonical source from other managed removals", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-observed-canonical-"));
+  const home = join(root, "state"), original = join(root, "original"), peer = join(root, "peer");
+  await synchronize(desired([skill("one")]), [{ id: "codex", path: join(root, "seed-target") }], join(root, "seed"));
+  await cp(join(root, "seed/skills/demo"), join(home, "skills/demo"), { recursive: true });
+  await mkdir(original);
+  await symlink(join(home, "skills/demo"), join(original, "demo"));
+  const linked = { ...skill("one"), librarySourceId: "library" };
+  const targets = [{ id: "codex", path: original }, { id: "claude-code", path: peer }];
+  assert.ok((await synchronize(desired([linked]), targets, home)).every(r => r.status === "synchronized"));
+  await synchronize(desired([]), targets, home);
+  assert.equal((await lstat(join(original, "demo"))).isSymbolicLink(), true);
+  assert.equal(await readFile(join(original, "demo/SKILL.md"), "utf8"), "one");
+  await assert.rejects(lstat(join(peer, "demo")), /ENOENT/);
+});
+
+test("a stale failed destination cannot block the next canonical update when another baseline confirms it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-partial-baseline-"));
+  const home = join(root, "state"), targets = [{ id: "codex", path: join(root, "one") }, { id: "claude-code", path: join(root, "two") }];
+  await synchronize(desired([skill("one")]), targets, home);
+  await rm(join(targets[1].path, "demo"));
+  await symlink(join(root, "user-link"), join(targets[1].path, "demo"));
+  const second = await synchronize({ ...desired([skill("two", "r2")]), generation: 2 }, targets, home);
+  assert.deepEqual(second.map(r => r.status), ["synchronized", "conflicted"]);
+  const third = await synchronize({ ...desired([skill("three", "r3")]), generation: 3 }, targets, home);
+  assert.deepEqual(third.map(r => r.status), ["synchronized", "conflicted"]);
+  assert.equal(await readFile(join(home, "skills/demo/SKILL.md"), "utf8"), "three");
 });

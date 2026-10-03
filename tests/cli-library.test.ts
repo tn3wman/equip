@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import {
   readLibraryLink,
-  readNovaLibrary,
+  readLibrarySnapshot,
   saveLibraryLink,
   syncLinkedLibrary,
 } from "../cli/library.ts";
@@ -44,13 +44,13 @@ test("Nova snapshot combines owned and installed skills and preserves bytes and 
   await writeFile(join(owned, "run.sh"), "#!/bin/sh\nexit 0\n");
   await chmod(join(owned, "run.sh"), 0o755);
 
-  const snapshot = await readNovaLibrary(root, { installedSkills: installed });
+  const snapshot = await readLibrarySnapshot(root, { installedSkills: installed });
   assert.deepEqual(
     snapshot.skills.map(({ name, source, kind }) => ({ name, source, kind })),
     [
       {
         name: "owned-skill",
-        source: "nova:skills/owned-skill",
+        source: `${basename(root).toLowerCase()}:skills/owned-skill`,
         kind: "custom",
       },
       {
@@ -76,7 +76,7 @@ test("a missing listed skill is resolved through the supplied resolver", async (
     JSON.stringify({ missing: "owner/repository" }),
   );
   const calls: unknown[][] = [];
-  const snapshot = await readNovaLibrary(root, {
+  const snapshot = await readLibrarySnapshot(root, {
     installedSkills: installed,
     resolveMissing: async (...args) => {
       calls.push(args);
@@ -109,7 +109,7 @@ test("malformed or mismatched Nova skill metadata is rejected", async () => {
   const directory = await customSkill(root, "broken-skill");
   await writeFile(join(directory, "SKILL.md"), "---\nname: another-name\n---\n");
   await assert.rejects(
-    readNovaLibrary(root, { installedSkills: join(root, "installed") }),
+    readLibrarySnapshot(root, { installedSkills: join(root, "installed") }),
     /invalid or mismatched SKILL\.md metadata/,
   );
 });
@@ -119,7 +119,7 @@ test("a manifest mutation during missing-skill resolution rejects the snapshot",
   const manifest = join(root, "skills/skills-sh.json");
   await writeFile(manifest, JSON.stringify({ missing: "owner/repository" }));
   await assert.rejects(
-    readNovaLibrary(root, {
+    readLibrarySnapshot(root, {
       installedSkills: join(root, "installed"),
       resolveMissing: async () => {
         await writeFile(manifest, JSON.stringify({ missing: "owner/changed" }));
@@ -143,7 +143,7 @@ test("a manifest mutation during missing-skill resolution rejects the snapshot",
         };
       },
     }),
-    /Nova changed while its skills were being read/,
+    /The library changed while its skills were being read/,
   );
 });
 
@@ -171,7 +171,7 @@ test("linked library sync is idempotent and a failed publish retains the accepte
   );
   await assert.rejects(
     syncLinkedLibrary(home, async () => ({ accepted: false, revision: "rejected" })),
-    /did not accept Nova's complete skill revision/,
+    /did not accept the library’s complete skill revision/,
   );
   const failed = await readLibraryLink(home);
   assert.equal(failed?.revision, accepted?.revision);

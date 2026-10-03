@@ -21,6 +21,7 @@ import type {
   Target,
   Workspace,
 } from "../shared/types.ts";
+import { skillArchive } from "../shared/archive.ts";
 import { demoCatalog } from "./catalog.ts";
 import {
   configuredPublicUrl as resolveConfiguredPublicUrl,
@@ -88,7 +89,7 @@ function seedDemo(): Workspace {
   const devices: Device[] = [
     {
       id: "demo-mac",
-      name: "Tyler’s MacBook Pro",
+      name: "MacBook Pro",
       os: "darwin",
       arch: "arm64",
       online: true,
@@ -387,14 +388,14 @@ function sameFiles(left: SkillFile[], right: SkillFile[]) {
 }
 
 function validateLibrarySnapshot(body: unknown): {
-  id: "nova";
+  id: string;
   name: string;
   revision: string;
   skills: LibrarySnapshotSkill[];
 } {
   const input = body as any;
-  if (!input || input.id !== "nova")
-    throw httpError(400, "Library id must be nova.");
+  if (!input || typeof input.id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.id) || input.id.length > 64)
+    throw httpError(400, "Library id must be 1–64 lowercase letters, numbers, or hyphen-separated words.");
   if (
     typeof input.name !== "string" ||
     !input.name.trim() ||
@@ -443,7 +444,7 @@ function validateLibrarySnapshot(body: unknown): {
   });
   if (librarySnapshotRevision(skills) !== input.revision)
     throw httpError(400, "Library revision does not match its skills.");
-  return { id: "nova", name: input.name.trim(), revision: input.revision, skills };
+  return { id: input.id, name: input.name.trim(), revision: input.revision, skills };
 }
 function httpError(status: number, message: string) {
   return Object.assign(new Error(message), { status });
@@ -711,8 +712,11 @@ export async function createApp(
     });
     // The dashboard uses history metadata; rollback reads immutable files on the server.
     if (req.query.view === "dashboard")
-      for (const skill of workspace.skills)
+      for (const skill of workspace.skills) {
+        skill.files = [];
+        skill.draft = undefined;
         skill.versions = skill.versions.map(version => ({ ...version, files: [] }));
+      }
     res.json(workspace);
   });
 
@@ -889,6 +893,23 @@ export async function createApp(
     if (!skill) throw httpError(404, "Skill not found.");
     return skill;
   };
+  app.get("/api/skills/:id", auth(true), (req: AuthedRequest, res, next) => {
+    try { res.json(findSkill(req)); } catch (error) { next(error); }
+  });
+  app.get("/api/skills/:id/export", auth(true), async (req: AuthedRequest, res, next) => {
+    try {
+      const skill = findSkill(req);
+      const version = typeof req.query.revision === "string" ? skill.versions.find(v => v.revision === req.query.revision) : undefined;
+      if (req.query.revision && !version) throw httpError(404, "Revision not found.");
+      const files = version?.files ?? skill.files;
+      if (!files.length || !skill.revision) throw httpError(409, "Publish this skill before exporting it.");
+      const metadata = validateFiles(files, 16_384);
+      const rev = version?.revision ?? skill.revision;
+      const archive = await skillArchive(metadata.name, files);
+      res.set({ "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="${metadata.name}-${rev}.zip"`, "X-Equip-Revision": rev, "Cache-Control": "private, no-store" });
+      res.send(Buffer.from(archive));
+    } catch (error) { next(error); }
+  });
   const resolveSource = async (source: string, name?: string) => {
     const parsed = await (await upstream()).parseUpstreamSource(source);
     if (parsed?.type === "local" || /^file:/i.test(source))
@@ -1025,7 +1046,7 @@ export async function createApp(
       const skill = findSkill(req);
       const files = clone(req.body?.files ?? skill.draft ?? skill.files);
       if (skill.librarySourceId)
-        throw httpError(409, "Edit the linked Nova source, or unlink it before publishing here.");
+        throw httpError(409, "Edit the linked library source, or unlink it before publishing here.");
       const metadata = validateFiles(files);
       if (
         req.workspace!.skills.some(
@@ -1220,6 +1241,17 @@ export async function createApp(
       delete device.disconnectedAt;
       bump(req.workspace!);
       return device;
+    }),
+  );
+  app.patch(
+    "/api/devices/:id/local-sync",
+    ...mutate((req) => {
+      const device = req.workspace!.devices.find(d => d.id === req.params.id && !d.disconnectedAt);
+      if (!device) throw httpError(404, "Device not found.");
+      if (typeof req.body?.enabled !== "boolean") throw httpError(400, "enabled must be a boolean.");
+      device.localSync = { ...device.localSync, enabled: req.body.enabled, error: undefined };
+      bump(req.workspace!);
+      return device.localSync;
     }),
   );
   app.post(
@@ -1458,6 +1490,58 @@ export async function createApp(
     next();
   };
   app.post(
+    "/api/device/local",
+    deviceAuth,
+    lockedWorkspace,
+    async (req: AuthedRequest, res, next) => {
+      try {
+        const workspace = req.workspace!;
+        const device = workspace.devices.find(d => d.id === req.deviceId)!;
+        if (!device.localSync?.enabled && req.body?.explicit !== true)
+          throw httpError(403, "Local importing is disabled for this computer.");
+        const files = clone(req.body?.files);
+        const metadata = validateFiles(files, 16_384);
+        if (req.body?.name !== metadata.name) throw httpError(400, "Local folder name must match SKILL.md.");
+        if (typeof req.body?.sourcePath !== "string" || !req.body.sourcePath || req.body.sourcePath.length > 2048)
+          throw httpError(400, "A local source path is required.");
+        let skill = workspace.skills.find(s => s.name === metadata.name);
+        if (skill && !sameFiles(skill.files, files)) {
+          if (skill.librarySourceId || skill.kind !== "custom")
+            throw httpError(409, "This skill has a separate source. Import it under another name or resolve its local conflict.");
+          if (!req.body.baseRevision || req.body.baseRevision !== skill.revision)
+            throw httpError(409, "The dashboard revision changed. Local files were preserved; review the conflict before publishing.");
+        }
+        if (!skill) {
+          if (req.body.baseRevision) throw httpError(409, "This skill was removed in Equip. Local files were preserved.");
+          skill = {
+            id: id("skill"), name: metadata.name, title: metadata.name,
+            description: metadata.description, author: workspace.name,
+            source: "local", kind: "custom", category: "Custom", icon: "wand-sparkles", color: "#7259ff",
+            selected: true, enabled: true, autoUpdate: false, revision: "", versions: [], files: [],
+            requirements: [], targets: [], updatedAt: iso(),
+            localOrigin: { deviceId: device.id, path: req.body.sourcePath },
+          };
+          workspace.skills.push(skill);
+        }
+        const changed = !sameFiles(skill.files, files);
+        if (changed) {
+          const rev = revision(files);
+          skill.files = files;
+          skill.description = metadata.description;
+          skill.revision = rev;
+          skill.updatedAt = iso();
+          skill.draft = undefined;
+          skill.versions.unshift({ id: id("version"), revision: rev, createdAt: iso(), message: `Published from ${device.name}`, files: clone(files) });
+          bump(workspace);
+          activity(workspace, { type: "publish", title: `${skill.title} received from ${device.name}`, description: `Revision ${rev} is ready for connected destinations.`, status: "pending", deviceId: device.id, skillId: skill.id });
+        }
+        device.localSync = { enabled: device.localSync?.enabled ?? false, ...device.localSync, lastImport: iso(), error: undefined };
+        await saveWorkspace(db, req.accountId!, workspace);
+        res.json({ id: skill.id, revision: skill.revision, generation: workspace.generation, changed });
+      } catch (error) { next(error); }
+    },
+  );
+  app.post(
     "/api/device/library",
     deviceAuth,
     lockedWorkspace,
@@ -1466,6 +1550,8 @@ export async function createApp(
         const snapshot = validateLibrarySnapshot(req.body);
         const workspace = req.workspace!;
         const linked = workspace.librarySource;
+        if (linked && linked.id !== snapshot.id)
+          throw httpError(409, "Unlink the current library before connecting another one.");
         if (req.body.expectedRevision !== undefined &&
           (typeof req.body.expectedRevision !== "string" ||
            linked?.id !== snapshot.id || linked.deviceId !== req.deviceId ||
@@ -1488,6 +1574,11 @@ export async function createApp(
             validateFiles(incoming.files, 16_384).description,
           );
         const excluded = new Set(linked?.excludedSkills ?? []);
+        for (const incoming of snapshot.skills) {
+          const existing = workspace.skills.find(skill => skill.name === incoming.name);
+          if (!excluded.has(incoming.name) && existing && existing.librarySourceId !== snapshot.id && !sameFiles(existing.files, incoming.files))
+            throw httpError(409, `Skill ${incoming.name} already exists with different instructions. Rename it or unlink its source before importing this library.`);
+        }
         const incomingNames = new Set(snapshot.skills.map((skill) => skill.name));
         workspace.skills = workspace.skills.filter(
           (skill) =>
@@ -1516,7 +1607,7 @@ export async function createApp(
                 id: id("version"),
                 revision: nextRevision,
                 createdAt: iso(),
-                message: "Updated from Nova",
+                message: `Updated from ${snapshot.name}`,
                 files: clone(incoming.files),
               });
             }
@@ -1541,7 +1632,7 @@ export async function createApp(
               id: id("version"),
               revision: nextRevision,
               createdAt: iso(),
-              message: "Linked from Nova",
+              message: `Linked from ${snapshot.name}`,
               files: clone(incoming.files),
             }],
             files: clone(incoming.files),
@@ -1732,6 +1823,9 @@ export async function createApp(
   );
   app.get("/api/device/desired", deviceAuth, (req: AuthedRequest, res) => {
     const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
+    const etag = `"${digest(JSON.stringify([req.accountId, device.id, req.workspace!.generation, req.workspace!.sourceRequests, device.resolutions, device.disconnect, device.localSync?.enabled]))}"`;
+    res.set({ ETag: etag, "Cache-Control": "private, no-cache" });
+    if (req.headers["if-none-match"] === etag) { res.status(304).end(); return; }
     const skills = req
       .workspace!.skills.filter(
         (s) => s.selected && s.enabled && s.revision && s.files.length,
@@ -1749,6 +1843,8 @@ export async function createApp(
       sourceRequests: req.workspace!.sourceRequests ?? [],
       resolutions: device.resolutions ?? {},
       disconnect: device.disconnect,
+      localSync: device.localSync?.enabled ?? false,
+      localSkills: req.workspace!.skills.map(({id,name,revision,kind,librarySourceId}) => ({id,name,revision,kind,librarySourceId})),
     };
     res.json(desired);
   });
@@ -1776,6 +1872,10 @@ export async function createApp(
           ...(agent.aliases ? { aliases: clone(agent.aliases) } : {}),
         }));
       }
+      if (typeof req.body?.localSyncPath === "string" && req.body.localSyncPath.length <= 2048)
+        device.localSync = { ...device.localSync, enabled: device.localSync?.enabled ?? false, path: req.body.localSyncPath };
+      if (typeof req.body?.localSyncError === "string")
+        device.localSync = { ...device.localSync, enabled: device.localSync?.enabled ?? false, error: req.body.localSyncError.slice(0, 1000) || undefined };
       device.lastSeen = iso();
       device.online = true;
       await saveWorkspace(db, req.accountId!, req.workspace!);

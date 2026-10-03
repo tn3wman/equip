@@ -8,6 +8,9 @@ import { createApp } from "../server/app.ts";
 import { demoCatalog } from "../server/catalog.ts";
 import { librarySnapshotRevision } from "../shared/library.ts";
 import type { LibrarySnapshotSkill } from "../shared/library.ts";
+import { unzipSync } from "fflate";
+import { getDesired } from "../cli/desired.ts";
+import { readFile, stat } from "node:fs/promises";
 
 let base = "";
 let shutdown: () => Promise<void>;
@@ -103,6 +106,61 @@ function novaSkill(name: string, body = "First", extra = ""): LibrarySnapshotSki
     ],
   };
 }
+
+test("local publishing is opt-in and revision exports and cached device state stay account-bound", async () => {
+  const cookie = await register("portable-local@example.com");
+  const otherCookie = await register("portable-other@example.com");
+  const device = await connectDevice(cookie, "Portable computer");
+  const other = await connectDevice(otherCookie, "Other computer");
+  const files = novaSkill("portable", "Local instructions").files;
+  files.push({ path: "scripts/run.sh", content: "#!/bin/sh\n", mode: 0o755 });
+  const payload = { name: "portable", sourcePath: "/portable-home/skills/portable", files };
+  const denied = await call("/api/device/local", { method: "POST", headers: device.headers, body: JSON.stringify(payload) });
+  assert.equal(denied.response.status, 403);
+  const enabled = await call(`/api/devices/${device.deviceId}/local-sync`, { method: "PATCH", body: JSON.stringify({ enabled: true }) }, cookie);
+  assert.equal(enabled.response.status, 200);
+  const crossAccount = await call(`/api/devices/${device.deviceId}/local-sync`, { method: "PATCH", body: JSON.stringify({ enabled: false }) }, otherCookie);
+  assert.equal(crossAccount.response.status, 404);
+  const created = await call("/api/device/local", { method: "POST", headers: device.headers, body: JSON.stringify(payload) });
+  assert.equal(created.response.status, 200);
+  const download = await fetch(`${base}/api/skills/${created.body.id}/export`, { headers: { cookie } });
+  assert.equal(download.status, 200);
+  assert.equal(download.headers.get("x-equip-revision"), created.body.revision);
+  const entries = unzipSync(new Uint8Array(await download.arrayBuffer()));
+  assert.equal(Buffer.from(entries["portable/SKILL.md"]).toString(), files[0].content);
+  assert.equal(Buffer.from(entries["portable/scripts/run.sh"]).toString(), files[1].content);
+  const deniedExport = await fetch(`${base}/api/skills/${created.body.id}/export`, { headers: { cookie: otherCookie } });
+  assert.equal(deniedExport.status, 404);
+
+  const home = await mkdtemp(path.join(tmpdir(), "equip-desired-cache-"));
+  try {
+    const token = device.headers.authorization.slice(7);
+    const first = await getDesired(home, base, token);
+    assert.equal(first.skills.length, 1);
+    const cachePath = path.join(home, "desired-cache.json");
+    const saved = await stat(cachePath);
+    assert.equal(saved.mode & 0o777, 0o600);
+    assert.equal((await readFile(cachePath, "utf8")).includes(token), false);
+    await getDesired(home, base, token);
+    assert.equal((await stat(cachePath)).mtimeMs, saved.mtimeMs);
+    const raw = await fetch(`${base}/api/device/desired`, { headers: device.headers });
+    const unchanged = await fetch(`${base}/api/device/desired`, { headers: { ...device.headers, "if-none-match": raw.headers.get("etag")! } });
+    assert.equal(unchanged.status, 304);
+    await call(`/api/devices/${device.deviceId}/local-sync`, { method: "PATCH", body: JSON.stringify({ enabled: false }) }, cookie);
+    assert.equal((await getDesired(home, base, token)).localSync, false);
+    assert.equal((await getDesired(home, base, other.headers.authorization.slice(7))).skills.length, 0);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a library can have any valid name and cannot replace another linked library", async () => {
+  const cookie = await register("generic-library@example.com");
+  const owner = await connectDevice(cookie, "Any computer");
+  const snapshot = { ...libraryBody([novaSkill("generic")]), id: "team-workflows", name: "Team workflows" };
+  const first = await call("/api/device/library", { method: "POST", headers: owner.headers, body: JSON.stringify(snapshot) });
+  assert.equal(first.response.status, 200);
+  const another = await call("/api/device/library", { method: "POST", headers: owner.headers, body: JSON.stringify({ ...snapshot, id: "different-library" }) });
+  assert.equal(another.response.status, 409);
+});
 
 test("demo is explicit, populated, and cannot mutate", async () => {
   const workspace = await call("/api/workspace");
@@ -486,7 +544,9 @@ test("Nova library snapshots are authoritative, atomic, device-bound, and unlink
     headers: owner.headers,
     body: JSON.stringify(libraryBody([novaSkill("alpha", "Third")])),
   });
-  assert.equal(relinked.response.status, 200);
+  assert.equal(relinked.response.status, 409);
+  const matchingRelink = await call("/api/device/library", { method: "POST", headers: owner.headers, body: JSON.stringify(libraryBody([novaSkill("alpha", "Second", "reference")])) });
+  assert.equal(matchingRelink.response.status, 200);
   const browserUnlink = await post("/api/library/unlink", {}, cookie);
   assert.equal(browserUnlink.body.unlinked, true);
   const browserRetained = await call("/api/workspace", {}, cookie);
@@ -530,7 +590,7 @@ test("source ingestion accepts long descriptions without weakening custom publis
   assert.equal(imported.description, description.trim());
   const dashboard = await call("/api/workspace?view=dashboard", {}, cookie);
   const visible = dashboard.body.skills.find((skill: any) => skill.name === "long-description");
-  assert.deepEqual(visible.files, imported.files);
+  assert.deepEqual(visible.files, []);
   assert.deepEqual(visible.versions.map((version: any) => version.revision), imported.versions.map((version: any) => version.revision));
   assert.ok(visible.versions.every((version: any) => version.files.length === 0));
   assert.ok(imported.versions.every((version: any) => version.files.length > 0));

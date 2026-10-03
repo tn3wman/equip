@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { createApp } from "../server/app.ts";
-import { readNovaLibrary } from "../cli/library.ts";
+import { readLibrarySnapshot } from "../cli/library.ts";
 
 async function runCli(
   args: string[],
@@ -155,7 +155,7 @@ test(
       assert.equal(await readFile(join(targetOne, "nova-owned", "SKILL.md"), "utf8"), second);
       assert.equal(await readFile(join(targetTwo, "nova-owned", "SKILL.md"), "utf8"), second);
 
-      const nextSnapshot = await readNovaLibrary(nova);
+      const nextSnapshot = await readLibrarySnapshot(nova);
       const stalePublish = await fetch(`${base}/api/device/library`, {
         method: "POST",
         headers: {

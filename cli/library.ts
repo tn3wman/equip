@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { SkillFile } from "../shared/types.ts";
 import { librarySnapshotRevision, type LibrarySnapshotSkill } from "../shared/library.ts";
@@ -18,18 +18,18 @@ export interface LibraryLink {
 
 function safeName(name: string) {
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64)
-    throw new Error(`Invalid Nova skill name: ${name}`);
+    throw new Error(`Invalid Library skill name: ${name}`);
 }
 
-async function collect(root: string, directory = root): Promise<SkillFile[]> {
+export async function collectSkillFiles(root: string, directory = root): Promise<SkillFile[]> {
   const files: SkillFile[] = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
-    // These are generated files excluded by Nova's own installer, not skill assets.
+    // These generated files are not part of a skill bundle.
     if ([".git", ".DS_Store", "__pycache__"].includes(entry.name) || entry.name.endsWith(".pyc")) continue;
     const path = join(directory, entry.name);
     if (entry.isSymbolicLink())
-      throw new Error(`Nova skill contains an unsupported link: ${relative(root, path)}`);
-    if (entry.isDirectory()) files.push(...await collect(root, path));
+      throw new Error(`Library skill contains an unsupported link: ${relative(root, path)}`);
+    if (entry.isDirectory()) files.push(...await collectSkillFiles(root, path));
     else if (entry.isFile()) {
       const bytes = await readFile(path);
       const binary = !Buffer.from(bytes.toString("utf8")).equals(bytes);
@@ -40,46 +40,48 @@ async function collect(root: string, directory = root): Promise<SkillFile[]> {
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 
-export async function readNovaLibrary(
+export async function readLibrarySnapshot(
   root: string,
   options: { installedSkills?: string; resolveMissing?: typeof resolveSkill } = {},
 ) {
-  const manifestPath = join(root, "skills/skills-sh.json");
-  const originalManifest = await readFile(manifestPath, "utf8");
+  const nested = join(root, "skills");
+  const skillsRoot = (await stat(nested).catch(() => null))?.isDirectory() ? nested : root;
+  const manifestPath = join(skillsRoot, "skills-sh.json");
+  const originalManifest = await readFile(manifestPath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; });
   const manifest: unknown = JSON.parse(originalManifest);
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest))
-    throw new Error("Nova's skills-sh.json must map skill names to sources.");
+    throw new Error("The library skills-sh.json must map skill names to sources.");
   const listed = Object.entries(manifest);
-  const custom = (await readdir(join(root, "skills"), { withFileTypes: true }))
+  const custom = (await readdir(skillsRoot, { withFileTypes: true }))
     .filter(entry => entry.isDirectory()).map(entry => entry.name);
   const entries: Array<{ name: string; source: string; kind: "custom" | "third-party"; directory?: string }> = [];
   for (const [name, source] of listed) {
     safeName(name);
-    if (typeof source !== "string" || !source.trim()) throw new Error(`Nova skill ${name} has no source.`);
+    if (typeof source !== "string" || !source.trim()) throw new Error(`Library skill ${name} has no source.`);
     entries.push({ name, source, kind: "third-party", directory: join(options.installedSkills ?? join(homedir(), ".agents/skills"), name) });
   }
   for (const name of custom) {
-    const directory = join(root, "skills", name);
+    const directory = join(skillsRoot, name);
     if (!(await stat(join(directory, "SKILL.md")).catch(() => null))?.isFile()) continue;
     safeName(name);
-    if (entries.some(entry => entry.name === name)) throw new Error(`Nova lists ${name} as both a repository skill and a third-party skill.`);
-    entries.push({ name, source: `nova:skills/${name}`, kind: "custom", directory });
+    if (entries.some(entry => entry.name === name)) throw new Error(`The library lists ${name} as both a repository skill and a third-party skill.`);
+    entries.push({ name, source: `${basename(root).toLowerCase().replace(/[^a-z0-9]+/g, "-")}:skills/${name}`, kind: "custom", directory });
   }
-  if (!entries.length) throw new Error("Nova has no skills to synchronize.");
+  if (!entries.length) throw new Error("The library has no skills to synchronize.");
   const skills: LibrarySnapshotSkill[] = await Promise.all(entries.map(async entry => {
     const exists = await stat(join(entry.directory!, "SKILL.md")).catch(() => null);
     const files = exists?.isFile()
-      ? await collect(await realpath(entry.directory!))
+      ? await collectSkillFiles(await realpath(entry.directory!))
       : (await (options.resolveMissing ?? resolveSkill)(entry.source, entry.name)).files;
     const instructions = files.find(file => file.path === "SKILL.md")?.content;
     const frontmatter = instructions?.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/);
     const metadata = frontmatter ? parseYaml(frontmatter[1]) : null;
     if (metadata?.name !== entry.name || typeof metadata.description !== "string")
-      throw new Error(`Nova skill ${entry.name} has invalid or mismatched SKILL.md metadata.`);
+      throw new Error(`Library skill ${entry.name} has invalid or mismatched SKILL.md metadata.`);
     return { name: entry.name, title: entry.name, source: entry.source, kind: entry.kind, files };
   }));
-  if (originalManifest !== await readFile(manifestPath, "utf8"))
-    throw new Error("Nova changed while its skills were being read. The next sync will retry.");
+  if (originalManifest !== await readFile(manifestPath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }))
+    throw new Error("The library changed while its skills were being read. The next sync will retry.");
   skills.sort((a, b) => a.name.localeCompare(b.name));
   return { skills, revision: librarySnapshotRevision(skills) };
 }
@@ -103,14 +105,14 @@ export async function syncLinkedLibrary(
   const link = await readLibraryLink(home);
   if (!link) return;
   try {
-    const snapshot = await readNovaLibrary(link.root);
+    const snapshot = await readLibrarySnapshot(link.root);
     if (snapshot.revision === link.revision) {
       if (link.lastError) await saveLibraryLink(home, { ...link, lastError: undefined });
       return;
     }
     const result = await publish({ id: link.id, name: link.name, expectedRevision: link.revision, ...snapshot });
     if (!result.accepted || result.revision !== snapshot.revision)
-      throw new Error("Equip did not accept Nova's complete skill revision.");
+      throw new Error("Equip did not accept the library’s complete skill revision.");
     await saveLibraryLink(home, { ...link, revision: result.revision, lastSync: new Date().toISOString() });
     return true;
   } catch (error) {
@@ -119,10 +121,11 @@ export async function syncLinkedLibrary(
   }
 }
 
-export async function connectLibrary(home: string, path: string, name = "Nova") {
+export async function connectLibrary(home: string, path: string, name?: string) {
   const root = await realpath(resolve(path));
   // Validate before replacing a working link. No instructions or credentials are changed.
-  await readNovaLibrary(root);
+  await readLibrarySnapshot(root);
+  name = name || basename(root);
   const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   if (!id) throw new Error("The library needs a name.");
   const previous = await readLibraryLink(home);

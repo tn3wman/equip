@@ -11,9 +11,10 @@ import {
   realpath,
   rename,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type {
   DesiredState,
   Receipt,
@@ -41,6 +42,8 @@ interface LedgerEntry {
   observed?: true;
   canonicalPath?: string;
   transactionId?: string;
+  copied?: true;
+  localOwned?: true;
 }
 interface Ledger {
   generation: number;
@@ -173,6 +176,97 @@ async function writeFiles(root: string, files: SkillFile[]) {
   }
 }
 
+interface CanonicalState {
+  path: string;
+  hashes: Record<string, string>;
+  transactionId?: string;
+  oldPath?: string;
+  conflict?: { files: SkillFile[]; message: string };
+}
+
+async function pointsTo(path: string, expected: string) {
+  const info = await lstat(path).catch(() => null);
+  if (!info?.isSymbolicLink()) return false;
+  const link = await readlink(path).catch(() => "");
+  return resolve(dirname(path), link) === resolve(expected);
+}
+
+async function createManagedLink(source: string, destination: string) {
+  const target = process.platform === "win32"
+    ? source
+    : relative(dirname(destination), source);
+  await symlink(target, destination, process.platform === "win32" ? "junction" : "dir");
+}
+
+async function prepareCanonical(
+  skill: Skill,
+  home: string,
+  entries: LedgerEntry[],
+  replace: boolean,
+): Promise<CanonicalState> {
+  safeName(skill.name);
+  const path = join(home, "skills", skill.name);
+  const hashes = desiredHashes(skill.files);
+  const info = await lstat(path).catch(() => null);
+  if (info?.isSymbolicLink())
+    return {
+      path,
+      hashes,
+      conflict: {
+        files: [],
+        message: "Canonical skill path is a symbolic link and was preserved",
+      },
+    };
+  if (info) {
+    const current = await snapshot(path);
+    if (!differs(current.hashes, hashes)) return { path, hashes };
+    const baselines = entries
+      .filter((entry) => entry.canonicalPath === path || entry.observed)
+      .map((entry) => entry.files);
+    if (
+      (!baselines.length ||
+        baselines.every((baseline) => differs(current.hashes, baseline))) &&
+      !replace
+    )
+      return {
+        path,
+        hashes,
+        conflict: {
+          files: current.files,
+          message: "Canonical skill changed locally and was preserved",
+        },
+      };
+    if (entries.some((entry) => entry.canonicalPath === path && !entry.observed)) {
+      const backup = join(
+        home,
+        "backups",
+        `${Date.now()}-${skill.name}-canonical-${randomUUID()}`,
+      );
+      await mkdir(dirname(backup), { recursive: true });
+      await cp(path, backup, { recursive: true, dereference: false, preserveTimestamps: true });
+    }
+  }
+  const stage = `${path}.equip-stage-${randomUUID()}`;
+  const oldPath = `${path}.equip-old-${randomUUID()}`;
+  const transactionId = randomUUID();
+  await mkdir(stage, { recursive: true });
+  await writeFiles(stage, skill.files);
+  await saveJsonAtomic(join(home, "transaction.json"), {
+    destination: path,
+    stage,
+    oldPath,
+    hadOld: !!info,
+    revision: skill.revision,
+    transactionId,
+  } satisfies Journal);
+  if (info) await rename(path, oldPath);
+  await mkdir(dirname(path), { recursive: true });
+  await rename(stage, path);
+  await rm(oldPath, { recursive: true, force: true });
+  await rm(join(home, "transaction.json"), { force: true });
+  return { path, hashes, transactionId };
+}
+
 async function recover(home: string) {
   const path = join(home, "transaction.json");
   const journal = JSON.parse(
@@ -206,6 +300,11 @@ async function install(
   previous: LedgerEntry | undefined,
   action: string | undefined,
   home: string,
+  canonical: CanonicalState,
+  canonicalSnapshots: Map<
+    string,
+    Promise<{ files: SkillFile[]; hashes: Record<string, string> }>
+  >,
 ): Promise<{
   entry?: LedgerEntry;
   release?: boolean;
@@ -225,15 +324,51 @@ async function install(
     path: destination,
     timestamp,
   };
+  if (canonical.conflict)
+    return {
+      ...(action === "import" || action === "preserve"
+        ? { release: true }
+        : { entry: previous }),
+      receipt: {
+        ...base,
+        revision: previous?.revision ?? "",
+        status: "conflicted",
+        message:
+          action === "import"
+            ? "Imported local files and released management"
+            : action === "preserve"
+              ? "Preserved local files and released management"
+              : canonical.conflict.message,
+        localFiles: canonical.conflict.files,
+      },
+    };
   const obsoletePath =
     previous?.path !== destination ? previous?.path : undefined;
   if (obsoletePath) {
+    let oldCanonicalSnapshot:
+      | Promise<{ files: SkillFile[]; hashes: Record<string, string> }>
+      | undefined;
+    if (previous?.canonicalPath) {
+      oldCanonicalSnapshot = canonicalSnapshots.get(previous.canonicalPath);
+      if (!oldCanonicalSnapshot) {
+        oldCanonicalSnapshot = snapshot(previous.canonicalPath);
+        canonicalSnapshots.set(previous.canonicalPath, oldCanonicalSnapshot);
+      }
+    }
     const oldInfo = await lstat(obsoletePath).catch(() => null);
     const oldSnapshot = oldInfo?.isSymbolicLink()
-      ? { files: [], hashes: { ".": "symlink" } }
+      ? previous?.canonicalPath && await pointsTo(obsoletePath, previous.canonicalPath)
+        ? await oldCanonicalSnapshot!
+        : { files: [], hashes: { ".": "symlink" } }
       : await snapshot(obsoletePath);
-    const oldChanged =
-      oldInfo?.isSymbolicLink() || differs(oldSnapshot.hashes, previous?.files);
+    const oldCanonicalChanged = previous?.canonicalPath
+      ? differs((await oldCanonicalSnapshot!).hashes, previous.files)
+      : false;
+    const oldChanged = previous?.canonicalPath
+      ? previous.copied
+        ? differs(oldSnapshot.hashes, previous.files)
+        : !(await pointsTo(obsoletePath, previous.canonicalPath)) || oldCanonicalChanged
+      : oldInfo?.isSymbolicLink() || differs(oldSnapshot.hashes, previous?.files);
     const destinationInfo = await lstat(destination).catch(() => null);
     const destinationSnapshot = destinationInfo?.isSymbolicLink()
       ? { files: [], hashes: { ".": "symlink" } }
@@ -260,7 +395,7 @@ async function install(
         };
       if (
         action !== "replace" ||
-        oldInfo?.isSymbolicLink() ||
+        (oldInfo?.isSymbolicLink() && !previous?.canonicalPath) ||
         destinationInfo?.isSymbolicLink()
       )
         return {
@@ -282,11 +417,17 @@ async function install(
           "backups",
           `${Date.now()}-${basename(obsoletePath)}-${randomUUID()}`,
         );
-        await cp(obsoletePath, backup, {
+        await cp(
+          previous?.canonicalPath && await pointsTo(obsoletePath, previous.canonicalPath)
+            ? previous.canonicalPath
+            : obsoletePath,
+          backup,
+          {
           recursive: true,
           dereference: false,
           preserveTimestamps: true,
-        });
+          },
+        );
       }
     }
   }
@@ -395,10 +536,69 @@ async function install(
       },
     };
   }
-  // Nova's existing installs often point at its shared folder. Verify them,
-  // but leave ownership with Nova so removals cannot destroy preexisting work.
+  if (previous?.canonicalPath && previous.path === destination) {
+    const intact = previous.copied
+      ? !!rootInfo && !rootInfo.isSymbolicLink() &&
+        !differs((await snapshot(destination)).hashes, previous.files)
+      : await pointsTo(destination, previous.canonicalPath);
+    if (!intact)
+      return {
+        entry: previous,
+        receipt: {
+          ...base,
+          revision: previous.revision,
+          status: "conflicted",
+          message: "Managed skill link changed and was preserved",
+          localFiles: rootInfo?.isSymbolicLink()
+            ? []
+            : (await snapshot(destination)).files,
+        },
+      };
+    if (previous.copied) {
+      const transactionId = randomUUID();
+      const stage = `${destination}.equip-stage-${transactionId}`;
+      const oldPath = `${destination}.equip-old-${transactionId}`;
+      await cp(canonical.path, stage, {
+        recursive: true,
+        preserveTimestamps: true,
+      });
+      await saveJsonAtomic(join(home, "transaction.json"), {
+        destination,
+        stage,
+        oldPath,
+        hadOld: true,
+        revision: skill.revision,
+        transactionId,
+      } satisfies Journal);
+      await rename(destination, oldPath);
+      await rename(stage, destination);
+      return {
+        entry: {
+          ...previous,
+          revision: skill.revision,
+          files: canonical.hashes,
+          canonicalPath: canonical.path,
+          transactionId,
+        },
+        oldPath,
+        receipt: { ...base, status: "synchronized" },
+      };
+    }
+    return {
+      entry: {
+        ...previous,
+        revision: skill.revision,
+        files: canonical.hashes,
+        canonicalPath: canonical.path,
+        transactionId: canonical.transactionId ?? previous.transactionId,
+      },
+      receipt: { ...base, status: "synchronized" },
+    };
+  }
+  // Matching preexisting folders can be observed without taking ownership.
+  // Removals retain them, and updates still check their recorded baseline.
   let linkedLocalFiles: SkillFile[] | undefined;
-  if (rootInfo && !previous && skill.librarySourceId) {
+  if (rootInfo && !previous) {
     const existing = await snapshot(await realpath(destination));
     linkedLocalFiles = existing.files;
     if (!differs(existing.hashes, desiredHashes(skill.files)))
@@ -440,6 +640,7 @@ async function install(
   );
   if (
     !conflict &&
+    previous?.canonicalPath &&
     previous?.path === destination &&
     previous.revision === skill.revision &&
     !differs(desired, previous.files)
@@ -483,24 +684,36 @@ async function install(
       preserveTimestamps: true,
     });
   }
-  const stage = `${destination}.equip-stage-${randomUUID()}`;
-  const oldPath = `${destination}.equip-old-${randomUUID()}`;
+  await mkdir(dirname(destination), { recursive: true });
   const transactionId = randomUUID();
-  await mkdir(stage, { recursive: true });
-  await writeFiles(stage, skill.files);
-  const hadOld = !!(await lstat(destination).catch(() => null));
+  const stage = `${destination}.equip-stage-${transactionId}`;
+  const oldPath = `${destination}.equip-old-${transactionId}`;
+  let copied = false;
+  let fallbackMessage: string | undefined;
+  try {
+    await createManagedLink(canonical.path, stage);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (!code || !["EPERM", "EACCES", "ENOTSUP", "EINVAL"].includes(code))
+      throw error;
+    copied = true;
+    await cp(canonical.path, stage, {
+      recursive: true,
+      preserveTimestamps: true,
+    });
+    fallbackMessage = `Installed a managed copy because this platform refused a directory link (${code})`;
+  }
   await saveJsonAtomic(join(home, "transaction.json"), {
     destination,
     stage,
     oldPath,
-    hadOld,
+    hadOld: !!rootInfo,
     revision: skill.revision,
     obsoletePath,
     transactionId,
   } satisfies Journal);
   try {
-    if (hadOld) await rename(destination, oldPath);
-    await mkdir(dirname(destination), { recursive: true });
+    if (rootInfo) await rename(destination, oldPath);
     await rename(stage, destination);
   } catch (error) {
     if (await lstat(oldPath).catch(() => null)) {
@@ -515,15 +728,19 @@ async function install(
     profile: target.profile,
     project: target.project,
     revision: skill.revision,
-    files: desired,
+    files: canonical.hashes,
     path: destination,
+    canonicalPath: canonical.path,
     transactionId,
+    ...(copied ? { copied: true as const } : {}),
+    ...(skill.localOrigin?.deviceId === target.deviceId && skill.localOrigin?.path === await realpath(canonical.path)
+      ? { localOwned: true as const } : {}),
   };
   return {
     entry,
     oldPath,
     obsoletePath,
-    receipt: { ...base, status: "synchronized" },
+    receipt: { ...base, status: "synchronized", ...(fallbackMessage ? { message: fallbackMessage } : {}) },
   };
 }
 
@@ -562,19 +779,40 @@ export async function synchronize(
       installs: { ...ledger.installs },
     };
     const receipts: Receipt[] = [];
+    const canonicals = new Map<string, Promise<CanonicalState>>();
+    const canonicalSnapshots = new Map<
+      string,
+      Promise<{ files: SkillFile[]; hashes: Record<string, string> }>
+    >();
     for (const target of targets)
       for (const skill of desired.skills.filter(
         (s) => s.enabled && enabledFor(s, target),
       )) {
         const key = keyFor(skill, target);
         try {
+          let canonical = canonicals.get(skill.id);
+          if (!canonical) {
+            canonical = prepareCanonical(
+              skill,
+              home,
+              Object.values(ledger.installs).filter(
+                (entry) => entry.skillId === skill.id,
+              ),
+              Object.entries(desired.resolutions).some(
+                ([key, action]) => key.startsWith(`${skill.id}:`) && action === "replace",
+              ),
+            );
+            canonicals.set(skill.id, canonical);
+          }
           const result = await install(
             skill,
             target,
             ledger.installs[key],
             desired.resolutions[key] ??
-              desired.resolutions[`${skill.id}:${target.id}`],
+            desired.resolutions[`${skill.id}:${target.id}`],
             home,
+            await canonical,
+            canonicalSnapshots,
           );
           if (result.release) {
             delete next.installs[key];
@@ -614,6 +852,7 @@ export async function synchronize(
           });
         }
       }
+    await recover(home);
     const wanted = new Set(
       targets.flatMap((t) =>
         desired.skills
@@ -621,9 +860,17 @@ export async function synchronize(
           .map((s) => keyFor(s, t)),
       ),
     );
+    const removalCanonicalSnapshots = new Map<
+      string,
+      Promise<{ files: SkillFile[]; hashes: Record<string, string> }>
+    >();
+    const protectedCanonicals = new Set<string>();
+    const canonicalGcCandidates = new Set<string>();
     for (const [key, old] of Object.entries(ledger.installs))
       if (!wanted.has(key)) {
+        if (old.localOwned && old.canonicalPath) protectedCanonicals.add(old.canonicalPath);
         if (old.observed) {
+          if (old.canonicalPath) protectedCanonicals.add(old.canonicalPath);
           delete next.installs[key];
           receipts.push({
             skillId: old.skillId,
@@ -648,10 +895,24 @@ export async function synchronize(
           continue;
         }
         const oldInfo = await lstat(old.path);
-        const current = oldInfo.isSymbolicLink()
+        const managedLink = !!old.canonicalPath && !old.copied &&
+          await pointsTo(old.path, old.canonicalPath);
+        let current = oldInfo.isSymbolicLink()
           ? { files: [], hashes: { ".": "symlink" } }
           : await snapshot(old.path);
-        const changed = oldInfo.isSymbolicLink() || differs(current.hashes, old.files);
+        if (managedLink && old.canonicalPath) {
+          let canonicalSnapshot = removalCanonicalSnapshots.get(old.canonicalPath);
+          if (!canonicalSnapshot) {
+            canonicalSnapshot = snapshot(old.canonicalPath);
+            removalCanonicalSnapshots.set(old.canonicalPath, canonicalSnapshot);
+          }
+          current = await canonicalSnapshot;
+        }
+        const changed = old.canonicalPath
+          ? old.copied
+            ? differs(current.hashes, old.files)
+            : !managedLink || differs(current.hashes, old.files)
+          : oldInfo.isSymbolicLink() || differs(current.hashes, old.files);
         const action =
           desired.resolutions[key] ??
           desired.resolutions[`${old.skillId}:${old.agent}`];
@@ -662,13 +923,14 @@ export async function synchronize(
               "backups",
               `${Date.now()}-removed-${basename(old.path)}-${randomUUID()}`,
             );
-            await cp(old.path, backup, {
+            await cp(managedLink && old.canonicalPath ? old.canonicalPath : old.path, backup, {
               recursive: true,
               dereference: false,
               preserveTimestamps: true,
             });
           }
           await rm(old.path, { recursive: true, force: true });
+          if (old.canonicalPath) canonicalGcCandidates.add(old.canonicalPath);
           delete next.installs[key];
           receipts.push({
             skillId: old.skillId,
@@ -684,6 +946,7 @@ export async function synchronize(
             timestamp: new Date().toISOString(),
           });
         } else if (action === "preserve" || action === "import") {
+          if (old.canonicalPath) protectedCanonicals.add(old.canonicalPath);
           delete next.installs[key];
           receipts.push({
             skillId: old.skillId,
@@ -700,7 +963,8 @@ export async function synchronize(
             timestamp: new Date().toISOString(),
             localFiles: current.files,
           });
-        } else
+        } else {
+          if (old.canonicalPath) protectedCanonicals.add(old.canonicalPath);
           receipts.push({
             skillId: old.skillId,
             agent: old.agent,
@@ -714,9 +978,30 @@ export async function synchronize(
             timestamp: new Date().toISOString(),
             localFiles: current.files,
           });
+        }
       }
     next.generation = desired.generation;
     await saveJsonAtomic(join(home, "ledger.json"), next);
+    // Different spellings can refer to the same store (e.g. /var and
+    // /private/var on macOS). Protect the physical source of observed links.
+    const identity = async (path: string) => realpath(path).catch(() => resolve(path));
+    const referenced = new Set(await Promise.all(
+      Object.values(next.installs)
+        .map((entry) => entry.canonicalPath)
+        .filter((path): path is string => !!path)
+        .map(identity),
+    ));
+    const protectedSources = new Set(await Promise.all(
+      [...protectedCanonicals].map(identity),
+    ));
+    for (const path of canonicalGcCandidates) {
+      const source = await identity(path);
+      if (
+        !referenced.has(source) &&
+        !protectedSources.has(source)
+      )
+        await rm(path, { recursive: true, force: true });
+    }
     return receipts;
   } finally {
     await lock.close();

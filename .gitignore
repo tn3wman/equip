@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.vercel/
+.infisical.json
 .equip-data/
 *.log
 .DS_Store

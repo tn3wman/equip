@@ -287,10 +287,13 @@ export default function App() {
   const activeDevices = workspace.devices.filter((d) => !d.disconnectedAt);
   const selectedSkills = workspace.skills.filter((s) => s.selected);
   const pending = activeDevices.filter((d) => !d.online).length;
-  const startEditor = (skill?: Skill) => {
-    setEdit(skill);
-    setSelected(undefined);
-    navigate("editor");
+  const startEditor = async (skill?: Skill) => {
+    try {
+      const complete = skill && workspace.skills.some(s => s.id === skill.id) && !skill.files.length && !skill.draft ? await api<Skill>(`/skills/${skill.id}`) : skill;
+      setEdit(complete);
+      setSelected(undefined);
+      navigate("editor");
+    } catch (error) { notify((error as Error).message); }
   };
   return (
     <div className="app">
@@ -868,7 +871,7 @@ function Library({
                       <div className="skill-title">
                         {skill.title}
                         {skill.librarySourceId ? (
-                          <span className="custom-tag source-tag">From Nova</span>
+                          <span className="custom-tag source-tag">From {librarySource?.name || "linked library"}</span>
                         ) : skill.kind === "custom" && (
                           <span className="custom-tag">Custom</span>
                         )}
@@ -878,7 +881,7 @@ function Library({
                         {skill.librarySourceId ? (
                           <>
                             <span className="source-dot" />
-                            Managed by Nova
+                            Managed by {librarySource?.name || "linked library"}
                           </>
                         ) : skill.kind === "custom" ? (
                           <>
@@ -902,7 +905,7 @@ function Library({
                     ) : (
                       <span>
                         {skill.librarySourceId
-                          ? "Managed by Nova"
+                          ? `Managed by ${librarySource?.name || "linked library"}`
                           : skill.kind === "custom"
                           ? "On publish"
                           : skill.autoUpdate
@@ -1107,7 +1110,7 @@ function Library({
         <Dialog title={`Unlink ${librarySource?.name || "library"}?`} onClose={() => setConfirmUnlink(false)}>
           <div className="dialog-body">
             <p>
-              Your current skills stay installed and remain in Equip. Nova will no longer add, update, or remove them.
+              Your current skills stay installed and remain in Equip. {librarySource?.name || "The linked library"} will no longer add, update, or remove them.
             </p>
             <div className="dialog-actions">
               <button className="button" onClick={() => setConfirmUnlink(false)}>Cancel</button>
@@ -1116,7 +1119,7 @@ function Library({
                 onClick={() =>
                   run(
                     () => api("/library/unlink", "POST"),
-                    "Nova unlinked. Your current skills remain in Equip.",
+                    "Library unlinked. Your current skills remain in Equip.",
                   ).then(() => setConfirmUnlink(false))
                 }
               >
@@ -1535,6 +1538,16 @@ function Devices({
               ) : null}
               {expanded === device.id && (
                 <div className="device-expanded">
+                  <div className="notice" style={{ display: "block" }}>
+                    <label className="radio-option">
+                      <input type="checkbox" checked={device.localSync?.enabled ?? false} disabled={workspace.demo || Boolean(device.disconnect)} onChange={event => run(() => api(`/devices/${device.id}/local-sync`, "PATCH", { enabled: event.target.checked }), event.target.checked ? "Local publishing enabled. New skills and custom edits will sync from this computer." : "Local publishing disabled. Dashboard updates still install.")} />
+                      <span><strong>Publish local skills automatically</strong><small>New skill folders and custom-skill edits from these agent locations go to Equip, then your other computers. Repository and upstream skills keep their own update authority.</small></span>
+                    </label>
+                    {device.localSync?.path && <p className="muted-copy">Shared skill store: <code>{device.localSync.path}</code></p>}
+                    {device.localSync?.lastImport && <p className="muted-copy">Last local publication {ago(device.localSync.lastImport)}</p>}
+                    {device.localSync?.error && <p className="error-text">Local publication needs attention: {device.localSync.error}</p>}
+                    <p className="muted-copy">You can also publish a folder with <code>equip local add /path/to/skill</code>. Equip preserves preexisting folders and flags conflicting copies.</p>
+                  </div>
                   <h3>Detected locations</h3>
                   {device.agents.map((agent, index) => (
                     <div className="agent-location-group" key={index}>
@@ -1691,14 +1704,11 @@ function Devices({
       <div className="cloud-boundary">
         <Monitor size={22} />
         <div>
-          <h3>Local computers and cloud agents are separate.</h3>
-          <p>
-            Equip detects local agent homes and enabled T3 profiles. Claude Desktop’s
-            local Code sessions use the Claude Code skill folder. ChatGPT desktop,
-            Claude Cowork, and hosted sessions use separate account skill stores;
-            Equip cannot synchronize those accounts yet. Changing a model router
-            does not create a new skill destination unless its agent home changes.
-          </p>
+          <h3>Desktop and cloud destinations</h3>
+          <p>Claude Desktop’s local Code sessions use the detected Claude Code locations. ChatGPT Desktop supports importing Claude Code skills with automatic updates in Settings → Import. Enable that native import separately in each desktop account.</p>
+          <p>ChatGPT account skills and Claude.ai / Cowork accept ZIP uploads. Open a skill and choose Download ZIP to export its exact revision. Account uploads remain manual because those account libraries do not expose a supported publishing API through Equip’s integrations. A download is not an installation receipt.</p>
+          <p>A hosted computer with filesystem access can run the same Equip installer and <code>equip connect --headless</code> inside that environment. It then reports its own installations. An ephemeral cloud session cannot keep a background worker after its environment is destroyed.</p>
+          <p><a href="https://learn.chatgpt.com/docs/import" target="_blank" rel="noreferrer">ChatGPT desktop import <ExternalLink size={12} /></a>{" · "}<a href="https://code.claude.com/docs/en/desktop#use-skills" target="_blank" rel="noreferrer">Claude Desktop skills <ExternalLink size={12} /></a>{" · "}<a href="https://help.openai.com/en/articles/20001066-skills-in-chatgpt" target="_blank" rel="noreferrer">ChatGPT account skills <ExternalLink size={12} /></a></p>
         </div>
       </div>
       {disconnect && (
