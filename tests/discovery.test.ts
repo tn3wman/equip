@@ -133,7 +133,7 @@ test("authenticated browse passes view and pagination and audits at most five ro
   assert.ok(maximum <= 5);
   assert.match(seen[0].url, /view=hot&page=2&per_page=24/);
   assert.equal(seen[0].authorization, "Bearer secret");
-  assert.equal(seen.slice(1).every(call => call.authorization === null), true);
+  assert.equal(seen.slice(1).every(call => call.authorization === "Bearer secret"), true);
 });
 
 test("official curated groups flatten, paginate locally, and alone mark skills official", async () => {

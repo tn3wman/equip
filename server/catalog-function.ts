@@ -14,8 +14,10 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   }
   try {
     const url = new URL(req.url ?? "/", "https://equip.invalid");
+    let token: string | undefined;
+    try { token = await getVercelOidcToken(); } catch { /* Public search and available reports remain usable without identity. */ }
     if (url.pathname === "/api/skills/audits") {
-      const safety = await fetchSkillSafety(url.searchParams.get("source") ?? "", url.searchParams.get("name") ?? "");
+      const safety = await fetchSkillSafety(url.searchParams.get("source") ?? "", url.searchParams.get("name") ?? "", { token });
       res.setHeader("Cache-Control", safety.status === "unavailable" ? "no-store" : "public, max-age=30, s-maxage=60");
       return res.end(JSON.stringify(safety));
     }
@@ -26,8 +28,6 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       res.statusCode = 400;
       return res.end(JSON.stringify({ error: "Invalid discovery parameters." }));
     }
-    let token: string | undefined;
-    try { token = await getVercelOidcToken(); } catch { /* Public search remains available without identity. */ }
     const result = await discoverSkills(query, view as DiscoveryView, page, { token });
     res.setHeader("Cache-Control", result.live ? "public, max-age=30, s-maxage=60" : "no-store");
     res.end(JSON.stringify(result));

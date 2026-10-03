@@ -127,7 +127,7 @@ function statusOf(value: unknown): SkillAudit["status"] {
 export async function fetchSkillSafety(
   source: string,
   name: string,
-  options: Pick<DiscoveryOptions, "fetch" | "now"> = {},
+  options: Pick<DiscoveryOptions, "fetch" | "now" | "token"> = {},
 ): Promise<SkillSafety> {
   const checkedAt = (options.now?.() ?? new Date()).toISOString();
   const identity = catalogIdentity(source, name);
@@ -143,7 +143,7 @@ export async function fetchSkillSafety(
   try {
     const response = await (options.fetch ?? fetch)(
       `${API}/api/v1/skills/audit/${path}`,
-      { signal: AbortSignal.timeout(8_000) },
+      { ...(options.token ? { headers: { Authorization: `Bearer ${options.token}` } } : {}), signal: AbortSignal.timeout(8_000) },
     );
     if (response.status === 404)
       return {

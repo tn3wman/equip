@@ -1306,7 +1306,7 @@ function Discover({
                   ...result,
                 };
                 setImporting(false);
-                open(inspected);
+                openResolved(inspected);
               } catch (inspectError) {
                 setSourceError((inspectError as Error).message);
               } finally {

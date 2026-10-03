@@ -403,7 +403,7 @@ export default function SkillDetail({
                 <Markdown remarkPlugins={[remarkGfm]}>
                   {(
                     files.find((f) => f.path === "SKILL.md")?.content ||
-                    "No published instructions yet. Open the editor to publish this draft."
+                    (skill.kind === "third-party" ? "Load the source to read its instructions and bundled files before installing." : "No published instructions yet. Open the editor to publish this draft.")
                   ).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "")}
                 </Markdown>
               </div>
