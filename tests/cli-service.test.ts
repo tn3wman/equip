@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import test from "node:test";
 import { serviceDefinition } from "../cli/service.ts";
 
@@ -7,6 +8,7 @@ test("service definitions use absolute Node and CLI paths on every platform", as
     home: "/tmp/home",
     nodePath: "/opt/node/bin/node",
     uid: 501,
+    pathEnvironmentNames: [],
   };
   const mac = await serviceDefinition(
     "/opt/equip/equip.cjs",
@@ -47,4 +49,35 @@ test("service definitions use absolute Node and CLI paths on every platform", as
     windows.enableCommands[1].join(" "),
     /^schtasks \/Run \/TN Equip Sync /,
   );
+});
+
+test("service definitions preserve upstream agent path configuration without credentials", async () => {
+  const environment = {
+    EQUIP_SKILLS_ROOT: resolve("node_modules/skills"),
+    CODEX_HOME: "/Users/test/.codex-work",
+    CLAUDE_CONFIG_DIR: "/Users/test/.claude-work",
+    XDG_CONFIG_HOME: "/Users/test/.config-work",
+    GITHUB_TOKEN: "secret-not-for-service",
+  };
+  const options = {
+    home: "/Users/test",
+    nodePath: "/opt/node/bin/node",
+    uid: 501,
+    environment,
+  };
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    const definition = await serviceDefinition(
+      "/opt/equip/equip.cjs",
+      "/Users/test/.equip/state",
+      "https://equip.test",
+      { ...options, platform },
+    );
+    assert.match(definition.content, /CODEX_HOME/);
+    assert.match(definition.content, /CLAUDE_CONFIG_DIR/);
+    assert.match(definition.content, /XDG_CONFIG_HOME/);
+    assert.doesNotMatch(
+      definition.content,
+      /GITHUB_TOKEN|secret-not-for-service/,
+    );
+  }
 });

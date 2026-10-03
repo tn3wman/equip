@@ -19,6 +19,7 @@ import { serviceRemoval, writeService } from "./service.ts";
 import { flushReceiptOutbox, queueReceiptBatch } from "./outbox.ts";
 import { synchronize, type AgentTarget } from "./sync.ts";
 import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
+import { replaceExecutable } from "./update.ts";
 
 const exec = promisify(execFile);
 const args = process.argv.slice(2);
@@ -250,17 +251,7 @@ async function maybeUpdate(s: State) {
     const data = Buffer.from(await artifact.arrayBuffer());
     if (createHash("sha256").update(data).digest("hex") !== manifest.sha256)
       throw new Error("CLI update hash mismatch");
-    const stage = `${executable}.update`;
-    const old = `${executable}.previous`;
-    await writeFile(stage, data, { mode: 0o755 });
-    await rename(executable, old);
-    try {
-      await rename(stage, executable);
-    } catch (error) {
-      await rename(old, executable);
-      throw error;
-    }
-    await rm(old, { force: true });
+    await replaceExecutable(executable, data);
     changed = true;
   }
   await saveWorkerFields(s, { lastUpdateCheck: s.lastUpdateCheck });

@@ -18,6 +18,24 @@ export interface ServiceOptions {
   home?: string;
   nodePath?: string;
   uid?: number;
+  environment?: NodeJS.ProcessEnv;
+  pathEnvironmentNames?: string[];
+}
+
+async function upstreamPathEnvironmentNames(skillsRoot: string) {
+  const source = await readFile(join(skillsRoot, "dist/cli.mjs"), "utf8");
+  const start = source.indexOf("const home = homedir();");
+  const end = source.indexOf("const agents = {", start);
+  if (start < 0 || end < 0)
+    throw new Error(
+      "Installed skills runtime changed its agent path definitions; refusing to create an incomplete background service",
+    );
+  const names = new Set(["XDG_CONFIG_HOME"]);
+  for (const match of source
+    .slice(start, end)
+    .matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g))
+    names.add(match[1]);
+  return [...names];
 }
 
 export async function serviceDefinition(
@@ -30,24 +48,26 @@ export async function serviceDefinition(
   const home = options.home ?? homedir();
   const node = options.nodePath ?? process.execPath;
   const uid = options.uid ?? process.getuid?.();
+  const environment = options.environment ?? process.env;
   const adjacentSkills = join(
     dirname(command),
     "../runtime/node_modules/skills",
   );
   const skillsRoot =
-    process.env.EQUIP_SKILLS_ROOT ||
+    environment.EQUIP_SKILLS_ROOT ||
     (existsSync(adjacentSkills)
       ? adjacentSkills
       : join(equipHome, "runtime/node_modules/skills"));
-  const agentHome = process.env.EQUIP_AGENT_HOME;
-  const target = process.env.EQUIP_TARGET;
-  const agent = process.env.EQUIP_AGENT;
+  const pathEnvironmentNames =
+    options.pathEnvironmentNames ??
+    (await upstreamPathEnvironmentNames(skillsRoot));
   const optionalEnvironment = [
-    ["EQUIP_AGENT_HOME", agentHome],
-    ["EQUIP_TARGET", target],
-    ["EQUIP_AGENT", agent],
-    ["EQUIP_DEVICE_NAME", process.env.EQUIP_DEVICE_NAME],
-    ["EQUIP_NPM_CLI", process.env.EQUIP_NPM_CLI],
+    ["EQUIP_AGENT_HOME", environment.EQUIP_AGENT_HOME],
+    ["EQUIP_TARGET", environment.EQUIP_TARGET],
+    ["EQUIP_AGENT", environment.EQUIP_AGENT],
+    ["EQUIP_DEVICE_NAME", environment.EQUIP_DEVICE_NAME],
+    ["EQUIP_NPM_CLI", environment.EQUIP_NPM_CLI],
+    ...pathEnvironmentNames.map((name) => [name, environment[name]]),
   ];
   const plistOptional = optionalEnvironment
     .filter((entry): entry is [string, string] => !!entry[1])
