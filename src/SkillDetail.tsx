@@ -189,6 +189,16 @@ export default function SkillDetail({
               <>
                 <Folder size={13} />
                 From {workspace.librarySource?.name || "Nova"}
+                {skill.kind === "third-party" && (
+                  <a
+                    href={skill.source.startsWith("http") ? skill.source : `https://github.com/${skill.source.split("@")[0]}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label="View source repository"
+                  >
+                    <Github size={13} /> {skill.source} <ArrowUpRight size={13} />
+                  </a>
+                )}
               </>
             ) : skill.kind === "custom" ? (
               <>

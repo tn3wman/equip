@@ -763,7 +763,7 @@ function Library({
             <span>
               {librarySource.skillCount} {librarySource.skillCount === 1 ? "skill" : "skills"}
               {" · "}{sourceDevice?.name || "Disconnected computer"}
-              {" · "}Last sync {ago(librarySource.updatedAt)}
+              {" · "}Library updated {ago(librarySource.updatedAt)}
               {sourceDevice && !sourceDevice.online ? " · Source computer offline" : ""}
             </span>
           </div>
