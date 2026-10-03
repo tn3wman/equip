@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
@@ -20,7 +21,35 @@ test(
     });
     const listener = app.listen(0, "127.0.0.1");
     await new Promise<void>((resolve) => listener.once("listening", resolve));
-    const base = `http://127.0.0.1:${(listener.address() as AddressInfo).port}`;
+    const upstream = `http://127.0.0.1:${(listener.address() as AddressInfo).port}`;
+    let injectedTokenFailure = false;
+    const proxy = createServer(async (request, response) => {
+      if (request.url === "/api/device/token" && !injectedTokenFailure) {
+        injectedTokenFailure = true;
+        response.writeHead(502, { "retry-after": "0" });
+        response.end("temporary upstream failure");
+        return;
+      }
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const forwarded = await fetch(`${upstream}${request.url}`, {
+        method: request.method,
+        headers: request.headers as Record<string, string>,
+        body:
+          request.method === "GET" || request.method === "HEAD"
+            ? undefined
+            : Buffer.concat(chunks),
+      });
+      const headers = Object.fromEntries(forwarded.headers.entries());
+      delete headers["content-encoding"];
+      delete headers["content-length"];
+      delete headers["transfer-encoding"];
+      response.writeHead(forwarded.status, headers);
+      response.end(Buffer.from(await forwarded.arrayBuffer()));
+    });
+    proxy.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve) => proxy.once("listening", resolve));
+    const base = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
     try {
       const registration = await fetch(`${base}/api/auth/register`, {
         method: "POST",
@@ -98,6 +127,7 @@ test(
         child.once("error", reject);
       });
       assert.equal(exit, 0, output);
+      assert.equal(injectedTokenFailure, true);
       assert.match(output, /Connected and synchronized 1 installation/);
       const state = JSON.parse(
         await readFile(join(root, "client/state.json"), "utf8"),
@@ -110,6 +140,7 @@ test(
         "---\nname: private-test\ndescription: Device-resolved source\n---\n# Private\n",
       );
     } finally {
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
       await new Promise<void>((resolve) => listener.close(() => resolve()));
       await close();
       await rm(root, { recursive: true, force: true });

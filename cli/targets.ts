@@ -7,6 +7,15 @@ export interface CompatibleAgent {
   projectPath: string;
 }
 
+export function retainedConfiguredTargets(
+  autoDetect: boolean | undefined,
+  targets: AgentTarget[],
+) {
+  return autoDetect === false
+    ? targets
+    : targets.filter((target) => target.profile || target.project);
+}
+
 export function selectAgentTargets(
   compatible: CompatibleAgent[],
   detected: CompatibleAgent[],

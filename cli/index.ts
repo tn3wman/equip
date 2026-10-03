@@ -18,7 +18,7 @@ import {
 import { serviceRemoval, writeService } from "./service.ts";
 import { flushReceiptOutbox, queueReceiptBatch } from "./outbox.ts";
 import { synchronize, type AgentTarget } from "./sync.ts";
-import { selectAgentTargets } from "./targets.ts";
+import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
 
 const exec = promisify(execFile);
 const args = process.argv.slice(2);
@@ -268,6 +268,21 @@ async function maybeUpdate(s: State) {
 }
 async function runSync(s: State) {
   if (!s.token) throw new Error("Not connected. Run equip connect.");
+  const configuredTargets = retainedConfiguredTargets(
+    s.autoDetect,
+    s.targets ?? [],
+  );
+  if (configuredTargets.length !== (s.targets ?? []).length) {
+    const latest = await state();
+    if (latest.deviceId === s.deviceId && latest.token === s.token) {
+      latest.targets = retainedConfiguredTargets(
+        latest.autoDetect,
+        latest.targets ?? [],
+      );
+      await save(latest);
+    }
+    s.targets = configuredTargets;
+  }
   const explicitTarget = targetOption();
   const selected = explicitTarget
     ? [
@@ -280,7 +295,7 @@ async function runSync(s: State) {
       ]
     : uniqueTargets([
         ...(s.autoDetect === false ? [] : await targetsFromFlags()),
-        ...(s.targets ?? []),
+        ...configuredTargets,
       ]);
   const targets = selected.map((t) => ({ ...t, deviceId: s.deviceId }));
   const base = s.server || server;
@@ -391,6 +406,23 @@ async function openUrl(url: string) {
   const toolArgs = platform() === "win32" ? ["/c", "start", "", url] : [url];
   await exec(tool, toolArgs).catch(() => {});
 }
+function retryDelay(response: Response | undefined, interval: number) {
+  const value = response?.headers.get("retry-after");
+  if (!value) return Math.max(1, interval) * 1000;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date)
+    ? Math.max(0, date - Date.now())
+    : Math.max(1, interval) * 1000;
+}
+async function waitWithinDeadline(milliseconds: number, deadline: number) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return;
+  await new Promise((resolve) =>
+    setTimeout(resolve, Math.min(milliseconds, remaining)),
+  );
+}
 async function ensureService(s: State) {
   if (
     s.service ||
@@ -466,20 +498,35 @@ async function main() {
     const deadline = Date.now() + auth.expiresIn * 1000;
     let connected: { token: string; deviceId: string } | undefined;
     while (Date.now() < deadline) {
-      const response = await fetch(`${server}/api/device/token`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceCode: auth.deviceCode }),
-      });
+      let response: Response | undefined;
+      try {
+        response = await fetch(`${server}/api/device/token`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ deviceCode: auth.deviceCode }),
+          signal: AbortSignal.timeout(
+            Math.max(1, Math.min(15_000, deadline - Date.now())),
+          ),
+        });
+      } catch {
+        await waitWithinDeadline(
+          retryDelay(undefined, auth.interval),
+          deadline,
+        );
+        continue;
+      }
       if (response.ok) {
         connected = await response.json();
         break;
       }
-      if (response.status !== 428)
+      const retryable =
+        response.status === 408 ||
+        response.status === 428 ||
+        response.status === 429 ||
+        response.status >= 500;
+      if (!retryable)
         throw new Error(`${response.status} ${await response.text()}`);
-      await new Promise((r) =>
-        setTimeout(r, Math.max(1, auth.interval) * 1000),
-      );
+      await waitWithinDeadline(retryDelay(response, auth.interval), deadline);
     }
     if (!connected) throw new Error("Authorization expired");
     const configuredTarget = targetOption();
@@ -493,12 +540,23 @@ async function main() {
           },
         ]
       : [];
-    const noDetect = has("--no-detect") || explicitTargets.length > 0;
+    const explicitSelection =
+      explicitTargets.length > 0 ||
+      !!option("--agents") ||
+      !!agentOption() ||
+      !!option("--profile") ||
+      !!option("--project");
+    const noDetect = has("--no-detect") || explicitSelection;
+    const persistedTargets = explicitTargets.length
+      ? explicitTargets
+      : explicitSelection
+        ? await targetsFromFlags()
+        : [];
     const s: State = {
       ...connected,
       server,
       name: deviceName,
-      targets: noDetect ? explicitTargets : await targetsFromFlags(),
+      targets: persistedTargets,
       autoDetect: !noDetect,
     };
     await save(s);

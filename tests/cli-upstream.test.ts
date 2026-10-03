@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
@@ -75,32 +75,57 @@ test("local source resolution captures the complete immutable folder", async () 
 
 test("agent detection uses upstream global definitions and installation markers", async () => {
   const home = await mkdtemp(join(tmpdir(), "equip-agents-test-"));
+  const hostConfig = await mkdtemp(join(tmpdir(), "equip-host-config-"));
   const codex = join(home, "custom-codex");
   const claude = join(home, "custom-claude");
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  const previousCodex = process.env.CODEX_HOME;
+  const previousClaude = process.env.CLAUDE_CONFIG_DIR;
   process.env.CODEX_HOME = codex;
   process.env.CLAUDE_CONFIG_DIR = claude;
+  process.env.XDG_CONFIG_HOME = hostConfig;
   await mkdir(codex);
   await mkdir(claude);
   await mkdir(join(home, ".codex"));
   await mkdir(join(home, ".claude"));
-  const compatibility = await getCompatibility(home);
-  assert.equal(
-    compatibility.agents.find((agent) => agent.id === "codex")?.globalPath,
-    join(home, ".codex/skills"),
-  );
-  assert.equal(
-    compatibility.agents.find((agent) => agent.id === "claude-code")
-      ?.globalPath,
-    join(home, ".claude/skills"),
-  );
-  assert.equal(
-    compatibility.agents.find((agent) => agent.id === "codex")?.name,
-    "Codex",
-  );
-  const detected = await getDetectedAgents(home);
-  assert.ok(detected.some((agent) => agent.id === "codex"));
-  assert.ok(detected.some((agent) => agent.id === "claude-code"));
-  assert.ok(!detected.some((agent) => agent.id === "universal"));
+  await mkdir(join(hostConfig, "opencode"));
+  try {
+    const compatibility = await getCompatibility(home);
+    assert.equal(
+      compatibility.agents.find((agent) => agent.id === "codex")?.globalPath,
+      join(home, ".codex/skills"),
+    );
+    assert.equal(
+      compatibility.agents.find((agent) => agent.id === "claude-code")
+        ?.globalPath,
+      join(home, ".claude/skills"),
+    );
+    assert.equal(
+      compatibility.agents.find((agent) => agent.id === "codex")?.name,
+      "Codex",
+    );
+    assert.ok(
+      compatibility.agents
+        .filter((agent) => agent.globalPath)
+        .every(
+          (agent) =>
+            agent.globalPath === home ||
+            agent.globalPath.startsWith(`${home}${sep}`),
+        ),
+    );
+    const detected = await getDetectedAgents(home);
+    assert.ok(detected.some((agent) => agent.id === "codex"));
+    assert.ok(detected.some((agent) => agent.id === "claude-code"));
+    assert.ok(!detected.some((agent) => agent.id === "universal"));
+    assert.ok(!detected.some((agent) => agent.id === "opencode"));
+  } finally {
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
+    if (previousCodex === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodex;
+    if (previousClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previousClaude;
+  }
 });
 
 test("upstream parser accepts SSH source syntax", async () => {

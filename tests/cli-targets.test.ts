@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { selectAgentTargets } from "../cli/targets.ts";
+import {
+  retainedConfiguredTargets,
+  selectAgentTargets,
+} from "../cli/targets.ts";
 
 const agents = [
   {
@@ -25,4 +28,14 @@ test("explicit project-only agent requires and respects a project root", () => {
   const selected = selectAgentTargets(agents, agents, ["eve"], "/workspace");
   assert.equal(selected[0].path, "/workspace/agent/skills");
   assert.equal(selected[0].project, "/workspace");
+});
+
+test("auto detection drops cached globals but retains explicit profiles and projects", () => {
+  const targets = [
+    { id: "opencode", path: "/old-host-config/opencode/skills" },
+    { id: "codex", path: "/profiles/work", profile: "work" },
+    { id: "claude-code", path: "/project/.claude/skills", project: "/project" },
+  ];
+  assert.deepEqual(retainedConfiguredTargets(true, targets), targets.slice(1));
+  assert.deepEqual(retainedConfiguredTargets(false, targets), targets);
 });

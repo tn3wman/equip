@@ -277,30 +277,28 @@ export async function discoverSkills(
       }>;
     };
     const now = new Date().toISOString();
-    const skills = (body.skills ?? []).map(
-      (s): Skill => ({
-        id: s.id,
-        name: s.skillId,
-        title: s.name,
-        description: "",
-        author: s.source.split("/")[0],
-        source: s.source,
-        kind: "third-party",
-        category: category || "Community",
-        icon: "Sparkles",
-        color: "#7067CF",
-        selected: false,
-        enabled: false,
-        autoUpdate: true,
-        revision: "",
-        versions: [],
-        files: [],
-        requirements: [],
-        targets: [],
-        installs: s.installs,
-        updatedAt: now,
-      }),
-    );
+    const skills = (body.skills ?? []).map((s): Skill => ({
+      id: s.id,
+      name: s.skillId,
+      title: s.name,
+      description: "",
+      author: s.source.split("/")[0],
+      source: s.source,
+      kind: "third-party",
+      category: category || "Community",
+      icon: "Sparkles",
+      color: "#7067CF",
+      selected: false,
+      enabled: false,
+      autoUpdate: true,
+      revision: "",
+      versions: [],
+      files: [],
+      requirements: [],
+      targets: [],
+      installs: s.installs,
+      updatedAt: now,
+    }));
     return { skills, live: true };
   } catch (error) {
     return {
@@ -371,7 +369,19 @@ async function upstreamBinding(home?: string) {
         "const home = homedir();",
         `const home = ${JSON.stringify(home || "")} || homedir();`,
       );
-    if (home)
+    if (home) {
+      if (
+        !source.includes(
+          'const configHome = xdgConfig ?? join(home, ".config");',
+        )
+      )
+        throw new Error(
+          `skills ${upstream.version} XDG binding signature changed; refusing an unsafe isolated compatibility guess`,
+        );
+      source = source.replace(
+        'const configHome = xdgConfig ?? join(home, ".config");',
+        'const configHome = join(home, ".config");',
+      );
       for (const variable of [
         "CODEX_HOME",
         "CLAUDE_CONFIG_DIR",
@@ -382,8 +392,10 @@ async function upstreamBinding(home?: string) {
         "SARVAM_HOME",
         "APPDATA",
         "FLATPAK_XDG_CONFIG_HOME",
+        "XDG_CONFIG_HOME",
       ])
         source = source.replaceAll(`process.env.${variable}`, "undefined");
+    }
     source = source.replace(
       ending,
       "export { agents, detectInstalledAgents, parseSource };",
