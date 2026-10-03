@@ -1599,7 +1599,7 @@ kbd {
   padding-left: 24px;
 }
 .agent-location.alias strong {
-  color: #78896a;
+  color: #526b40;
   font-family: var(--mono);
   font-size: 9px;
 }

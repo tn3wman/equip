@@ -500,8 +500,11 @@ export async function synchronize(
             path: old.path, timestamp: new Date().toISOString() });
           continue;
         }
-        const current = await snapshot(old.path);
-        const changed = differs(current.hashes, old.files);
+        const oldInfo = await lstat(old.path);
+        const current = oldInfo.isSymbolicLink()
+          ? { files: [], hashes: { ".": "symlink" } }
+          : await snapshot(old.path);
+        const changed = oldInfo.isSymbolicLink() || differs(current.hashes, old.files);
         const action =
           desired.resolutions[key] ??
           desired.resolutions[`${old.skillId}:${old.agent}`];

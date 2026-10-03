@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -584,4 +584,18 @@ test("an unchanged revision leaves the installed directory in place", async () =
   const after = await stat(join(target, "demo"));
   assert.equal(after.ino, before.ino);
   assert.equal(after.mtimeMs, before.mtimeMs);
+});
+
+
+test("removal preserves a locally substituted symlink even when its contents match", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-removal-link-"));
+  const target = join(root, "agent"), home = join(root, "state");
+  const targets = [{ id: "codex", path: target }];
+  await synchronize(desired([skill("one")]), targets, home);
+  await rename(join(target, "demo"), join(root, "local-work"));
+  await symlink(join(root, "local-work"), join(target, "demo"));
+  const receipts = await synchronize(desired([]), targets, home);
+  assert.equal(receipts[0].status, "conflicted");
+  assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+  assert.equal(await readFile(join(root, "local-work/SKILL.md"), "utf8"), "one");
 });
