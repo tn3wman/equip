@@ -156,7 +156,7 @@ export default function App() {
   }, [menu]);
   const refresh = useCallback(async () => {
     try {
-      setWorkspace(await api<Workspace>("/workspace"));
+      setWorkspace(await api<Workspace>("/workspace?view=dashboard"));
       setError("");
     } catch (e) {
       setError((e as Error).message);

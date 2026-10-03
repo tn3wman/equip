@@ -336,7 +336,7 @@ function validateFileEntries(files: unknown): asserts files is SkillFile[] {
         throw httpError(400, `A file conflicts with a directory: ${filePath}`);
   }
 }
-function validateFiles(files: SkillFile[]) {
+function validateFiles(files: SkillFile[], descriptionLimit = 1024) {
   validateFileEntries(files);
   if (files.length === 0)
     throw httpError(400, "A skill needs at least one file.");
@@ -371,9 +371,12 @@ function validateFiles(files: SkillFile[]) {
   if (
     typeof description !== "string" ||
     !description.trim() ||
-    description.length > 1024
+    description.length > descriptionLimit
   )
-    throw httpError(400, "Frontmatter description must be 1–1024 characters.");
+    throw httpError(
+      400,
+      `Frontmatter description must be 1–${descriptionLimit} characters.`,
+    );
   return { name, description: description.trim() };
 }
 function revision(files: SkillFile[]) {
@@ -417,7 +420,7 @@ function validateLibrarySnapshot(body: unknown): {
       (item.kind !== "custom" && item.kind !== "third-party")
     )
       throw httpError(400, "A library skill has invalid fields.");
-    const metadata = validateFiles(item.files);
+    const metadata = validateFiles(item.files, 16_384);
     if (metadata.name !== item.name)
       throw httpError(400, `Skill ${item.name} does not match its frontmatter name.`);
     if (names.has(item.name))
@@ -706,6 +709,10 @@ export async function createApp(
         device.online =
           !device.disconnectedAt && Date.parse(device.lastSeen) >= cutoff;
     });
+    // The dashboard uses history metadata; rollback reads immutable files on the server.
+    if (req.query.view === "dashboard")
+      for (const skill of workspace.skills)
+        skill.versions = skill.versions.map(version => ({ ...version, files: [] }));
     res.json(workspace);
   });
 
@@ -783,7 +790,7 @@ export async function createApp(
         const source = String(req.body?.source ?? "");
         if (!source) throw httpError(400, "source is required.");
         const resolved = await resolveSource(source, req.body?.name);
-        validateFiles(resolved.files);
+        validateFiles(resolved.files, 16_384);
         res.json(resolved);
       } catch (error) {
         next(error);
@@ -915,7 +922,7 @@ export async function createApp(
           error?.message ?? "Source unavailable on server.",
         );
       }
-      const metadata = validateFiles(resolved.files);
+      const metadata = validateFiles(resolved.files, 16_384);
       resolved.name = metadata.name;
       resolved.description = metadata.description;
       if (req.workspace!.skills.some((skill) => skill.name === resolved.name))
@@ -1075,7 +1082,7 @@ export async function createApp(
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
       const resolved: any = await resolveSource(skill.source, skill.name);
-      const metadata = validateFiles(resolved.files);
+      const metadata = validateFiles(resolved.files, 16_384);
       if (
         req.workspace!.skills.some(
           (other) => other.id !== skill.id && other.name === metadata.name,
@@ -1105,7 +1112,10 @@ export async function createApp(
       const skill = findSkill(req);
       const version = skill.versions.find((v) => v.id === req.body?.versionId);
       if (!version) throw httpError(404, "Version not found.");
-      const metadata = validateFiles(version.files);
+      const metadata = validateFiles(
+        version.files,
+        skill.kind === "third-party" ? 16_384 : 1024,
+      );
       if (
         req.workspace!.skills.some(
           (other) => other.id !== skill.id && other.name === metadata.name,
@@ -1164,7 +1174,7 @@ export async function createApp(
           error?.message ?? "Source unavailable on server.",
         );
       }
-      const metadata = validateFiles(resolved.files);
+      const metadata = validateFiles(resolved.files, 16_384);
       const skill: Skill = {
         ...resolved,
         name: metadata.name,
@@ -1473,7 +1483,10 @@ export async function createApp(
 
         const descriptions = new Map<string, string>();
         for (const incoming of snapshot.skills)
-          descriptions.set(incoming.name, validateFiles(incoming.files).description);
+          descriptions.set(
+            incoming.name,
+            validateFiles(incoming.files, 16_384).description,
+          );
         const excluded = new Set(linked?.excludedSkills ?? []);
         const incomingNames = new Set(snapshot.skills.map((skill) => skill.name));
         workspace.skills = workspace.skills.filter(
@@ -1633,7 +1646,7 @@ export async function createApp(
           !resolved.revision
         )
           throw httpError(400, "Resolved source does not match the request.");
-        validateFiles(resolved.files);
+        validateFiles(resolved.files, 16_384);
         if (sourceRequest.skillId) {
           const skill = req.workspace!.skills.find(
             (item) => item.id === sourceRequest.skillId,
@@ -2107,7 +2120,7 @@ export async function createApp(
                 skill.source,
                 skill.name,
               );
-              validateFiles(resolved.files);
+              validateFiles(resolved.files, 16_384);
               const nextRevision =
                 resolved.revision || revision(resolved.files);
               skill.upstreamRevision =

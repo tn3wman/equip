@@ -494,6 +494,66 @@ test("Nova library snapshots are authoritative, atomic, device-bound, and unlink
   assert.ok(browserRetained.body.skills.find((skill: any) => skill.name === "alpha"));
 });
 
+test("source ingestion accepts long descriptions without weakening custom publishing", async () => {
+  const cookie = await register("long-source-description@example.com");
+  const device = await connectDevice(cookie, "Long description source");
+  const description = "Detailed upstream guidance. ".repeat(80);
+  assert.ok(description.length > 1024 && description.length < 16_384);
+  const files = [
+    {
+      path: "SKILL.md",
+      content: `---\nname: long-description\ndescription: ${description}\n---\n\n# Source\n`,
+    },
+  ];
+  const skills: LibrarySnapshotSkill[] = [
+    {
+      name: "long-description",
+      title: "Long description",
+      source: "nova:skills/long-description",
+      kind: "custom",
+      files,
+    },
+  ];
+  const body = libraryBody(skills);
+  const accepted = await call("/api/device/library", {
+    method: "POST",
+    headers: device.headers,
+    body: JSON.stringify(body),
+  });
+  assert.equal(accepted.response.status, 200);
+  assert.equal(accepted.body.revision, body.revision);
+  const workspace = await call("/api/workspace", {}, cookie);
+  const imported = workspace.body.skills.find(
+    (skill: any) => skill.name === "long-description",
+  );
+  assert.equal(imported.files[0].content, files[0].content);
+  assert.equal(imported.description, description.trim());
+
+  const custom = await post(
+    "/api/skills",
+    {
+      title: "Custom long description",
+      name: "custom-long-description",
+      description: "Draft",
+      files: [
+        {
+          path: "SKILL.md",
+          content: `---\nname: custom-long-description\ndescription: ${description}\n---\n`,
+        },
+      ],
+    },
+    cookie,
+  );
+  assert.equal(custom.response.status, 200);
+  const rejected = await post(
+    `/api/skills/${custom.body.id}/publish`,
+    { files: custom.body.draft },
+    cookie,
+  );
+  assert.equal(rejected.response.status, 400);
+  assert.match(rejected.body.error, /1–1024 characters/);
+});
+
 test("device authorization is account-bound, single-use, and receipts drive state", async () => {
   const cookie = await register("device-owner@example.com");
   const auth = await post("/api/device/authorize", {
