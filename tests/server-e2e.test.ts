@@ -9,7 +9,7 @@ import { synchronize } from "../cli/sync.ts";
 
 test("two devices install independently and removal preserves only the edited copy", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "equip-api-e2e-"));
-  const { app, close } = createApp({
+  const { app, close } = await createApp({
     dataDir: path.join(root, "data"),
     autoUpdateIntervalMs: 0,
   });
@@ -160,7 +160,7 @@ test("two devices install independently and removal preserves only the edited co
     assert.equal(removedDevice.appliedGeneration, workspace.body.generation);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    close();
+    await close();
     await rm(root, { recursive: true, force: true });
   }
 });

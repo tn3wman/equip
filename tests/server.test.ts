@@ -13,7 +13,7 @@ let resolverCalls = 0;
 
 before(async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "equip-server-test-"));
-  const { app, close } = createApp({
+  const { app, close } = await createApp({
     dataDir,
     autoUpdateIntervalMs: 0,
     sourceResolver: async (source, name) => {
@@ -32,7 +32,7 @@ before(async () => {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     );
-    close();
+    await close();
     await rm(dataDir, { recursive: true, force: true });
   };
 });
@@ -125,6 +125,37 @@ test("skill inspection requires a real account and rejects server-local sources 
   assert.equal(remote.response.status, 200);
   assert.equal(remote.body.name, "vercel-react-best-practices");
   assert.equal(resolverCalls, callsBeforeLocal + 1);
+});
+
+test("workflow assistance returns a reviewable valid skill draft", async () => {
+  const cookie = await register("assist@example.com");
+  const invalid = await post(
+    "/api/skills/assist",
+    { title: "Release checklist", workflow: "" },
+    cookie,
+  );
+  assert.equal(invalid.response.status, 400);
+  assert.match(invalid.body.error, /Describe the workflow/);
+
+  const assisted = await post(
+    "/api/skills/assist",
+    {
+      title: "Release checklist",
+      workflow:
+        "Review the listed changes.\n\nConfirm every stated acceptance criterion before publishing.",
+    },
+    cookie,
+  );
+  assert.equal(assisted.response.status, 200);
+  assert.equal(assisted.body.files.length, 1);
+  const content = assisted.body.files[0].content;
+  assert.match(content, /name: release-checklist/);
+  assert.match(content, /## Inputs/);
+  assert.match(content, /1\. Review the listed changes\./);
+  assert.match(
+    content,
+    /2\. Confirm every stated acceptance criterion before publishing\./,
+  );
 });
 
 test("accounts are isolated and passwords are checked", async () => {

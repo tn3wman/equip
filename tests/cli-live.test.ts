@@ -14,7 +14,7 @@ test(
   { timeout: 15_000 },
   async () => {
     const root = await mkdtemp(join(tmpdir(), "equip-cli-live-"));
-    const { app, close } = createApp({
+    const { app, close } = await createApp({
       dataDir: join(root, "server"),
       autoUpdateIntervalMs: 0,
     });
@@ -111,7 +111,7 @@ test(
       );
     } finally {
       await new Promise<void>((resolve) => listener.close(() => resolve()));
-      close();
+      await close();
       await rm(root, { recursive: true, force: true });
     }
   },

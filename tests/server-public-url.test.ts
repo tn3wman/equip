@@ -8,7 +8,7 @@ import { createApp } from "../server/app.ts";
 
 test("public HTTPS origin drives authorization, installers, and secure cookies", async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "equip-public-url-"));
-  const { app, close } = createApp({
+  const { app, close } = await createApp({
     dataDir,
     autoUpdateIntervalMs: 0,
     publicUrl: "https://equip.example.test",
@@ -46,18 +46,18 @@ test("public HTTPS origin drives authorization, installers, and secure cookies",
     assert.doesNotMatch(installer, /127\.0\.0\.1/);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    close();
+    await close();
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("public URL rejects non-origin and non-HTTP values", () => {
-  assert.throws(
-    () => createApp({ publicUrl: "https://equip.example.test/path" }),
+test("public URL rejects non-origin and non-HTTP values", async () => {
+  await assert.rejects(
+    async () => await createApp({ publicUrl: "https://equip.example.test/path" }),
     /must be an HTTP\(S\) origin/,
   );
-  assert.throws(
-    () => createApp({ publicUrl: "javascript:alert(1)" }),
+  await assert.rejects(
+    async () => await createApp({ publicUrl: "javascript:alert(1)" }),
     /must be an HTTP\(S\) origin/,
   );
 });

@@ -58,6 +58,7 @@ export default function Editor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [assistedDraft, setAssistedDraft] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   const assets = useRef<HTMLInputElement>(null);
   const file = files.find((f) => f.path === active) || files[0];
@@ -134,6 +135,8 @@ export default function Editor({
       setFiles(result.files);
       setActive("SKILL.md");
       setMode("scratch");
+      setPreview(true);
+      setAssistedDraft(true);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -293,12 +296,12 @@ export default function Editor({
       </label>
       {mode === "assist" ? (
         <section className="assisted-editor">
-          <Sparkles size={27} />
+          <FileText size={27} />
           <h2>What should your agent know how to do?</h2>
           <p>
             Describe the inputs, the steps, and what a good result looks like.
-            Equip creates a valid starting template for you to review and
-            refine.
+            Equip turns those details into a structured starting template. You
+            review every instruction before publishing.
           </p>
           <label className="field">
             Your workflow
@@ -319,9 +322,9 @@ export default function Editor({
               {busy ? (
                 <Loader2 className="spin" size={16} />
               ) : (
-                <Sparkles size={16} />
+                <FileText size={16} />
               )}
-              Create starting draft
+              Build starting draft
             </button>
           </div>
         </section>
@@ -384,6 +387,16 @@ export default function Editor({
         </section>
       ) : (
         <>
+          {assistedDraft ? (
+            <div className="notice assisted-review" role="status">
+              <Check size={16} />
+              <span>
+                Your starting draft is ready. Read the preview, then switch to
+                Edit to change the instructions before publishing.
+              </span>
+              <button onClick={() => setPreview(false)}>Edit draft</button>
+            </div>
+          ) : null}
           <div className="editor-workbench">
             <aside className="editor-file-tree">
               <div className="editor-file-tree-head">

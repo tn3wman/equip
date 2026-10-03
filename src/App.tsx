@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useRef,
   useState,
   type FormEvent,
 } from "react";
@@ -80,6 +81,8 @@ export default function App() {
     () => (location.hash.slice(1) as Page) || "library",
   );
   const [workspace, setWorkspace] = useState<Workspace>();
+  const [emailSignIn, setEmailSignIn] = useState(false);
+  const [authLinkError, setAuthLinkError] = useState("");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Skill>();
   const [edit, setEdit] = useState<Skill>();
@@ -92,6 +95,7 @@ export default function App() {
   const [approval, setApproval] = useState(
     new URLSearchParams(location.search).get("code") || "",
   );
+  const bootstrap = useRef<Promise<void> | null>(null);
   useEffect(() => {
     if (!menu) return;
     const previous = document.activeElement as HTMLElement;
@@ -135,9 +139,46 @@ export default function App() {
     }
   }, []);
   useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
+    if (!bootstrap.current) {
+      const search = new URLSearchParams(location.search);
+      const token = search.get("token");
+
+      if (token) {
+        search.delete("token");
+        const cleanUrl = `${location.pathname}${search.size ? `?${search}` : ""}${location.hash}`;
+        history.replaceState(null, "", cleanUrl);
+      }
+
+      const config = api<{ emailSignIn: boolean }>("/auth/config")
+        .then((result) => setEmailSignIn(result.emailSignIn))
+        .catch(() => undefined);
+      const load = token
+        ? api<Workspace>("/auth/email/consume", "POST", { token })
+            .then((result) => {
+              setWorkspace(result);
+              setError("");
+            })
+            .catch(async () => {
+              setAuthLinkError(
+                "That sign-in link is invalid or has expired. Request a fresh link below.",
+              );
+              setAuth(true);
+              await refresh();
+            })
+        : refresh();
+
+      bootstrap.current = Promise.all([config, load]).then(() => undefined);
+    }
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    void bootstrap.current.then(() => {
+      if (!cancelled) timer = setInterval(refresh, 5000);
+    });
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
   }, [refresh]);
   useEffect(() => {
     const hash = () => {
@@ -497,10 +538,13 @@ export default function App() {
       {auth && (
         <AuthDialog
           workspace={workspace}
+          emailSignIn={emailSignIn}
+          initialError={authLinkError}
           onClose={() => setAuth(false)}
           onSuccess={async (message) => {
             await refresh();
             setAuth(false);
+            setAuthLinkError("");
             notify(message);
           }}
         />
@@ -1877,10 +1921,14 @@ function ConnectDialog({
 
 function AuthDialog({
   workspace,
+  emailSignIn,
+  initialError,
   onClose,
   onSuccess,
 }: {
   workspace: Workspace;
+  emailSignIn: boolean;
+  initialError: string;
   onClose: () => void;
   onSuccess: (message: string) => Promise<void>;
 }) {
@@ -1889,11 +1937,25 @@ function AuthDialog({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(initialError);
+  const [sent, setSent] = useState(false);
+  const sendEmailLink = async () => {
+    await api("/auth/email", "POST", {
+      email,
+      name: name.trim() || undefined,
+      returnTo: `${location.pathname}${location.search}`,
+    });
+    setSent(true);
+  };
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true);
+    setError("");
     try {
+      if (emailSignIn) {
+        await sendEmailLink();
+        return;
+      }
       await api(`/auth/${mode}`, "POST", { name, email, password });
       await onSuccess(
         mode === "register"
@@ -1937,68 +1999,116 @@ function AuthDialog({
         ) : (
           <>
             <p>
-              Create a personal workspace to connect real computers. The demo
-              library stays separate.
+              {emailSignIn
+                ? "Use your email to open your personal workspace and connect real computers."
+                : "Create a personal workspace to connect real computers. The demo library stays separate."}
             </p>
-            <form onSubmit={submit} className="auth-form">
-              {mode === "register" && (
+            {emailSignIn && sent ? (
+              <div className="auth-sent" role="status">
+                <Check size={20} />
+                <div>
+                  <strong>Check your inbox</strong>
+                  <p>
+                    We sent a sign-in link to <strong>{email}</strong>. You can
+                    close this window after opening it.
+                  </p>
+                </div>
+                <button
+                  className="button full-width"
+                  disabled={busy}
+                  onClick={async () => {
+                    setBusy(true);
+                    setError("");
+                    try {
+                      await sendEmailLink();
+                    } catch (e) {
+                      setError((e as Error).message);
+                      setSent(false);
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  {busy ? <Loader2 className="spin" size={16} /> : null}
+                  Send another link
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={submit} className="auth-form">
+                {(emailSignIn || mode === "register") && (
+                  <label className="field">
+                    Your name
+                    {emailSignIn ? (
+                      <span className="field-hint">
+                        Optional for your first account
+                      </span>
+                    ) : null}
+                    <input
+                      autoComplete="name"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      required={!emailSignIn}
+                      placeholder="Alex Morgan"
+                    />
+                  </label>
+                )}
                 <label className="field">
-                  Your name
+                  Email address
                   <input
-                    autoComplete="name"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
+                    type="email"
+                    autoComplete="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
                     required
-                    placeholder="Alex Morgan"
+                    placeholder="you@example.com"
                   />
                 </label>
-              )}
-              <label className="field">
-                Email address
-                <input
-                  type="email"
-                  autoComplete="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  required
-                  placeholder="you@example.com"
-                />
-              </label>
-              <label className="field">
-                Password
-                <input
-                  type="password"
-                  autoComplete={
-                    mode === "register" ? "new-password" : "current-password"
-                  }
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  minLength={10}
-                  required
-                  placeholder="At least 10 characters"
-                />
-              </label>
-              {error && (
-                <p className="form-error" role="alert">
-                  {error}
-                </p>
-              )}
-              <button disabled={busy} className="button primary full-width">
-                {busy ? <Loader2 className="spin" size={16} /> : null}
-                {mode === "register" ? "Create your account" : "Sign in"}
-                <ArrowRight size={16} />
+                {!emailSignIn && (
+                  <label className="field">
+                    Password
+                    <input
+                      type="password"
+                      autoComplete={
+                        mode === "register"
+                          ? "new-password"
+                          : "current-password"
+                      }
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      minLength={10}
+                      required
+                      placeholder="At least 10 characters"
+                    />
+                  </label>
+                )}
+                {error && (
+                  <p className="form-error" role="alert">
+                    {error}
+                  </p>
+                )}
+                <button disabled={busy} className="button primary full-width">
+                  {busy ? <Loader2 className="spin" size={16} /> : null}
+                  {emailSignIn
+                    ? "Send sign-in link"
+                    : mode === "register"
+                      ? "Create your account"
+                      : "Sign in"}
+                  <ArrowRight size={16} />
+                </button>
+              </form>
+            )}
+            {!emailSignIn && (
+              <button
+                className="auth-switch"
+                onClick={() =>
+                  setMode(mode === "register" ? "login" : "register")
+                }
+              >
+                {mode === "register"
+                  ? "Already have an account? Sign in"
+                  : "New to Equip? Create an account"}
               </button>
-            </form>
-            <button
-              className="auth-switch"
-              onClick={() =>
-                setMode(mode === "register" ? "login" : "register")
-              }
-            >
-              {mode === "register"
-                ? "Already have an account? Sign in"
-                : "New to Equip? Create an account"}
-            </button>
+            )}
           </>
         )}
       </div>

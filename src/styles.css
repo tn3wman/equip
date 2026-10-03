@@ -1808,6 +1808,33 @@ kbd {
   font-size: 11px;
   color: #84976f;
 }
+.auth-sent {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid #dfe7d5;
+  border-radius: 7px;
+  background: #f6f8f1;
+  color: #587443;
+}
+.auth-sent > svg {
+  margin-top: 2px;
+}
+.auth-sent strong {
+  color: #496b32;
+  font-size: 13px;
+}
+.auth-sent p {
+  margin-top: 5px;
+  color: #637b51;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.auth-sent .button {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+}
 .form-error {
   color: #b47660;
   font-size: 12px;
@@ -2631,6 +2658,9 @@ kbd {
   gap: 15px;
   font-size: 10px;
   color: #9ebd87;
+}
+.assisted-review {
+  margin: 2px 0 14px;
 }
 .or-divider {
   font-size: 10px;

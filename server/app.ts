@@ -8,7 +8,6 @@ import express, {
   type Response,
 } from "express";
 import cookieParser from "cookie-parser";
-import Database from "better-sqlite3";
 import YAML from "yaml";
 import type {
   Activity,
@@ -27,6 +26,9 @@ import {
   runtimeConfig,
 } from "./config.ts";
 import { powershellInstaller, shellInstaller } from "./installers.ts";
+import { buildSkillDraft } from "./skill-draft.ts";
+import { openStore, type Store } from "./storage.ts";
+import { registerEmailAuth, type SendSignIn } from "./email-auth.ts";
 
 const scrypt = promisify(crypto.scrypt);
 const SESSION_COOKIE = "equip_session";
@@ -38,7 +40,6 @@ const digest = (value: string | Buffer) =>
   crypto.createHash("sha256").update(value).digest("hex");
 const clone = <T>(value: T): T => structuredClone(value);
 
-type Db = Database.Database;
 type AuthedRequest = Request & {
   accountId?: string;
   workspace?: Workspace;
@@ -193,22 +194,13 @@ function emptyWorkspace(name: string, email: string): Workspace {
   };
 }
 
-function initDb(dataDir: string) {
-  fs.mkdirSync(dataDir, { recursive: true });
-  const db = new Database(path.join(dataDir, "equip.sqlite"));
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, workspace TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, account_id TEXT, demo INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE);
-    CREATE TABLE IF NOT EXISTS device_authorizations (device_code_hash TEXT PRIMARY KEY, user_code TEXT NOT NULL UNIQUE, account_id TEXT, name TEXT NOT NULL, os TEXT NOT NULL, arch TEXT NOT NULL, status TEXT NOT NULL, expires_at INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS device_tokens (token_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL, device_id TEXT NOT NULL, revoked_at INTEGER, created_at INTEGER NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE);
-  `);
-  return db;
-}
-
-function saveWorkspace(db: Db, accountId: string, workspace: Workspace) {
-  db.prepare("UPDATE accounts SET workspace = ? WHERE id = ?").run(
+async function saveWorkspace(
+  db: Store,
+  accountId: string,
+  workspace: Workspace,
+) {
+  await db.run(
+    "UPDATE accounts SET workspace = ? WHERE id = ?",
     JSON.stringify(workspace),
     accountId,
   );
@@ -368,7 +360,7 @@ async function upstream() {
   return import("../shared/upstream.ts");
 }
 
-export function createApp(
+export async function createApp(
   options: {
     dataDir?: string;
     publicDir?: string;
@@ -376,6 +368,10 @@ export function createApp(
     sourceResolver?: (source: string, name?: string) => Promise<any>;
     publicUrl?: string;
     registrationEmail?: string;
+    databaseUrl?: string;
+    databaseCa?: string;
+    emailAuthEnabled?: boolean;
+    sendSignIn?: SendSignIn;
   } = {},
 ) {
   const registrationEmail = (
@@ -406,7 +402,13 @@ export function createApp(
     configuredPublicUrl = parsed.origin;
   }
   const dataDir = options.dataDir ?? runtimeConfig().dataDir;
-  const db = initDb(dataDir);
+  const db = await openStore({
+    dataDir,
+    databaseUrl: options.databaseUrl ?? process.env.EQUIP_DATABASE_URL,
+    databaseCa: options.databaseCa ?? process.env.EQUIP_DATABASE_CA,
+  });
+  const emailAuthEnabled =
+    options.emailAuthEnabled ?? Boolean(options.sendSignIn || process.env.EQUIP_RESEND_API_KEY);
   const accountLocks = new Map<string, Promise<void>>();
   const runAccountLocked = async <T>(
     accountId: string,
@@ -431,9 +433,9 @@ export function createApp(
   app.disable("x-powered-by");
   app.use(express.json({ limit: "40mb" }));
   app.use(cookieParser());
-  app.get("/api/health", (_req, res) => {
+  app.get("/api/health", async (_req, res) => {
     try {
-      db.prepare("SELECT 1").get();
+      await db.get("SELECT 1");
       res.json({ status: "ok" });
     } catch {
       res.status(503).json({ status: "unavailable" });
@@ -442,15 +444,19 @@ export function createApp(
   const publicOrigin = (req: Request) =>
     configuredPublicUrl ?? `${req.protocol}://${req.get("host")}`;
 
-  const createSession = (
+  const createSession = async (
     res: Response,
     accountId: string | null,
     demo = false,
   ) => {
     const token = crypto.randomBytes(32).toString("base64url");
-    db.prepare(
+    await db.run(
       "INSERT INTO sessions(token_hash,account_id,demo,expires_at) VALUES(?,?,?,?)",
-    ).run(digest(token), accountId, demo ? 1 : 0, Date.now() + 30 * DAY);
+      digest(token),
+      accountId,
+      demo ? 1 : 0,
+      Date.now() + 30 * DAY,
+    );
     res.cookie(SESSION_COOKIE, token, {
       httpOnly: true,
       sameSite: "lax",
@@ -463,14 +469,14 @@ export function createApp(
   };
   const auth =
     (allowAutoDemo = false) =>
-    (req: AuthedRequest, res: Response, next: NextFunction) => {
+    async (req: AuthedRequest, res: Response, next: NextFunction) => {
       const token = req.cookies?.[SESSION_COOKIE];
       const session = token
-        ? (db
-            .prepare(
-              "SELECT * FROM sessions WHERE token_hash=? AND expires_at>?",
-            )
-            .get(digest(token), Date.now()) as any)
+        ? await db.get<any>(
+            "SELECT * FROM sessions WHERE token_hash=? AND expires_at>?",
+            digest(token),
+            Date.now(),
+          )
         : undefined;
       if (session?.demo) {
         req.demo = true;
@@ -478,9 +484,10 @@ export function createApp(
         return next();
       }
       if (session?.account_id) {
-        const account = db
-          .prepare("SELECT workspace FROM accounts WHERE id=?")
-          .get(session.account_id) as any;
+        const account = await db.get<any>(
+          "SELECT workspace FROM accounts WHERE id=?",
+          session.account_id,
+        );
         if (account) {
           req.accountId = session.account_id;
           req.workspace = JSON.parse(account.workspace);
@@ -488,16 +495,16 @@ export function createApp(
         }
       }
       if (allowAutoDemo) {
-        createSession(res, null, true);
+        await createSession(res, null, true);
         req.demo = true;
         req.workspace = seedDemo();
         return next();
       }
       res.status(401).json({ error: "authentication_required" });
     };
-  const persist = (req: AuthedRequest) => {
+  const persist = async (req: AuthedRequest) => {
     if (req.accountId && req.workspace)
-      saveWorkspace(db, req.accountId, req.workspace);
+      await saveWorkspace(db, req.accountId, req.workspace);
   };
   const writable = (req: AuthedRequest) => {
     if (req.demo)
@@ -507,8 +514,12 @@ export function createApp(
       );
   };
 
+  await registerEmailAuth(app, {store: db, registrationEmail, publicOrigin, createSession, emptyWorkspace, enabled: emailAuthEnabled, send: options.sendSignIn});
+
   app.post("/api/auth/register", async (req, res, next) => {
     try {
+      if (emailAuthEnabled)
+        throw httpError(403, "Use your email sign-in link to continue.");
       const { name, email, password } = req.body ?? {};
       if (
         typeof name !== "string" ||
@@ -529,7 +540,8 @@ export function createApp(
           "This preview is limited to invited accounts.",
         );
       const accountId = id("account");
-      db.prepare("INSERT INTO accounts VALUES(?,?,?,?,?,?)").run(
+      await db.run(
+        "INSERT INTO accounts VALUES(?,?,?,?,?,?)",
         accountId,
         name.trim(),
         normalizedEmail,
@@ -537,29 +549,33 @@ export function createApp(
         JSON.stringify(emptyWorkspace(name.trim(), normalizedEmail)),
         iso(),
       );
-      createSession(res, accountId);
+      await createSession(res, accountId);
       res
         .status(201)
         .json(
           JSON.parse(
             (
-              db
-                .prepare("SELECT workspace FROM accounts WHERE id=?")
-                .get(accountId) as any
+              (await db.get<any>(
+                "SELECT workspace FROM accounts WHERE id=?",
+                accountId,
+              ))!
             ).workspace,
           ),
         );
     } catch (error: any) {
-      if (error.code === "SQLITE_CONSTRAINT_UNIQUE")
+      if (error.code === "SQLITE_CONSTRAINT_UNIQUE" || error.code === "23505")
         next(httpError(409, "An account already exists for this email."));
       else next(error);
     }
   });
   app.post("/api/auth/login", async (req, res, next) => {
     try {
-      const account = db
-        .prepare("SELECT * FROM accounts WHERE email=? COLLATE NOCASE")
-        .get(String(req.body?.email ?? "").trim()) as any;
+      if (emailAuthEnabled)
+        throw httpError(403, "Use your email sign-in link to continue.");
+      const account = await db.get<any>(
+        "SELECT * FROM accounts WHERE email=?",
+        String(req.body?.email ?? "").trim().toLowerCase(),
+      );
       if (
         !account ||
         !(await passwordMatches(
@@ -568,20 +584,20 @@ export function createApp(
         ))
       )
         throw httpError(401, "Email or password is incorrect.");
-      createSession(res, account.id);
+      await createSession(res, account.id);
       res.json(JSON.parse(account.workspace));
     } catch (error) {
       next(error);
     }
   });
-  app.post("/api/auth/demo", (_req, res) => {
-    createSession(res, null, true);
+  app.post("/api/auth/demo", async (_req, res) => {
+    await createSession(res, null, true);
     res.json(seedDemo());
   });
-  app.post("/api/auth/logout", (req, res) => {
+  app.post("/api/auth/logout", async (req, res) => {
     const token = req.cookies?.[SESSION_COOKIE];
     if (token)
-      db.prepare("DELETE FROM sessions WHERE token_hash=?").run(digest(token));
+      await db.run("DELETE FROM sessions WHERE token_hash=?", digest(token));
     res.clearCookie(SESSION_COOKIE, { path: "/" });
     res.json({ ok: true });
   });
@@ -690,9 +706,10 @@ export function createApp(
     const tail = previous.then(() => gate);
     accountLocks.set(accountId, tail);
     await previous;
-    const row = db
-      .prepare("SELECT workspace FROM accounts WHERE id=?")
-      .get(accountId) as any;
+    const row = await db.get<any>(
+      "SELECT workspace FROM accounts WHERE id=?",
+      accountId,
+    );
     if (row) req.workspace = JSON.parse(row.workspace);
     const done = () => {
       release();
@@ -711,7 +728,7 @@ export function createApp(
       try {
         writable(req);
         const value: any = await handler(req);
-        persist(req);
+        await persist(req);
         if (value?.__status) res.status(value.__status).json(value.body);
         else res.json(value);
       } catch (error) {
@@ -1057,31 +1074,17 @@ export function createApp(
       return skill;
     }),
   );
-  app.post("/api/skills/assist", auth(false), (req: AuthedRequest, res) => {
-    const title = String(req.body?.title ?? "Workflow helper").trim();
-    const name =
-      title
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "")
-        .slice(0, 64)
-        .replace(/-$/, "") || "workflow-helper";
-    const workflow = String(req.body?.workflow ?? "").trim();
-    const metadata = YAML.stringify({
-      name,
-      description: (
-        workflow.split(/\n|(?<=\.)\s/)[0] || `Help with ${title.toLowerCase()}.`
-      ).slice(0, 1024),
-    }).trim();
-    res.json({
-      files: [
-        {
-          path: "SKILL.md",
-          content: `---\n${metadata}\n---\n\n# ${title}\n\n## Instructions\n\n${workflow || "Ask for the necessary inputs, complete the task, and verify the result."}\n`,
-        },
-      ],
-    });
-  });
+  app.post(
+    "/api/skills/assist",
+    auth(false),
+    (req: AuthedRequest, res, next) => {
+      try {
+        res.json({ files: buildSkillDraft(req.body ?? {}) });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   app.post(
     "/api/devices/:id/disconnect",
@@ -1130,7 +1133,7 @@ export function createApp(
     }
   });
 
-  app.post("/api/device/authorize", (req, res, next) => {
+  app.post("/api/device/authorize", async (req, res, next) => {
     try {
       const { name, os, arch } = req.body ?? {};
       if (![name, os, arch].every((v) => typeof v === "string" && v))
@@ -1143,9 +1146,8 @@ export function createApp(
         );
       const userCode = `${part()}-${part()}`;
       const expiresIn = 600;
-      db.prepare(
+      await db.run(
         "INSERT INTO device_authorizations VALUES(?,?,?,?,?,?,?,?)",
-      ).run(
         digest(deviceCode),
         userCode,
         null,
@@ -1166,12 +1168,11 @@ export function createApp(
       next(error);
     }
   });
-  app.get("/api/device/authorization", (req, res) => {
-    const row = db
-      .prepare(
-        "SELECT name,os,user_code,expires_at,status FROM device_authorizations WHERE user_code=?",
-      )
-      .get(String(req.query.code ?? "").toUpperCase()) as any;
+  app.get("/api/device/authorization", async (req, res) => {
+    const row = await db.get<any>(
+      "SELECT name,os,user_code,expires_at,status FROM device_authorizations WHERE user_code=?",
+      String(req.query.code ?? "").toUpperCase(),
+    );
     if (!row || row.expires_at <= Date.now())
       return res.status(404).json({ error: "authorization_not_found" });
     res.json({
@@ -1184,21 +1185,26 @@ export function createApp(
   app.post(
     "/api/device/approve",
     auth(false),
-    (req: AuthedRequest, res, next) => {
+    async (req: AuthedRequest, res, next) => {
       try {
         writable(req);
         const code = String(req.body?.userCode ?? "").toUpperCase();
-        const row = db
-          .prepare("SELECT * FROM device_authorizations WHERE user_code=?")
-          .get(code) as any;
+        const row = await db.get<any>(
+          "SELECT * FROM device_authorizations WHERE user_code=?",
+          code,
+        );
         if (!row) throw httpError(404, "Authorization not found.");
         if (row.expires_at <= Date.now())
           throw httpError(410, "Authorization expired.");
         if (row.status !== "pending")
           throw httpError(409, "Authorization was already used.");
-        db.prepare(
+        const changed = await db.run(
           "UPDATE device_authorizations SET account_id=?,status='approved' WHERE user_code=? AND status='pending'",
-        ).run(req.accountId, code);
+          req.accountId,
+          code,
+        );
+        if (!changed.changes)
+          throw httpError(409, "Authorization was already used.");
         res.json({ ok: true });
       } catch (error) {
         next(error);
@@ -1207,9 +1213,10 @@ export function createApp(
   );
   app.post("/api/device/token", async (req, res) => {
     const codeHash = digest(String(req.body?.deviceCode ?? ""));
-    const row = db
-      .prepare("SELECT * FROM device_authorizations WHERE device_code_hash=?")
-      .get(codeHash) as any;
+    const row = await db.get<any>(
+      "SELECT * FROM device_authorizations WHERE device_code_hash=?",
+      codeHash,
+    );
     if (!row) return res.status(403).json({ error: "invalid_device_code" });
     if (row.expires_at <= Date.now())
       return res.status(410).json({ error: "expired_token" });
@@ -1220,25 +1227,26 @@ export function createApp(
     const token = crypto.randomBytes(32).toString("base64url");
     const deviceId = id("device");
     try {
-      await runAccountLocked(row.account_id, () => {
-        const transaction = db.transaction(() => {
-          const changed = db
-            .prepare(
-              "UPDATE device_authorizations SET status='consumed' WHERE device_code_hash=? AND status='approved'",
-            )
-            .run(codeHash);
+      await runAccountLocked(row.account_id, async () => {
+        await db.transaction(async (transaction) => {
+          const changed = await transaction.run(
+            "UPDATE device_authorizations SET status='consumed' WHERE device_code_hash=? AND status='approved'",
+            codeHash,
+          );
           if (!changed.changes)
             throw httpError(403, "Authorization was already used.");
-          db.prepare("INSERT INTO device_tokens VALUES(?,?,?,?,?)").run(
+          await transaction.run(
+            "INSERT INTO device_tokens VALUES(?,?,?,?,?)",
             digest(token),
             row.account_id,
             deviceId,
             null,
             Date.now(),
           );
-          const account = db
-            .prepare("SELECT workspace FROM accounts WHERE id=?")
-            .get(row.account_id) as any;
+          const account = await transaction.get<any>(
+            "SELECT workspace FROM accounts WHERE id=?",
+            row.account_id,
+          );
           const workspace: Workspace = JSON.parse(account.workspace);
           workspace.devices.push({
             id: deviceId,
@@ -1251,33 +1259,32 @@ export function createApp(
             receipts: [],
           });
           bump(workspace);
-          saveWorkspace(db, row.account_id, workspace);
+          await saveWorkspace(transaction, row.account_id, workspace);
         });
-        transaction();
       });
       res.json({ token, deviceId });
     } catch (error: any) {
-      res.status(error.status ?? 500).json({ error: error.message });
+      res.status(error.status ?? 500).json({ error: error.status ? error.message : "The server could not complete the request. Try again shortly." });
     }
   });
 
-  const deviceAuth = (
+  const deviceAuth = async (
     req: AuthedRequest,
     res: Response,
     next: NextFunction,
   ) => {
     const match = req.get("authorization")?.match(/^Bearer (.+)$/);
     const row = match
-      ? (db
-          .prepare(
-            "SELECT * FROM device_tokens WHERE token_hash=? AND revoked_at IS NULL",
-          )
-          .get(digest(match[1])) as any)
+      ? await db.get<any>(
+          "SELECT * FROM device_tokens WHERE token_hash=? AND revoked_at IS NULL",
+          digest(match[1]),
+        )
       : undefined;
     if (!row) return res.status(401).json({ error: "invalid_token" });
-    const account = db
-      .prepare("SELECT workspace FROM accounts WHERE id=?")
-      .get(row.account_id) as any;
+    const account = await db.get<any>(
+      "SELECT workspace FROM accounts WHERE id=?",
+      row.account_id,
+    );
     if (!account) return res.status(401).json({ error: "invalid_token" });
     req.accountId = row.account_id;
     req.deviceId = row.device_id;
@@ -1288,7 +1295,7 @@ export function createApp(
     "/api/device/source",
     deviceAuth,
     lockedWorkspace,
-    (req: AuthedRequest, res, next) => {
+    async (req: AuthedRequest, res, next) => {
       try {
         const requestId = String(req.body?.requestId ?? "");
         const requests = req.workspace!.sourceRequests ?? [];
@@ -1316,7 +1323,7 @@ export function createApp(
               deviceId: device.id,
               skillId: sourceRequest.skillId,
             });
-          saveWorkspace(db, req.accountId!, req.workspace!);
+          await saveWorkspace(db, req.accountId!, req.workspace!);
           return res.json({ ok: true, accepted: false });
         }
         const resolved: any = req.body?.resolved;
@@ -1405,7 +1412,7 @@ export function createApp(
           deviceId: device.id,
           skillId: sourceRequest.skillId,
         });
-        saveWorkspace(db, req.accountId!, req.workspace!);
+        await saveWorkspace(db, req.accountId!, req.workspace!);
         res.json({ ok: true, accepted: true });
       } catch (error) {
         next(error);
@@ -1435,7 +1442,7 @@ export function createApp(
     "/api/device/heartbeat",
     deviceAuth,
     lockedWorkspace,
-    (req: AuthedRequest, res) => {
+    async (req: AuthedRequest, res) => {
       const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
       device.name = String(req.body?.name ?? device.name);
       device.os = String(req.body?.os ?? device.os);
@@ -1445,7 +1452,7 @@ export function createApp(
         : device.agents;
       device.lastSeen = iso();
       device.online = true;
-      saveWorkspace(db, req.accountId!, req.workspace!);
+      await saveWorkspace(db, req.accountId!, req.workspace!);
       res.json({ ok: true });
     },
   );
@@ -1453,7 +1460,7 @@ export function createApp(
     "/api/device/receipts",
     deviceAuth,
     lockedWorkspace,
-    (req: AuthedRequest, res, next) => {
+    async (req: AuthedRequest, res, next) => {
       try {
         const device = req.workspace!.devices.find(
           (d) => d.id === req.deviceId,
@@ -1662,7 +1669,7 @@ export function createApp(
             deviceId: device.id,
           });
         }
-        saveWorkspace(db, req.accountId!, req.workspace!);
+        await saveWorkspace(db, req.accountId!, req.workspace!);
         res.json({ ok: true, resolutionErrors });
       } catch (error) {
         next(error);
@@ -1673,14 +1680,17 @@ export function createApp(
     "/api/device/disconnected",
     deviceAuth,
     lockedWorkspace,
-    (req: AuthedRequest, res) => {
+    async (req: AuthedRequest, res) => {
       const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
       device.online = false;
       device.disconnect = req.body?.mode === "remove" ? "remove" : "retain";
-      saveWorkspace(db, req.accountId!, req.workspace!);
-      db.prepare(
+      await saveWorkspace(db, req.accountId!, req.workspace!);
+      await db.run(
         "UPDATE device_tokens SET revoked_at=? WHERE account_id=? AND device_id=?",
-      ).run(Date.now(), req.accountId, req.deviceId);
+        Date.now(),
+        req.accountId,
+        req.deviceId,
+      );
       res.json({ ok: true });
     },
   );
@@ -1750,9 +1760,13 @@ export function createApp(
     );
   }
   app.use((error: any, _req: Request, res: Response, _next: NextFunction) => {
-    res
-      .status(error.status ?? 500)
-      .json({ error: error.message ?? "Internal server error." });
+    const status = error.status ?? 500;
+    res.status(status).json({
+      error:
+        status >= 500
+          ? "Internal server error."
+          : error.message ?? "Request failed.",
+    });
   });
 
   let updating = false;
@@ -1760,14 +1774,15 @@ export function createApp(
     if (updating) return;
     updating = true;
     try {
-      const accounts = db
-        .prepare("SELECT id,workspace FROM accounts")
-        .all() as Array<{ id: string; workspace: string }>;
+      const accounts = await db.all<{ id: string; workspace: string }>(
+        "SELECT id,workspace FROM accounts",
+      );
       for (const account of accounts) {
         await runAccountLocked(account.id, async () => {
-          const fresh = db
-            .prepare("SELECT workspace FROM accounts WHERE id=?")
-            .get(account.id) as any;
+          const fresh = await db.get<any>(
+            "SELECT workspace FROM accounts WHERE id=?",
+            account.id,
+          );
           const workspace: Workspace = JSON.parse(fresh.workspace);
           let changed = false;
           for (const skill of workspace.skills.filter(
@@ -1841,7 +1856,7 @@ export function createApp(
               changed = true;
             }
           }
-          if (changed) saveWorkspace(db, account.id, workspace);
+          if (changed) await saveWorkspace(db, account.id, workspace);
         });
       }
     } finally {
@@ -1854,9 +1869,9 @@ export function createApp(
       ? setInterval(() => void runAutoUpdates(), intervalMs)
       : undefined;
   updateTimer?.unref();
-  const close = () => {
+  const close = async () => {
     if (updateTimer) clearInterval(updateTimer);
-    db.close();
+    await db.close();
   };
   return { app, db, close, runAutoUpdates };
 }

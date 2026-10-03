@@ -47,7 +47,7 @@ test("explicit local runtime settings override hosted defaults", () => {
 
 test("health reports database readiness without authentication", async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "equip-health-"));
-  const { app, db } = createApp({ dataDir, autoUpdateIntervalMs: 0 });
+  const { app, db } = await createApp({ dataDir, autoUpdateIntervalMs: 0 });
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve) => server.once("listening", resolve));
   const port = (server.address() as AddressInfo).port;
@@ -55,13 +55,12 @@ test("health reports database readiness without authentication", async () => {
     const response = await fetch(`http://127.0.0.1:${port}/api/health`);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { status: "ok" });
-    db.close();
+    await db.close();
     const unavailable = await fetch(`http://127.0.0.1:${port}/api/health`);
     assert.equal(unavailable.status, 503);
     assert.deepEqual(await unavailable.json(), { status: "unavailable" });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (db.open) db.close();
     await rm(dataDir, { recursive: true, force: true });
   }
 });

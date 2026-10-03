@@ -1,0 +1,22 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npx vite build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://equip-preview.up.railway.app/api/:path*" },
+    { "source": "/cli/:path*", "destination": "https://equip-preview.up.railway.app/cli/:path*" },
+    { "source": "/install", "destination": "https://equip-preview.up.railway.app/install" },
+    { "source": "/install.sh", "destination": "https://equip-preview.up.railway.app/install.sh" },
+    { "source": "/install.ps1", "destination": "https://equip-preview.up.railway.app/install.ps1" },
+    { "source": "/((?!assets/).*)", "destination": "/index.html" }
+  ],
+  "headers": [
+    { "source": "/(api|cli|install)(.*)", "headers": [{ "key": "Cache-Control", "value": "no-store" }] },
+    { "source": "/(.*)", "headers": [
+      { "key": "X-Content-Type-Options", "value": "nosniff" },
+      { "key": "Referrer-Policy", "value": "no-referrer" },
+      { "key": "X-Frame-Options", "value": "DENY" }
+    ] }
+  ]
+}
