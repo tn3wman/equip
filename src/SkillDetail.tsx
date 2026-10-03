@@ -68,6 +68,7 @@ export default function SkillDetail({
   );
   const devices = workspace.devices.filter((device) => !device.disconnectedAt);
   const data = actual || skill;
+  const hasUpdate = Boolean(skill.upstreamRevision && skill.upstreamRevision !== skill.revision);
   const flagged = safety?.status === "warn" || safety?.status === "fail";
   const files = data.files.length ? data.files : data.draft || [];
   const activeFile = files.find((f) => f.path === file) || files[0];
@@ -124,7 +125,7 @@ export default function SkillDetail({
   }, [skill.source, skill.name, skill.kind, skill.revision]);
   const act = async (
     fn: () => Promise<any>,
-    message: string,
+    message: string | ((result: any) => string),
     close = false,
   ) => {
     setBusy(true);
@@ -132,7 +133,7 @@ export default function SkillDetail({
     try {
       const result = await fn();
       await onChange();
-      notify(result?.pending ? "Waiting for a connected computer to resolve this source. The selected revision will change after Equip accepts it." : message);
+      notify(result?.pending ? "Waiting for a connected computer to resolve this source. The selected revision will change after Equip accepts it." : typeof message === "function" ? message(result) : message);
       if (close) onClose();
     } catch (e) {
       setError((e as Error).message);
@@ -153,6 +154,19 @@ export default function SkillDetail({
       setError((e as Error).message);
     } finally {
       setLoading(false);
+    }
+  };
+  const checkUpdates = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const checked = await api<Skill>(`/skills/${skill.id}/check`, "POST");
+      await onChange();
+      notify(checked.upstreamRevision ? "A new upstream revision is available." : "Up to date. Your installed skill folder matches the upstream source.");
+    } catch (requestError) {
+      setError((requestError as Error).message);
+    } finally {
+      setBusy(false);
     }
   };
   const updateTargets = async (
@@ -254,20 +268,19 @@ export default function SkillDetail({
                 ) : (
                   <button
                     className="button primary"
-                    disabled={busy || safetyLoading || (flagged && !auditAcknowledged)}
-                    onClick={() =>
+                    disabled={busy || (hasUpdate && (safetyLoading || (flagged && !auditAcknowledged)))}
+                    onClick={hasUpdate ? () =>
                       act(
                         () => api(`/skills/${skill.id}/update`, "POST", auditAcknowledged ? { auditAcknowledged: true } : undefined),
-                        "Updated revision selected. Computers will confirm installation.",
-                      )
-                    }
+                        (result) => result.revision === skill.revision ? "Already up to date. No installation changes were needed." : "Updated revision selected. Computers will confirm installation.",
+                      ) : checkUpdates}
                   >
                     {busy ? (
                       <Loader2 className="spin" size={15} />
                     ) : (
                       <RefreshCw size={15} />
                     )}
-                    Update skill
+                    {hasUpdate ? "Update skill" : busy ? "Checking…" : "Check for updates"}
                   </button>
                 )}
                 <button
@@ -317,7 +330,8 @@ export default function SkillDetail({
               </button>
             )}
           </div>
-          {skill.kind === "third-party" && flagged && !safetyLoading && <><button className="text-link" onClick={() => setTab("security")}>Review security reports <ArrowUpRight size={13} /></button><label className="audit-acknowledgement"><input type="checkbox" checked={auditAcknowledged} onChange={(event) => setAuditAcknowledged(event.target.checked)} /><span><strong>I reviewed the audit findings</strong><small>Required before {installed ? "updating" : "adding"} this skill.</small></span></label></>}
+          {installed && skill.kind === "third-party" && skill.upstreamCheckedAt && <p className="update-check-status">{hasUpdate ? `Update available · ${revision(skill.upstreamRevision!)}` : "Up to date at last check"} · Checked {ago(skill.upstreamCheckedAt)}</p>}
+          {skill.kind === "third-party" && flagged && !safetyLoading && <><button className="text-link" onClick={() => setTab("security")}>Review security reports <ArrowUpRight size={13} /></button>{(!installed || hasUpdate) && <label className="audit-acknowledgement"><input type="checkbox" checked={auditAcknowledged} onChange={(event) => setAuditAcknowledged(event.target.checked)} /><span><strong>I reviewed the audit findings</strong><small>Required before {installed ? "updating" : "adding"} this skill.</small></span></label>}</>}
         </div>
         {error && (
           <div className="notice error" role="alert">
@@ -576,12 +590,7 @@ export default function SkillDetail({
                 <button
                   className="button small"
                   disabled={busy}
-                  onClick={() =>
-                    act(
-                      () => api(`/skills/${skill.id}/check`, "POST"),
-                      "Upstream check complete.",
-                    )
-                  }
+                  onClick={checkUpdates}
                 >
                   <RefreshCw size={14} />
                   Check for updates

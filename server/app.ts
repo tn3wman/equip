@@ -1064,9 +1064,12 @@ export async function createApp(
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
       const resolved: any = await resolveSource(skill.source, skill.name);
-      const nextRevision = resolved.revision || revision(resolved.files);
+      validateFiles(resolved.files, 16_384);
+      const same = canonicalFiles(resolved.files) === canonicalFiles(skill.files);
+      const nextRevision = resolved.revision && resolved.revision !== skill.revision ? resolved.revision : revision(resolved.files);
+      skill.upstreamCheckedAt = iso();
       skill.upstreamRevision =
-        nextRevision === skill.revision ? undefined : nextRevision;
+        same ? undefined : nextRevision;
       return skill;
     }),
   );
@@ -1086,6 +1089,11 @@ export async function createApp(
         return queued;
       }
       const metadata = validateFiles(resolved.files, 16_384);
+      if (canonicalFiles(resolved.files) === canonicalFiles(skill.files)) {
+        skill.upstreamCheckedAt = iso();
+        skill.upstreamRevision = undefined;
+        return skill;
+      }
       const safety = await reviewSafety(skill.source, metadata.name, req.body?.auditAcknowledged);
       if (
         req.workspace!.skills.some(
@@ -1097,8 +1105,9 @@ export async function createApp(
       skill.name = metadata.name;
       skill.description = metadata.description;
       skill.files = clone(resolved.files);
-      skill.revision = resolved.revision || revision(resolved.files);
+      skill.revision = resolved.revision && resolved.revision !== skill.revision ? resolved.revision : revision(resolved.files);
       skill.upstreamRevision = undefined;
+      skill.upstreamCheckedAt = iso();
       skill.updatedAt = iso();
       skill.versions.unshift({
         id: id("version"),
@@ -1131,6 +1140,8 @@ export async function createApp(
       skill.description = metadata.description;
       skill.files = clone(version.files);
       skill.revision = version.revision;
+      skill.upstreamRevision = undefined;
+      skill.upstreamCheckedAt = undefined;
       skill.updatedAt = iso();
       skill.versions.unshift({
         id: id("version"),
@@ -1631,15 +1642,17 @@ export async function createApp(
             (item) => item.id === sourceRequest.skillId,
           );
           if (!skill) throw httpError(404, "Requested skill no longer exists.");
-          if (resolved.revision !== skill.revision) {
+          skill.upstreamCheckedAt = iso();
+          skill.upstreamRevision = undefined;
+          if (canonicalFiles(resolved.files) !== canonicalFiles(skill.files)) {
             skill.safety = resolved.safety;
             skill.files = clone(resolved.files);
-            skill.revision = resolved.revision;
+            skill.revision = resolved.revision !== skill.revision ? resolved.revision : revision(resolved.files);
             skill.upstreamRevision = undefined;
             skill.updatedAt = iso();
             skill.versions.unshift({
               id: id("version"),
-              revision: resolved.revision,
+              revision: skill.revision,
               createdAt: iso(),
               message: "Updated from device-resolved source",
               files: clone(resolved.files),
@@ -2106,10 +2119,12 @@ export async function createApp(
               );
               const metadata = validateFiles(resolved.files, 16_384);
               const nextRevision =
-                resolved.revision || revision(resolved.files);
+                resolved.revision && resolved.revision !== skill.revision ? resolved.revision : revision(resolved.files);
+              const same = canonicalFiles(resolved.files) === canonicalFiles(skill.files);
+              skill.upstreamCheckedAt = iso();
               skill.upstreamRevision =
-                nextRevision === skill.revision ? undefined : nextRevision;
-              if (nextRevision === skill.revision) {
+                same ? undefined : nextRevision;
+              if (same) {
                 changed = true;
                 continue;
               }

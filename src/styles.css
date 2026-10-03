@@ -2182,6 +2182,11 @@ kbd {
   gap: 10px;
   margin-top: 24px;
 }
+.update-check-status {
+  color: #526b40;
+  font-size: 11px;
+  margin-top: 12px;
+}
 .detail-tabs {
   padding: 0 30px;
   gap: 26px;

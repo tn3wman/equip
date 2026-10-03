@@ -66,6 +66,7 @@ export interface Skill {
   autoUpdate: boolean;
   revision: string;
   upstreamRevision?: string;
+  upstreamCheckedAt?: string;
   versions: Version[];
   files: SkillFile[];
   draft?: SkillFile[];
