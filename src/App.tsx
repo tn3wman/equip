@@ -1015,7 +1015,7 @@ function Library({
                 <span className="fleet-device-info">
                   <strong>{device.name}</strong>
                   <small>
-                    {device.agents.length} agents ·{" "}
+                    {device.agents.reduce((count, agent) => count + (agent.aliases?.length || 1), 0)} configurations ·{" "}
                     {device.disconnect
                       ? "Disconnection pending"
                       : device.online
@@ -2048,7 +2048,7 @@ function ConnectDialog({
                   <small>
                     {!device.agents.length
                       ? "Detecting installed agents"
-                      : `${device.agents.length} agents detected · ${deviceStatus(device, skills, generation) === "synchronized" ? "Selected revisions installed" : "Waiting for confirmed installation"}`}
+                      : `${device.agents.reduce((count, agent) => count + (agent.aliases?.length || 1), 0)} configurations detected · ${deviceStatus(device, skills, generation) === "synchronized" ? "Selected revisions installed" : "Waiting for confirmed installation"}`}
                   </small>
                 </span>
                 <Status status={deviceStatus(device, skills, generation)} />
