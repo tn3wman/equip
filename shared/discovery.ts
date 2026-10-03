@@ -54,6 +54,10 @@ export function catalogIdentity(
   if (!skillName) return null;
   let raw = source.trim();
   if (!raw) return null;
+  if (raw.length > 2048 || name.length > 200) return null;
+  raw = raw.replace(/^github:/i, "").replace(/^git\+(?=https:\/\/github\.com\/)/i, "");
+  raw = raw.replace(/^git@github\.com:/i, "https://github.com/");
+  raw = raw.replace(/^ssh:\/\/git@github\.com\//i, "https://github.com/");
   raw = raw.replace(/[?#].*$/, "").replace(/\.git\/?$/, "").replace(/\/+$/, "");
 
   if (/^https?:\/\//i.test(raw)) {
@@ -83,9 +87,9 @@ export function catalogIdentity(
   let normalizedSource: string;
   let sourceType: CatalogIdentity["sourceType"];
   let installUrl: string;
-  if (parts.length === 2) {
+  if (parts.length >= 2 && parts.every(part => cleanSegment(part.split("@")[0]))) {
     const owner = cleanSegment(parts[0]);
-    const repo = cleanSegment(parts[1]);
+    const repo = cleanSegment(parts[1].split("@")[0].replace(/\.git$/, ""));
     if (!owner || !repo) return null;
     normalizedSource = `${owner}/${repo}`;
     sourceType = "github";
@@ -132,7 +136,7 @@ export async function fetchSkillSafety(
       status: "unavailable",
       audits: [],
       checkedAt,
-      error: "Unsupported catalog source",
+      error: "Security reports are not available for this source. Inspect its instructions and bundled files before installing.",
       scope: "upstream",
     };
   const path = identity.id.split("/").map(encodeURIComponent).join("/");
@@ -172,7 +176,7 @@ export async function fetchSkillSafety(
         ...(Array.isArray(row.categories)
           ? { categories: row.categories.filter((value): value is string => typeof value === "string") }
           : {}),
-        url: `${identity.catalogUrl}/security/${encodeURIComponent(slug)}`,
+        url: slug === "unknown" ? identity.catalogUrl : `${identity.catalogUrl}/security/${encodeURIComponent(slug)}`,
       };
     });
     if (!audits.length)

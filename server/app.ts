@@ -920,7 +920,7 @@ export async function createApp(
           error?.message ?? "Source unavailable on server.",
         );
         const request = req.workspace!.sourceRequests!.find(item => item.id === queued.body.id);
-        if (request) request.auditAcknowledged = req.body?.auditAcknowledged === true;
+        if (request) request.auditAcknowledged = Boolean(sourceName) && req.body?.auditAcknowledged === true;
         return queued;
       }
       const metadata = validateFiles(resolved.files, 16_384);
@@ -2104,7 +2104,7 @@ export async function createApp(
                 skill.source,
                 skill.name,
               );
-              validateFiles(resolved.files, 16_384);
+              const metadata = validateFiles(resolved.files, 16_384);
               const nextRevision =
                 resolved.revision || revision(resolved.files);
               skill.upstreamRevision =
@@ -2113,7 +2113,14 @@ export async function createApp(
                 changed = true;
                 continue;
               }
-              const safety = await resolveSafety(skill.source, skill.name);
+              if (metadata.name !== skill.name) {
+                const description = "The upstream skill name changed. Review and approve this update manually.";
+                if (!workspace.activity.some(item => item.type === "update-review" && item.skillId === skill.id && item.description === description))
+                  activity(workspace, { type: "update-review", title: `${skill.title} update needs review`, description, status: "pending", skillId: skill.id });
+                changed = true;
+                continue;
+              }
+              const safety = await resolveSafety(skill.source, metadata.name);
               skill.safety = safety;
               if (safety.status === "warn" || safety.status === "fail" || safety.status === "unavailable") {
                 const description = safety.status === "unavailable"

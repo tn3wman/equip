@@ -130,9 +130,9 @@ export default function SkillDetail({
     setBusy(true);
     setError("");
     try {
-      await fn();
+      const result = await fn();
       await onChange();
-      notify(message);
+      notify(result?.pending ? "Waiting for a connected computer to resolve this source. The selected revision will change after Equip accepts it." : message);
       if (close) onClose();
     } catch (e) {
       setError((e as Error).message);
@@ -217,7 +217,7 @@ export default function SkillDetail({
             ) : (
               <>
                 <Github size={13} />
-                {skill.sourceType ? `${skill.sourceType} · ` : ""}{skill.author || skill.source}
+                {skill.source}
                 <a
                   href={
                     skill.source.startsWith("http")
@@ -317,7 +317,7 @@ export default function SkillDetail({
               </button>
             )}
           </div>
-          {skill.kind === "third-party" && flagged && !safetyLoading && <label className="audit-acknowledgement"><input type="checkbox" checked={auditAcknowledged} onChange={(event) => setAuditAcknowledged(event.target.checked)} /><span><strong>I reviewed the audit findings</strong><small>Required before {installed ? "updating" : "adding"} this skill.</small></span></label>}
+          {skill.kind === "third-party" && flagged && !safetyLoading && <><button className="text-link" onClick={() => setTab("security")}>Review security reports <ArrowUpRight size={13} /></button><label className="audit-acknowledgement"><input type="checkbox" checked={auditAcknowledged} onChange={(event) => setAuditAcknowledged(event.target.checked)} /><span><strong>I reviewed the audit findings</strong><small>Required before {installed ? "updating" : "adding"} this skill.</small></span></label></>}
         </div>
         {error && (
           <div className="notice error" role="alert">
@@ -329,7 +329,7 @@ export default function SkillDetail({
           <div className="inspect-source-note">
             <Eye size={17} />
             <span>
-              {actual
+              {files.length
                 ? "Showing the resolved source files."
                 : "Catalog descriptions are a starting point. Load the source to inspect its actual files."}
             </span>

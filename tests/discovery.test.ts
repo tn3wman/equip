@@ -31,6 +31,9 @@ test("catalogIdentity normalizes supported sources and rejects unsafe URLs", () 
   assert.equal(catalogIdentity("https://mintlify.com/path", "mintlify"), null);
   assert.equal(catalogIdentity("../private", "skill"), null);
   assert.equal(catalogIdentity("owner/repo", "%zz"), null);
+  for (const source of ["github:owner/repo", "owner/repo@skill", "owner/repo/skills/skill", "git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo.git", "git+https://github.com/owner/repo.git"])
+    assert.equal(catalogIdentity(source, "skill")?.id, "owner/repo/skill", source);
+  assert.equal(catalogIdentity("owner/repo/../secret", "skill"), null);
 });
 
 test("fetchSkillSafety normalizes providers and uses the worst verdict", async () => {

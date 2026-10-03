@@ -4,7 +4,7 @@ import type { SkillSafety } from "../shared/types";
 export function SafetyBadge({ safety, loading = false }: { safety?: SkillSafety; loading?: boolean }) {
   if (loading) return <span className="safety-badge pending" role="status"><Loader2 className="spin" size={11} /> Checking</span>;
   const status = safety?.status || "unscanned";
-  const labels = { pass: "No findings", warn: "Review findings", fail: "High risk", unscanned: "Unscanned", unavailable: "Scan unavailable" };
+  const labels = { pass: "Reports pass", warn: "Review findings", fail: "Failed audit", unscanned: "Unscanned", unavailable: "Scan unavailable" };
   const Icon = status === "pass" ? Check : status === "warn" || status === "fail" ? AlertTriangle : CircleHelp;
   return <span className={`safety-badge ${status}`}><Icon size={11} />{labels[status]}</span>;
 }

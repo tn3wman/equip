@@ -13,17 +13,22 @@ test("security review gates install, manual and automatic updates without losing
   const root = await mkdtemp(join(tmpdir(), "equip-safety-"));
   let verdict: SkillSafety["status"] = "warn";
   let sourceBody = "First";
+  let upstreamName = "audit-fixture";
+  let available = true;
   const { app, close, runAutoUpdates } = await createApp({
     dataDir: root, autoUpdateIntervalMs: 0,
     safetyResolver: async () => ({ status: verdict, audits: [], scope: "upstream", checkedAt: new Date().toISOString() }),
-    sourceResolver: async () => ({ name: "audit-fixture", title: "Audit fixture", source: "owner/repo", description: "Safety integration fixture", author: "owner", requirements: [], files: files(sourceBody), category: "Community", icon: "Sparkles", color: "purple" }),
+    sourceResolver: async () => {
+      if (!available) throw new Error("Source unavailable on server");
+      return { name: upstreamName, title: "Audit fixture", source: "owner/repo", description: "Safety integration fixture", author: "owner", requirements: [], files: files(sourceBody).map(file => ({ ...file, content: file.content.replace("name: audit-fixture", `name: ${upstreamName}`) })), category: "Community", icon: "Sparkles", color: "purple" };
+    },
   });
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>(done => server.once("listening", done));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   let cookie = "";
-  const call = async (route: string, method = "GET", body?: unknown) => {
-    const response = await fetch(base + route, { method, headers: { cookie, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  const call = async (route: string, method = "GET", body?: unknown, token?: string) => {
+    const response = await fetch(base + route, { method, headers: { cookie, "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });
     cookie = response.headers.get("set-cookie")?.split(";")[0] ?? cookie;
     return { status: response.status, body: await response.json() };
   };
@@ -54,11 +59,29 @@ test("security review gates install, manual and automatic updates without losing
     await runAutoUpdates();
     assert.equal((await call("/api/workspace")).body.skills[0].revision, originalRevision);
     verdict = "pass";
+    upstreamName = "renamed-fixture";
+    await runAutoUpdates();
+    assert.equal((await call("/api/workspace")).body.skills[0].revision, originalRevision);
+    upstreamName = "audit-fixture";
     await runAutoUpdates();
     workspace = (await call("/api/workspace")).body;
     assert.notEqual(workspace.skills[0].revision, originalRevision);
     assert.equal(workspace.skills[0].versions.length, 2);
     assert.equal(workspace.skills[0].safety.status, "pass");
+    available = false;
+    const queued = await call(`/api/skills/${skillId}/update`, "POST", {});
+    assert.equal(queued.status, 202);
+    workspace = (await call("/api/workspace")).body;
+    assert.equal(workspace.sourceRequests[0].automatic, false);
+    const authorization = await call("/api/device/authorize", "POST", { name: "Private access", os: "linux", arch: "x64" });
+    await call("/api/device/approve", "POST", { userCode: authorization.body.userCode });
+    const connected = await call("/api/device/token", "POST", { deviceCode: authorization.body.deviceCode });
+    const applied = await call("/api/device/source", "POST", { requestId: queued.body.id, resolved: { source: "owner/repo", name: "audit-fixture", revision: "device-pinned-revision", files: files("Private update") } }, connected.body.token);
+    assert.equal(applied.status, 200);
+    workspace = (await call("/api/workspace")).body;
+    assert.equal(workspace.skills[0].revision, "device-pinned-revision");
+    assert.equal(workspace.skills[0].safety.status, "pass");
+    assert.equal(workspace.sourceRequests.length, 0);
   } finally {
     await new Promise<void>(done => server.close(() => done()));
     await close();
@@ -83,7 +106,7 @@ test("device-resolved sources cannot bypass audit findings", async () => {
   };
   try {
     await post("/api/auth/register", { name: "Test", email: "device-safety@example.com", password: "correct horse battery" });
-    const queued = await post("/api/skills/install", { source: "owner/repo" });
+    const queued = await post("/api/skills/install", { source: "owner/repo", auditAcknowledged: true });
     assert.equal(queued.status, 202);
     const auth = await post("/api/device/authorize", { name: "Fixture", os: "linux", arch: "x64" });
     await post("/api/device/approve", { userCode: auth.body.userCode });

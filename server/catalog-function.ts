@@ -16,7 +16,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     const url = new URL(req.url ?? "/", "https://equip.invalid");
     if (url.pathname === "/api/skills/audits") {
       const safety = await fetchSkillSafety(url.searchParams.get("source") ?? "", url.searchParams.get("name") ?? "");
-      res.setHeader("Cache-Control", "public, max-age=30, s-maxage=60");
+      res.setHeader("Cache-Control", safety.status === "unavailable" ? "no-store" : "public, max-age=30, s-maxage=60");
       return res.end(JSON.stringify(safety));
     }
     const view = url.searchParams.get("view") ?? "all-time";
@@ -29,7 +29,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     let token: string | undefined;
     try { token = await getVercelOidcToken(); } catch { /* Public search remains available without identity. */ }
     const result = await discoverSkills(query, view as DiscoveryView, page, { token });
-    res.setHeader("Cache-Control", "public, max-age=30, s-maxage=60");
+    res.setHeader("Cache-Control", result.live ? "public, max-age=30, s-maxage=60" : "no-store");
     res.end(JSON.stringify(result));
   } catch {
     res.statusCode = 502;

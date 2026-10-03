@@ -77,7 +77,7 @@ export async function buildVercelOutput(environment = process.env) {
     entryPoints: [fileURLToPath(new URL("../server/catalog-function.ts", import.meta.url))],
     outfile: `${functionRoot}/index.cjs`, bundle: true, platform: "node", format: "cjs", target: "node22",
   });
-  await writeFile(`${functionRoot}/.vc-config.json`, JSON.stringify({ runtime: "nodejs22.x", handler: "index.cjs", launcherType: "Nodejs" }));
+  await writeFile(`${functionRoot}/.vc-config.json`, JSON.stringify({ runtime: "nodejs22.x", handler: "index.cjs", launcherType: "Nodejs", maxDuration: 60 }));
   await writeFile(
     `${outputRoot}/config.json`,
     `${JSON.stringify(createVercelConfig(apiUrl), null, 2)}\n`,

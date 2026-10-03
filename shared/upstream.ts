@@ -18,7 +18,6 @@ import { createRequire } from "node:module";
 import { promisify } from "node:util";
 import { parse as parseYaml } from "yaml";
 import type { Skill, SkillFile } from "./types.ts";
-import { discoverSkills as discoverCatalogSkills } from "./discovery.ts";
 
 const exec = promisify(execFile);
 const localRequire = createRequire(join(process.cwd(), "package.json"));
@@ -256,12 +255,6 @@ export async function checkSkill(
   return next.revision === currentRevision
     ? { revision: currentRevision }
     : { revision: next.revision, files: next.files };
-}
-
-// Keep the server's former empty-category call working while discovery clients
-// adopt the explicit catalog views.
-export function discoverSkills(query = "", view: "all-time" | "trending" | "hot" | "official" | "" = "all-time") {
-  return discoverCatalogSkills(query, view || "all-time");
 }
 
 type UpstreamAgent = {
