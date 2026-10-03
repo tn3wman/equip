@@ -762,7 +762,7 @@ function Library({
             <Layers size={18} />
           </div>
           <div className="library-source-copy">
-            <strong>{librarySource.name} controls this library</strong>
+            <strong>{librarySource.name} is linked</strong>
             <span>
               {librarySource.skillCount} {librarySource.skillCount === 1 ? "skill" : "skills"}
               {" · "}{sourceDevice?.name || "Disconnected computer"}
