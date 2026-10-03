@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.equip-data/
+*.log
+.DS_Store
