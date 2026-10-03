@@ -8,10 +8,24 @@ import { promisify } from "node:util";
 import {
   getCompatibility,
   getDetectedAgents,
+  getAgentPathEnvironmentNames,
   parseUpstreamSource,
   resolveSkill,
   sourceProcessEnvironment,
 } from "../shared/upstream.ts";
+
+test("agent path environment names come from the installed upstream definitions", async () => {
+  const names = await getAgentPathEnvironmentNames();
+  for (const name of [
+    "XDG_CONFIG_HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "VIBE_HOME",
+    "HERMES_HOME",
+  ])
+    assert.ok(names.includes(name), `missing ${name}`);
+  assert.equal(new Set(names).size, names.length);
+});
 
 test("server source subprocess cannot inherit application credentials or Node hooks", async () => {
   const home = await mkdtemp(join(tmpdir(), "equip-isolated-home-"));

@@ -328,15 +328,52 @@ const bindingPromises = new Map<
 // skills intentionally publishes no library API. This narrow adapter binds the tested 1.7.0 bundle so
 // compatibility and detection remain its source of truth. The signature/version guards fail loudly when
 // upstream changes; source installation still delegates to the supported executable above.
-async function upstreamBinding(home?: string) {
+export type UpstreamEnvironmentOverrides = Record<
+  string,
+  string | undefined
+>;
+
+function agentPathEnvironmentNames(source: string) {
+  const start = source.indexOf("const home = homedir();");
+  const end = source.indexOf("const agents = {", start);
+  if (start < 0 || end < 0)
+    throw new Error(
+      "Installed skills bundle signature changed (agent path definitions); refusing an incomplete environment binding",
+    );
+  const names = new Set(["XDG_CONFIG_HOME"]);
+  for (const match of source
+    .slice(start, end)
+    .matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g))
+    names.add(match[1]);
+  return [...names].sort();
+}
+
+export async function getAgentPathEnvironmentNames() {
+  const upstream = await selectedPackage();
+  return agentPathEnvironmentNames(
+    await readFile(join(upstream.pkgRoot, "dist/cli.mjs"), "utf8"),
+  );
+}
+
+async function upstreamBinding(
+  home?: string,
+  environment?: UpstreamEnvironmentOverrides,
+) {
+  const scopedEnvironment = environment ?? (home ? {} : undefined);
   const upstream = await selectedPackage();
   const cliPath = join(upstream.pkgRoot, "dist/cli.mjs");
   const sourceBytes = await readFile(cliPath);
+  const upstreamPathVariables = agentPathEnvironmentNames(
+    sourceBytes.toString("utf8"),
+  );
   const key = [
     upstream.packagePath,
     upstream.version,
     createHash("sha256").update(sourceBytes).digest("hex"),
     home ? resolve(home) : "<default>",
+    ...upstreamPathVariables.map(
+      (variable) => scopedEnvironment?.[variable] ?? "",
+    ),
   ].join("\0");
   const existing = bindingPromises.get(key);
   if (existing) return existing;
@@ -380,21 +417,17 @@ async function upstreamBinding(home?: string) {
         );
       source = source.replace(
         'const configHome = xdgConfig ?? join(home, ".config");',
-        'const configHome = join(home, ".config");',
+        scopedEnvironment?.XDG_CONFIG_HOME
+          ? `const configHome = ${JSON.stringify(scopedEnvironment.XDG_CONFIG_HOME)};`
+          : 'const configHome = join(home, ".config");',
       );
-      for (const variable of [
-        "CODEX_HOME",
-        "CLAUDE_CONFIG_DIR",
-        "VIBE_HOME",
-        "HERMES_HOME",
-        "AUTOHAND_HOME",
-        "GROK_HOME",
-        "SARVAM_HOME",
-        "APPDATA",
-        "FLATPAK_XDG_CONFIG_HOME",
-        "XDG_CONFIG_HOME",
-      ])
-        source = source.replaceAll(`process.env.${variable}`, "undefined");
+    }
+    if (scopedEnvironment) {
+      for (const variable of upstreamPathVariables)
+        source = source.replaceAll(
+          `process.env.${variable}`,
+          JSON.stringify(scopedEnvironment[variable]),
+        );
     }
     source = source.replace(
       ending,
@@ -407,8 +440,11 @@ async function upstreamBinding(home?: string) {
   return bindingPromise;
 }
 
-export async function getCompatibility(home?: string) {
-  const binding = await upstreamBinding(home);
+export async function getCompatibility(
+  home?: string,
+  environment?: UpstreamEnvironmentOverrides,
+) {
+  const binding = await upstreamBinding(home, environment);
   const agents = binding.agents as Record<string, UpstreamAgent>;
   return {
     version: binding.version,
@@ -422,10 +458,13 @@ export async function getCompatibility(home?: string) {
   };
 }
 
-export async function getDetectedAgents(home?: string) {
-  const binding = await upstreamBinding(home);
+export async function getDetectedAgents(
+  home?: string,
+  environment?: UpstreamEnvironmentOverrides,
+) {
+  const binding = await upstreamBinding(home, environment);
   const ids = await binding.detectInstalledAgents();
-  const compatibility = await getCompatibility(home);
+  const compatibility = await getCompatibility(home, environment);
   return compatibility.agents.filter((agent) => ids.includes(agent.id));
 }
 

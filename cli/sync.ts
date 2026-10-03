@@ -8,6 +8,7 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
   rename,
   rm,
   writeFile,
@@ -22,10 +23,12 @@ import type {
 
 export interface AgentTarget {
   id: string;
+  name?: string;
   path: string;
   profile?: string;
   project?: string;
   deviceId?: string;
+  aliases?: Array<{ profile: string; path: string }>;
 }
 interface LedgerEntry {
   skillId: string;
@@ -281,6 +284,16 @@ async function install(
     }
   }
   const rootInfo = await lstat(destination).catch(() => null);
+  // Nova's existing installs often point at its shared folder. Verify them,
+  // but leave ownership with Nova so removals cannot destroy preexisting work.
+  let linkedLocalFiles: SkillFile[] | undefined;
+  if (rootInfo && !previous && skill.librarySourceId) {
+    const existing = await snapshot(await realpath(destination));
+    linkedLocalFiles = existing.files;
+    if (!differs(existing.hashes, desiredHashes(skill.files)))
+      return { receipt: { ...base, status: "synchronized", managed: false,
+        message: "Existing installation matches; original folder or link retained" } };
+  }
   if (rootInfo?.isSymbolicLink())
     return {
       entry: previous,
@@ -289,7 +302,7 @@ async function install(
         revision: previous?.revision ?? "",
         status: "conflicted",
         message: "Skill destination is a symbolic link and was preserved",
-        localFiles: [],
+        localFiles: linkedLocalFiles ?? [],
       },
     };
   const current = await snapshot(destination);
@@ -479,6 +492,14 @@ export async function synchronize(
     );
     for (const [key, old] of Object.entries(ledger.installs))
       if (!wanted.has(key)) {
+        if (!(await lstat(old.path).catch(() => null))) {
+          delete next.installs[key];
+          receipts.push({ skillId: old.skillId, agent: old.agent,
+            profile: old.profile, project: old.project, revision: old.revision,
+            status: "synchronized", message: "Released missing installation",
+            path: old.path, timestamp: new Date().toISOString() });
+          continue;
+        }
         const current = await snapshot(old.path);
         const changed = differs(current.hashes, old.files);
         const action =

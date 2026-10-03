@@ -20,6 +20,29 @@ test("default target selection skips detected project-only agents", () => {
   ]);
 });
 
+test("detected profile labels flow into targets unless explicitly overridden", () => {
+  const detected = [
+    {
+      id: "codex",
+      globalPath: "/home/.codex_nova/skills",
+      projectPath: ".agents/skills",
+      profile: "nova",
+    },
+  ];
+  assert.deepEqual(selectAgentTargets(agents, detected), [
+    {
+      id: "codex",
+      path: "/home/.codex_nova/skills",
+      profile: "nova",
+    },
+  ]);
+  assert.equal(
+    selectAgentTargets(agents, detected, undefined, undefined, "override")[0]
+      .profile,
+    "override",
+  );
+});
+
 test("explicit project-only agent requires and respects a project root", () => {
   assert.throws(
     () => selectAgentTargets(agents, agents, ["eve"]),

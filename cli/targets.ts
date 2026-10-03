@@ -3,8 +3,11 @@ import type { AgentTarget } from "./sync.ts";
 
 export interface CompatibleAgent {
   id: string;
+  name?: string;
   globalPath: string;
   projectPath: string;
+  profile?: string;
+  aliases?: Array<{ profile: string; path: string }>;
 }
 
 export function retainedConfiguredTargets(
@@ -30,11 +33,12 @@ export function selectAgentTargets(
         return agent;
       })
     : detected;
-  return selected.flatMap((agent) => {
+  return selected.flatMap((agent): AgentTarget[] => {
     if (project)
       return [
         {
           id: agent.id,
+          ...(agent.name ? { name: agent.name } : {}),
           path: resolve(project, agent.projectPath),
           profile,
           project,
@@ -47,6 +51,14 @@ export function selectAgentTargets(
         );
       return [];
     }
-    return [{ id: agent.id, path: resolve(agent.globalPath), profile }];
+    return [
+      {
+        id: agent.id,
+        ...(agent.name ? { name: agent.name } : {}),
+        path: resolve(agent.globalPath),
+        profile: profile ?? agent.profile,
+        ...(agent.aliases ? { aliases: agent.aliases } : {}),
+      },
+    ];
   });
 }

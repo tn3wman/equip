@@ -47,6 +47,7 @@ export interface Skill {
   targets: Target[];
   installs?: number;
   updatedAt: string;
+  librarySourceId?: string;
 }
 export interface Agent {
   id: string;
@@ -54,6 +55,7 @@ export interface Agent {
   path: string;
   profile?: string;
   project?: string;
+  aliases?: Array<{ profile: string; path: string }>;
 }
 export interface Receipt {
   skillId: string;
@@ -66,6 +68,7 @@ export interface Receipt {
   path?: string;
   timestamp: string;
   localFiles?: SkillFile[];
+  managed?: boolean;
 }
 export interface Device {
   id: string;
@@ -111,8 +114,19 @@ export interface Workspace {
   generation: number;
   sourceRequests?: SourceRequest[];
   compatibility?: { version: string; count: number; checkedAt: string };
+  librarySource?: {
+    id: string;
+    name: string;
+    deviceId: string;
+    revision: string;
+    updatedAt: string;
+    skillCount: number;
+    excludedSkills?: string[];
+    error?: string;
+  };
 }
 export interface DesiredState {
+  librarySource?: Workspace["librarySource"];
   generation: number;
   skills: Skill[];
   sourceRequests?: SourceRequest[];

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -36,6 +36,24 @@ const desired = (s: Skill[]): DesiredState => ({
   generation: 1,
   skills: s,
   resolutions: {},
+});
+
+test("Nova verifies preexisting linked folders without taking ownership or destroying them", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-nova-links-"));
+  const target = join(root, "agent"), shared = join(root, "shared"), home = join(root, "state");
+  await synchronize(desired([skill("one")]), [{ id: "codex", path: shared }], join(root, "seed"));
+  await mkdir(target);
+  await symlink(join(shared, "demo"), join(target, "demo"));
+  const linked = { ...skill("one"), librarySourceId: "nova" };
+  const receipts = await synchronize(desired([linked]), [{ id: "codex", path: target }], home);
+  assert.equal(receipts[0].status, "synchronized");
+  assert.equal(receipts[0].managed, false);
+  await synchronize(desired([]), [{ id: "codex", path: target }], home);
+  assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+  await writeFile(join(shared, "demo/SKILL.md"), "local work");
+  const conflict = await synchronize(desired([linked]), [{ id: "codex", path: target }], home);
+  assert.equal(conflict[0].status, "conflicted");
+  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "local work");
 });
 
 test("identical revision synchronizes to two isolated devices", async () => {

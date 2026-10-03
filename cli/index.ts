@@ -19,7 +19,9 @@ import { serviceRemoval, writeService } from "./service.ts";
 import { flushReceiptOutbox, queueReceiptBatch } from "./outbox.ts";
 import { synchronize, type AgentTarget } from "./sync.ts";
 import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
+import { discoverAgentProfiles } from "./profiles.ts";
 import { replaceExecutable } from "./update.ts";
+import { connectLibrary, readLibraryLink, syncLinkedLibrary } from "./library.ts";
 
 const exec = promisify(execFile);
 const args = process.argv.slice(2);
@@ -35,6 +37,7 @@ const agentHome = process.env.EQUIP_AGENT_HOME
   ? resolve(process.env.EQUIP_AGENT_HOME)
   : undefined;
 const equipHome = resolve(process.env.EQUIP_HOME || join(homedir(), ".equip"));
+process.env.EQUIP_SOURCE_CACHE ??= join(equipHome, "source-cache");
 const server = (
   option("--server") ||
   process.env.EQUIP_SERVER ||
@@ -129,7 +132,9 @@ async function postReceipts(
 }
 async function targetsFromFlags(): Promise<AgentTarget[]> {
   const compatibility = await getCompatibility(agentHome);
-  const detected = await getDetectedAgents(agentHome);
+  const detected = agentHome
+    ? await getDetectedAgents(agentHome)
+    : await discoverAgentProfiles();
   const ids = (option("--agents") || agentOption())?.split(",").filter(Boolean);
   const project = option("--project");
   const profile = option("--profile");
@@ -291,6 +296,25 @@ async function runSync(s: State) {
   const targets = selected.map((t) => ({ ...t, deviceId: s.deviceId }));
   const base = s.server || server;
   await flushReceipts(s, base);
+  let libraryError = "";
+  let libraryPublished = false;
+  const desiredBeforeLibrary = await request<DesiredState>("/api/device/desired", {}, s.token, base);
+  const link = await readLibraryLink(equipHome);
+  if (link && !desiredBeforeLibrary.disconnect) {
+    if (link.revision && (!desiredBeforeLibrary.librarySource ||
+        desiredBeforeLibrary.librarySource.id !== link.id ||
+        desiredBeforeLibrary.librarySource.deviceId !== s.deviceId)) {
+      await rm(join(equipHome, "library-link.json"), { force: true });
+    } else {
+      try {
+        libraryPublished = !!(await syncLinkedLibrary(equipHome, payload => request("/api/device/library", {
+          method: "POST", body: JSON.stringify(payload),
+        }, s.token, base)));
+      } catch (error) {
+        libraryError = error instanceof Error ? error.message : String(error);
+      }
+    }
+  }
   await request(
     "/api/device/heartbeat",
     {
@@ -299,24 +323,23 @@ async function runSync(s: State) {
         name: s.name || hostname(),
         os: platform(),
         arch: process.arch,
+        libraryError,
         agents: targets.map((t) => ({
           id: t.id,
-          name: t.id,
+          name: t.name ?? t.id,
           path: t.path,
           profile: t.profile,
           project: t.project,
+          aliases: t.aliases,
         })),
       }),
     },
     s.token,
     base,
   );
-  let desired = await request<DesiredState>(
-    "/api/device/desired",
-    {},
-    s.token,
-    base,
-  );
+  let desired = libraryPublished
+    ? await request<DesiredState>("/api/device/desired", {}, s.token, base)
+    : desiredBeforeLibrary;
   if (desired.sourceRequests?.length) {
     for (const sourceRequest of desired.sourceRequests) {
       try {
@@ -379,10 +402,10 @@ async function runSync(s: State) {
   await postReceipts(s, base, desired.generation, receipts);
   if (receipts.every((receipt) => receipt.status === "synchronized"))
     s.lastSync = new Date().toISOString();
-  delete s.lastError;
+  s.lastError = libraryError || undefined;
   await saveWorkerFields(s, {
     lastSync: s.lastSync,
-    lastError: undefined,
+    lastError: s.lastError,
     lastUpdateCheck: s.lastUpdateCheck,
   });
   return receipts;
@@ -442,6 +465,31 @@ async function ensureService(s: State) {
 }
 
 async function main() {
+  if (command === "library") {
+    const operation = args[0] ?? "status";
+    const s = await state();
+    if (operation === "status") {
+      console.log(JSON.stringify(await readLibraryLink(equipHome) ?? { connected: false }, null, 2));
+      return;
+    }
+    if (!s.token) throw new Error("Connect this computer first: equip connect");
+    if (operation === "connect") {
+      if (!args[1]) throw new Error("Use equip library connect /path/to/nova");
+      await connectLibrary(equipHome, args[1]);
+      await runSync(s);
+      const linked = await readLibraryLink(equipHome);
+      if (linked?.lastError) throw new Error(linked.lastError);
+      console.log(`Nova linked. Its skills will synchronize automatically from ${linked?.root}.`);
+      return;
+    }
+    if (operation === "unlink") {
+      await request("/api/device/library/unlink", { method: "POST", body: "{}" }, s.token, s.server || server);
+      await rm(join(equipHome, "library-link.json"), { force: true });
+      console.log("Library unlinked. Selected skills and installations retained.");
+      return;
+    }
+    throw new Error(`Unknown library operation: ${operation}`);
+  }
   if (command === "connect") {
     const existing = await state();
     if (existing.token) {
@@ -715,6 +763,7 @@ async function main() {
         targets: s.targets ?? [],
         lastSync: s.lastSync,
         lastError: s.lastError,
+        library: await readLibraryLink(equipHome),
       },
       null,
       2,

@@ -462,6 +462,7 @@ export default function App() {
               navigate={navigate}
               create={() => startEditor()}
               connect={() => setConnect(true)}
+              run={run}
             />
           )}
           {page === "discover" && (
@@ -672,16 +673,19 @@ function Library({
   navigate,
   create,
   connect,
+  run,
 }: {
   workspace: Workspace;
   open: (s: Skill) => void;
   navigate: (p: Page) => void;
   create: () => void;
   connect: () => void;
+  run: (fn: () => Promise<unknown>, message: string) => Promise<void>;
 }) {
   const [tab, setTab] = useState("all");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
+  const [confirmUnlink, setConfirmUnlink] = useState(false);
   const skills = workspace.skills.filter((s) => s.selected);
   const updates = skills.filter(
     (s) => s.upstreamRevision && s.upstreamRevision !== s.revision,
@@ -701,6 +705,10 @@ function Library({
   );
   const devices = workspace.devices.filter((d) => !d.disconnectedAt);
   const offline = devices.filter((d) => !d.online && !d.disconnect);
+  const librarySource = workspace.librarySource;
+  const sourceDevice = librarySource
+    ? workspace.devices.find((device) => device.id === librarySource.deviceId)
+    : undefined;
   return (
     <div className="page library-page">
       <div className="page-heading">
@@ -745,6 +753,26 @@ function Library({
           </button>
         )}
       </div>
+      {librarySource && (
+        <div className="library-source-banner">
+          <div className="library-source-mark">
+            <Layers size={18} />
+          </div>
+          <div className="library-source-copy">
+            <strong>{librarySource.name} controls this library</strong>
+            <span>
+              {librarySource.skillCount} {librarySource.skillCount === 1 ? "skill" : "skills"}
+              {" · "}{sourceDevice?.name || "Disconnected computer"}
+              {" · "}Last sync {ago(librarySource.updatedAt)}
+              {sourceDevice && !sourceDevice.online ? " · Source computer offline" : ""}
+            </span>
+          </div>
+          {librarySource.error && <span className="error-text">Source sync failed: {librarySource.error}</span>}
+          <button className="button small" onClick={() => setConfirmUnlink(true)}>
+            Unlink library
+          </button>
+        </div>
+      )}
       {workspace.sourceRequests?.length ? (
         <div className="notice">
           <ClockIcon />
@@ -839,13 +867,20 @@ function Library({
                     <div>
                       <div className="skill-title">
                         {skill.title}
-                        {skill.kind === "custom" && (
+                        {skill.librarySourceId ? (
+                          <span className="custom-tag source-tag">From Nova</span>
+                        ) : skill.kind === "custom" && (
                           <span className="custom-tag">Custom</span>
                         )}
                       </div>
                       <p>{skill.description}</p>
                       <span className="skill-source">
-                        {skill.kind === "custom" ? (
+                        {skill.librarySourceId ? (
+                          <>
+                            <span className="source-dot" />
+                            Managed by Nova
+                          </>
+                        ) : skill.kind === "custom" ? (
                           <>
                             <span className="source-dot" />
                             Your workspace
@@ -866,7 +901,9 @@ function Library({
                       <span className="update-label">Update available</span>
                     ) : (
                       <span>
-                        {skill.kind === "custom"
+                        {skill.librarySourceId
+                          ? "Managed by Nova"
+                          : skill.kind === "custom"
                           ? "On publish"
                           : skill.autoUpdate
                             ? "Automatic updates"
@@ -1066,6 +1103,29 @@ function Library({
           </div>
         </aside>
       </div>
+      {confirmUnlink && (
+        <Dialog title={`Unlink ${librarySource?.name || "library"}?`} onClose={() => setConfirmUnlink(false)}>
+          <div className="dialog-body">
+            <p>
+              Your current skills stay installed and remain in Equip. Nova will no longer add, update, or remove them.
+            </p>
+            <div className="dialog-actions">
+              <button className="button" onClick={() => setConfirmUnlink(false)}>Cancel</button>
+              <button
+                className="button primary"
+                onClick={() =>
+                  run(
+                    () => api("/library/unlink", "POST"),
+                    "Nova unlinked. Your current skills remain in Equip.",
+                  ).then(() => setConfirmUnlink(false))
+                }
+              >
+                Unlink library
+              </button>
+            </div>
+          </div>
+        </Dialog>
+      )}
     </div>
   );
 }
@@ -1385,6 +1445,11 @@ function Devices({
             workspace.skills,
             workspace.generation,
           );
+          const agentTypes = new Set(device.agents.map((agent) => agent.id)).size;
+          const configurations = device.agents.reduce(
+            (count, agent) => count + (agent.aliases?.length || 1),
+            0,
+          );
           return (
             <section className="device-section" key={device.id}>
               <div className="device-section-header">
@@ -1404,7 +1469,8 @@ function Devices({
                         : device.os === "linux"
                           ? "Linux"
                           : device.os}{" "}
-                    · {device.arch} · {device.agents.length} detected agents
+                    · {device.arch} · {configurations} configurations across{" "}
+                    {agentTypes} {agentTypes === 1 ? "agent type" : "agent types"}
                   </p>
                 </div>
                 <div className="device-health">
@@ -1438,7 +1504,10 @@ function Devices({
                   <span key={`${agent.id}-${index}`}>
                     <span className="agent-glyph">{agent.name.charAt(0)}</span>
                     {agent.name}
-                    {agent.profile && <small>{agent.profile}</small>}
+                    <small>
+                      {agent.aliases?.length || 1}{" "}
+                      {agent.aliases?.length ? "configurations" : "configuration"}
+                    </small>
                   </span>
                 ))}
                 <button
@@ -1467,13 +1536,22 @@ function Devices({
                 <div className="device-expanded">
                   <h3>Detected locations</h3>
                   {device.agents.map((agent, index) => (
-                    <div className="agent-location" key={index}>
-                      <strong>{agent.name}</strong>
-                      <code>{agent.path}</code>
-                      <span>
-                        {agent.project ? "Project: " + agent.project : "Global"}
-                        {agent.profile ? " · " + agent.profile : ""}
-                      </span>
+                    <div className="agent-location-group" key={index}>
+                      <div className="agent-location">
+                        <strong>{agent.name}</strong>
+                        <code>{agent.path}</code>
+                        <span>
+                          {agent.project ? "Project: " + agent.project : "Global"}
+                          {" · "}{agent.aliases?.length ? "Shared skill folder" : agent.profile || "default"}
+                        </span>
+                      </div>
+                      {agent.aliases?.map((alias) => (
+                        <div className="agent-location alias" key={`${alias.profile}:${alias.path}`}>
+                          <strong>{alias.profile}</strong>
+                          <code>{alias.path}</code>
+                          <span>Same physical skill root</span>
+                        </div>
+                      ))}
                     </div>
                   ))}
                   <h3>Installation receipts</h3>
@@ -1488,6 +1566,9 @@ function Devices({
                             </strong>
                             <small>
                               {r.agent}
+                              {r.managed === false
+                                ? " · Existing matching installation"
+                                : ""}
                               {r.message ? " · " + r.message : ""}
                             </small>
                           </span>

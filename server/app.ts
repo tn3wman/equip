@@ -8,6 +8,7 @@ import express, {
   type Response,
 } from "express";
 import cookieParser from "cookie-parser";
+import compression from "compression";
 import YAML from "yaml";
 import type {
   Activity,
@@ -29,6 +30,12 @@ import { powershellInstaller, shellInstaller } from "./installers.ts";
 import { buildSkillDraft } from "./skill-draft.ts";
 import { openStore, type Store } from "./storage.ts";
 import { registerEmailAuth, type SendSignIn } from "./email-auth.ts";
+import {
+  canonicalFiles,
+  librarySnapshotRevision,
+  skillRevision,
+  type LibrarySnapshotSkill,
+} from "../shared/library.ts";
 
 const scrypt = promisify(crypto.scrypt);
 const SESSION_COOKIE = "equip_session";
@@ -255,6 +262,30 @@ function validateReceipts(receipts: unknown): asserts receipts is Receipt[] {
       throw httpError(400, "A receipt has invalid fields.");
     if (receipt.localFiles !== undefined)
       validateFileEntries(receipt.localFiles);
+    if (receipt.managed !== undefined && typeof receipt.managed !== "boolean")
+      throw httpError(400, "A receipt has invalid managed state.");
+  }
+}
+
+function validateAgents(agents: unknown): asserts agents is Device["agents"] {
+  if (!Array.isArray(agents) || agents.length > 100)
+    throw httpError(400, "agents must be an array of at most 100 agents.");
+  const valid = (value: unknown, limit: number) =>
+    typeof value === "string" && value.length > 0 && value.length <= limit;
+  for (const agent of agents) {
+    if (!agent || !valid(agent.id, 120) || !valid(agent.name, 200) || !valid(agent.path, 2048))
+      throw httpError(400, "An agent has invalid fields.");
+    if (agent.profile !== undefined && !valid(agent.profile, 200))
+      throw httpError(400, "An agent has an invalid profile.");
+    if (agent.project !== undefined && !valid(agent.project, 2048))
+      throw httpError(400, "An agent has an invalid project.");
+    if (agent.aliases !== undefined) {
+      if (!Array.isArray(agent.aliases) || agent.aliases.length > 50)
+        throw httpError(400, "Agent aliases must be an array of at most 50 aliases.");
+      for (const alias of agent.aliases)
+        if (!alias || !valid(alias.profile, 200) || !valid(alias.path, 2048))
+          throw httpError(400, "An agent alias has invalid fields.");
+    }
   }
 }
 
@@ -346,11 +377,70 @@ function validateFiles(files: SkillFile[]) {
   return { name, description: description.trim() };
 }
 function revision(files: SkillFile[]) {
-  return crypto
-    .createHash("sha256")
-    .update(JSON.stringify(files))
-    .digest("hex")
-    .slice(0, 16);
+  return skillRevision(files);
+}
+function sameFiles(left: SkillFile[], right: SkillFile[]) {
+  return canonicalFiles(left) === canonicalFiles(right);
+}
+
+function validateLibrarySnapshot(body: unknown): {
+  id: "nova";
+  name: string;
+  revision: string;
+  skills: LibrarySnapshotSkill[];
+} {
+  const input = body as any;
+  if (!input || input.id !== "nova")
+    throw httpError(400, "Library id must be nova.");
+  if (
+    typeof input.name !== "string" ||
+    !input.name.trim() ||
+    input.name.length > 120
+  )
+    throw httpError(400, "Library name must be 1–120 characters.");
+  if (typeof input.revision !== "string" || !/^[a-f0-9]{64}$/.test(input.revision))
+    throw httpError(400, "Library revision must be a lowercase SHA-256 hash.");
+  if (!Array.isArray(input.skills) || input.skills.length > 200)
+    throw httpError(400, "Library skills must be an array of at most 200 skills.");
+  const names = new Set<string>();
+  let decodedBytes = 0;
+  const skills = input.skills.map((item: any): LibrarySnapshotSkill => {
+    if (
+      !item ||
+      typeof item.name !== "string" ||
+      typeof item.title !== "string" ||
+      !item.title.trim() ||
+      item.title.length > 200 ||
+      typeof item.source !== "string" ||
+      !item.source ||
+      item.source.length > 2048 ||
+      (item.kind !== "custom" && item.kind !== "third-party")
+    )
+      throw httpError(400, "A library skill has invalid fields.");
+    const metadata = validateFiles(item.files);
+    if (metadata.name !== item.name)
+      throw httpError(400, `Skill ${item.name} does not match its frontmatter name.`);
+    if (names.has(item.name))
+      throw httpError(400, `Duplicate library skill name: ${item.name}`);
+    names.add(item.name);
+    for (const file of item.files as SkillFile[])
+      decodedBytes +=
+        file.encoding === "base64"
+          ? Buffer.from(file.content, "base64").byteLength
+          : Buffer.byteLength(file.content);
+    if (decodedBytes > 50 * 1024 * 1024)
+      throw httpError(413, "Library files exceed the 50 MiB limit.");
+    return {
+      name: item.name,
+      title: item.title.trim(),
+      source: item.source,
+      kind: item.kind,
+      files: clone(item.files),
+    };
+  });
+  if (librarySnapshotRevision(skills) !== input.revision)
+    throw httpError(400, "Library revision does not match its skills.");
+  return { id: "nova", name: input.name.trim(), revision: input.revision, skills };
 }
 function httpError(status: number, message: string) {
   return Object.assign(new Error(message), { status });
@@ -436,7 +526,8 @@ export async function createApp(
   const app = express();
   app.disable("x-powered-by");
   if (process.env.RAILWAY_ENVIRONMENT_ID) app.set("trust proxy", 1);
-  app.use(express.json({ limit: "40mb" }));
+  app.use(compression());
+  app.use(express.json({ limit: "72mb" }));
   app.use(cookieParser());
   app.get("/api/health", async (_req, res) => {
     try {
@@ -902,6 +993,8 @@ export async function createApp(
     "/api/skills/:id",
     ...mutate((req) => {
       const skill = findSkill(req);
+      if (skill.librarySourceId && req.body?.autoUpdate === true)
+        throw httpError(409, "Library-managed skills cannot enable upstream updates.");
       for (const key of [
         "enabled",
         "autoUpdate",
@@ -924,6 +1017,8 @@ export async function createApp(
     ...mutate((req) => {
       const skill = findSkill(req);
       const files = clone(req.body?.files ?? skill.draft ?? skill.files);
+      if (skill.librarySourceId)
+        throw httpError(409, "Edit the linked Nova source, or unlink it before publishing here.");
       const metadata = validateFiles(files);
       if (
         req.workspace!.skills.some(
@@ -960,6 +1055,8 @@ export async function createApp(
     "/api/skills/:id/check",
     ...mutate(async (req) => {
       const skill = findSkill(req);
+      if (skill.librarySourceId)
+        throw httpError(409, "Library-managed skills are updated by their linked library.");
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
       const resolved: any = await resolveSource(skill.source, skill.name);
@@ -973,6 +1070,8 @@ export async function createApp(
     "/api/skills/:id/update",
     ...mutate(async (req) => {
       const skill = findSkill(req);
+      if (skill.librarySourceId)
+        throw httpError(409, "Library-managed skills are updated by their linked library.");
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
       const resolved: any = await resolveSource(skill.source, skill.name);
@@ -1036,6 +1135,12 @@ export async function createApp(
         (s) => s.id === req.params.id,
       );
       if (index < 0) throw httpError(404, "Skill not found.");
+      const removed = req.workspace!.skills[index];
+      if (removed.librarySourceId && req.workspace!.librarySource?.id === removed.librarySourceId) {
+        req.workspace!.librarySource.excludedSkills = Array.from(
+          new Set([...(req.workspace!.librarySource.excludedSkills ?? []), removed.name]),
+        ).sort();
+      }
       req.workspace!.skills.splice(index, 1);
       bump(req.workspace!);
       return { ok: true };
@@ -1105,6 +1210,18 @@ export async function createApp(
       delete device.disconnectedAt;
       bump(req.workspace!);
       return device;
+    }),
+  );
+  app.post(
+    "/api/library/unlink",
+    ...mutate((req) => {
+      const source = req.workspace!.librarySource;
+      if (!source) return { ok: true, unlinked: false };
+      for (const skill of req.workspace!.skills)
+        if (skill.librarySourceId === source.id) delete skill.librarySourceId;
+      delete req.workspace!.librarySource;
+      bump(req.workspace!);
+      return { ok: true, unlinked: true };
     }),
   );
   app.post(
@@ -1331,6 +1448,148 @@ export async function createApp(
     next();
   };
   app.post(
+    "/api/device/library",
+    deviceAuth,
+    lockedWorkspace,
+    async (req: AuthedRequest, res, next) => {
+      try {
+        const snapshot = validateLibrarySnapshot(req.body);
+        const workspace = req.workspace!;
+        const linked = workspace.librarySource;
+        if (req.body.expectedRevision !== undefined &&
+          (typeof req.body.expectedRevision !== "string" ||
+           linked?.id !== snapshot.id || linked.deviceId !== req.deviceId ||
+           (linked.revision !== req.body.expectedRevision && linked.revision !== snapshot.revision)))
+          throw httpError(409, "The library link changed. Connect it again explicitly.");
+        if (linked && linked.id === snapshot.id && linked.deviceId !== req.deviceId)
+          throw httpError(409, "This library is linked to another device.");
+        if (linked?.id === snapshot.id && linked.revision === snapshot.revision)
+          return res.json({
+            accepted: true,
+            revision: linked.revision,
+            skillCount: linked.skillCount,
+            generation: workspace.generation,
+          });
+
+        const descriptions = new Map<string, string>();
+        for (const incoming of snapshot.skills)
+          descriptions.set(incoming.name, validateFiles(incoming.files).description);
+        const excluded = new Set(linked?.excludedSkills ?? []);
+        const incomingNames = new Set(snapshot.skills.map((skill) => skill.name));
+        workspace.skills = workspace.skills.filter(
+          (skill) =>
+            skill.librarySourceId !== snapshot.id || incomingNames.has(skill.name),
+        );
+
+        for (const incoming of snapshot.skills) {
+          if (excluded.has(incoming.name)) continue;
+          const existing = workspace.skills.find((skill) => skill.name === incoming.name);
+          const nextRevision = revision(incoming.files);
+          if (existing) {
+            const changed = !sameFiles(existing.files, incoming.files);
+            existing.librarySourceId = snapshot.id;
+            existing.autoUpdate = false;
+            existing.upstreamRevision = undefined;
+            existing.title = incoming.title;
+            existing.description = descriptions.get(incoming.name)!;
+            existing.source = incoming.source;
+            existing.kind = incoming.kind;
+            if (changed) {
+              existing.files = clone(incoming.files);
+              existing.revision = nextRevision;
+              existing.draft = undefined;
+              existing.updatedAt = iso();
+              existing.versions.unshift({
+                id: id("version"),
+                revision: nextRevision,
+                createdAt: iso(),
+                message: "Updated from Nova",
+                files: clone(incoming.files),
+              });
+            }
+            continue;
+          }
+          workspace.skills.push({
+            id: id("skill"),
+            name: incoming.name,
+            title: incoming.title,
+            description: descriptions.get(incoming.name)!,
+            author: snapshot.name,
+            source: incoming.source,
+            kind: incoming.kind,
+            category: incoming.kind === "custom" ? "Custom" : "Community",
+            icon: incoming.kind === "custom" ? "wand-sparkles" : "package",
+            color: "#7259ff",
+            selected: true,
+            enabled: true,
+            autoUpdate: false,
+            revision: nextRevision,
+            versions: [{
+              id: id("version"),
+              revision: nextRevision,
+              createdAt: iso(),
+              message: "Linked from Nova",
+              files: clone(incoming.files),
+            }],
+            files: clone(incoming.files),
+            requirements: [],
+            targets: [],
+            updatedAt: iso(),
+            librarySourceId: snapshot.id,
+          });
+        }
+
+        workspace.librarySource = {
+          id: snapshot.id,
+          name: snapshot.name,
+          deviceId: req.deviceId!,
+          revision: snapshot.revision,
+          updatedAt: iso(),
+          skillCount: snapshot.skills.length,
+          ...(excluded.size ? { excludedSkills: [...excluded].sort() } : {}),
+        };
+        bump(workspace);
+        activity(workspace, {
+          type: "library",
+          title: `${snapshot.name} library updated`,
+          description: `${snapshot.skills.length} skills received from the linked device.`,
+          status: "pending",
+          deviceId: req.deviceId,
+        });
+        await saveWorkspace(db, req.accountId!, workspace);
+        res.json({
+          accepted: true,
+          revision: snapshot.revision,
+          skillCount: snapshot.skills.length,
+          generation: workspace.generation,
+        });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  app.post(
+    "/api/device/library/unlink",
+    deviceAuth,
+    lockedWorkspace,
+    async (req: AuthedRequest, res, next) => {
+      try {
+        const source = req.workspace!.librarySource;
+        if (!source) return res.json({ ok: true, unlinked: false });
+        if (source.deviceId !== req.deviceId)
+          throw httpError(409, "This library is linked to another device.");
+        for (const skill of req.workspace!.skills)
+          if (skill.librarySourceId === source.id) delete skill.librarySourceId;
+        delete req.workspace!.librarySource;
+        bump(req.workspace!);
+        await saveWorkspace(db, req.accountId!, req.workspace!);
+        res.json({ ok: true, unlinked: true });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  app.post(
     "/api/device/source",
     deviceAuth,
     lockedWorkspace,
@@ -1466,10 +1725,13 @@ export async function createApp(
       )
       .map((skill) => ({
         ...skill,
+        versions: [],
+        draft: undefined,
         targets: skill.targets.filter((t) => t.deviceId === device.id),
       }));
     const desired: DesiredState = {
       generation: req.workspace!.generation,
+      librarySource: req.workspace!.librarySource,
       skills,
       sourceRequests: req.workspace!.sourceRequests ?? [],
       resolutions: device.resolutions ?? {},
@@ -1486,9 +1748,21 @@ export async function createApp(
       device.name = String(req.body?.name ?? device.name);
       device.os = String(req.body?.os ?? device.os);
       device.arch = String(req.body?.arch ?? device.arch);
-      device.agents = Array.isArray(req.body?.agents)
-        ? req.body.agents
-        : device.agents;
+      const linkedLibrary = req.workspace!.librarySource;
+      if (linkedLibrary && linkedLibrary.deviceId === req.deviceId &&
+          typeof req.body?.libraryError === "string")
+        linkedLibrary.error = req.body.libraryError.slice(0, 1000) || undefined;
+      if (req.body?.agents !== undefined) {
+        validateAgents(req.body.agents);
+        device.agents = req.body.agents.map((agent: Device["agents"][number]) => ({
+          id: agent.id,
+          name: agent.name,
+          path: agent.path,
+          ...(agent.profile ? { profile: agent.profile } : {}),
+          ...(agent.project ? { project: agent.project } : {}),
+          ...(agent.aliases ? { aliases: clone(agent.aliases) } : {}),
+        }));
+      }
       device.lastSeen = iso();
       device.online = true;
       await saveWorkspace(db, req.accountId!, req.workspace!);
@@ -1826,7 +2100,7 @@ export async function createApp(
           const workspace: Workspace = JSON.parse(fresh.workspace);
           let changed = false;
           for (const skill of workspace.skills.filter(
-            (skill) => skill.kind === "third-party" && skill.autoUpdate,
+            (skill) => skill.kind === "third-party" && skill.autoUpdate && !skill.librarySourceId,
           )) {
             try {
               const resolved: any = await resolveSource(

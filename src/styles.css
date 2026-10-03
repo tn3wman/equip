@@ -518,6 +518,51 @@ p {
   padding: 5px 8px;
   border-radius: 4px;
 }
+.library-source-banner {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  margin: -10px 0 22px;
+  padding: 13px 15px;
+  border: 1px solid #ddd6ec;
+  border-radius: 7px;
+  background: #f4f0f8;
+  color: #675578;
+}
+.library-source-mark {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  background: #e8e0f1;
+  color: #765e8c;
+}
+.library-source-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+.library-source-copy strong {
+  font-size: 11px;
+  font-weight: 600;
+  color: #51415f;
+}
+.library-source-copy span {
+  overflow: hidden;
+  color: #877795;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-tag {
+  border-color: #ddd4e8;
+  background: #f1ebf6;
+  color: #78618c;
+}
 .library-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 235px;
@@ -1550,6 +1595,14 @@ kbd {
   color: #9ca58f;
   font-size: 9px;
 }
+.agent-location-group .agent-location.alias {
+  padding-left: 24px;
+}
+.agent-location.alias strong {
+  color: #78896a;
+  font-family: var(--mono);
+  font-size: 9px;
+}
 .receipt-row {
   display: flex;
   align-items: center;
@@ -2362,6 +2415,33 @@ kbd {
   color: #94af7e;
   margin-top: 7px;
 }
+.source-managed-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 22px;
+  padding: 12px 13px;
+  border: 1px solid #ddd6e8;
+  border-radius: 6px;
+  background: #f4f0f7;
+  color: #776487;
+}
+.source-managed-note svg {
+  margin-top: 1px;
+  flex-shrink: 0;
+}
+.source-managed-note strong {
+  display: block;
+  color: #5e4d6c;
+  font-size: 11px;
+  font-weight: 600;
+}
+.source-managed-note p {
+  margin-top: 4px;
+  color: #8a7c94;
+  font-size: 10px;
+  line-height: 1.55;
+}
 .switch {
   width: 34px;
   height: 19px;
@@ -3022,6 +3102,19 @@ kbd {
   }
 }
 @media (max-width: 700px) {
+  .library-source-banner {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .library-source-banner > .button {
+    margin-left: 47px;
+  }
+  .library-source-copy {
+    flex-basis: calc(100% - 47px);
+  }
+  .library-source-copy span {
+    white-space: normal;
+  }
   :root {
     --sidebar: 228px;
   }

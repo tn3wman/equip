@@ -62,6 +62,7 @@ export default function SkillDetail({
     (s) => s.id === skill.id && s.selected,
   );
   const devices = workspace.devices.filter((device) => !device.disconnectedAt);
+  const libraryManaged = Boolean(skill.librarySourceId);
   const data = actual || skill;
   const files = data.files.length ? data.files : data.draft || [];
   const activeFile = files.find((f) => f.path === file) || files[0];
@@ -184,7 +185,12 @@ export default function SkillDetail({
           <h2>{data.title}</h2>
           <p>{data.description}</p>
           <div className="detail-byline">
-            {skill.kind === "custom" ? (
+            {libraryManaged ? (
+              <>
+                <Folder size={13} />
+                From {workspace.librarySource?.name || "Nova"}
+              </>
+            ) : skill.kind === "custom" ? (
               <>
                 <Pencil size={13} />
                 Created in your workspace
@@ -217,7 +223,7 @@ export default function SkillDetail({
           <div className="detail-actions">
             {installed ? (
               <>
-                {skill.kind === "custom" ? (
+                {!libraryManaged && (skill.kind === "custom" ? (
                   <button
                     className="button primary"
                     onClick={() => onEdit(skill)}
@@ -243,7 +249,7 @@ export default function SkillDetail({
                     )}
                     Update skill
                   </button>
-                )}
+                ))}
                 <button
                   className="button"
                   disabled={busy}
@@ -468,6 +474,7 @@ export default function SkillDetail({
                         />
                         <span>
                           <strong>{agent.name}</strong>
+                          {agent.aliases?.length ? <small>{agent.aliases.map(alias => alias.profile).join(", ")} share this folder</small> : null}
                           <code>{agent.path}</code>
                         </span>
                         <Status
@@ -508,7 +515,16 @@ export default function SkillDetail({
           )}
           {tab === "history" && (
             <>
-              {skill.kind === "third-party" && (
+              {libraryManaged && (
+                <div className="source-managed-note">
+                  <Folder size={16} />
+                  <div>
+                    <strong>Managed by {workspace.librarySource?.name || "Nova"}</strong>
+                    <p>Changes and new versions come from the linked source library.</p>
+                  </div>
+                </div>
+              )}
+              {skill.kind === "third-party" && !libraryManaged && (
                 <div className="update-setting">
                   <div>
                     <h3>Automatic updates</h3>
@@ -539,7 +555,7 @@ export default function SkillDetail({
                   </button>
                 </div>
               )}
-              {skill.kind === "third-party" && (
+              {skill.kind === "third-party" && !libraryManaged && (
                 <button
                   className="button small"
                   disabled={busy}
@@ -573,7 +589,7 @@ export default function SkillDetail({
                   </div>
                   {v.revision === skill.revision ? (
                     <span className="custom-tag">Selected</span>
-                  ) : (
+                  ) : libraryManaged ? null : (
                     <button
                       className="button small"
                       onClick={() => {
