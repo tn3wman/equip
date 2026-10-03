@@ -68,7 +68,7 @@ export default function SkillDetail({
   );
   const devices = workspace.devices.filter((device) => !device.disconnectedAt);
   const data = actual || skill;
-  const hasUpdate = Boolean(skill.upstreamRevision && skill.upstreamRevision !== skill.revision);
+  const hasUpdate = Boolean(skill.upstreamCheckedAt && skill.upstreamRevision && skill.upstreamRevision !== skill.revision);
   const flagged = safety?.status === "warn" || safety?.status === "fail";
   const files = data.files.length ? data.files : data.draft || [];
   const activeFile = files.find((f) => f.path === file) || files[0];

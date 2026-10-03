@@ -692,14 +692,14 @@ function Library({
   const [filter, setFilter] = useState("all");
   const skills = workspace.skills.filter((s) => s.selected);
   const updates = skills.filter(
-    (s) => s.upstreamRevision && s.upstreamRevision !== s.revision,
+    (s) => s.upstreamCheckedAt && s.upstreamRevision && s.upstreamRevision !== s.revision,
   ).length;
   const visible = skills.filter(
     (s) =>
       (tab === "all" || s.kind === tab) &&
       (filter === "all" ||
         (filter === "updates"
-          ? s.upstreamRevision && s.upstreamRevision !== s.revision
+          ? s.upstreamCheckedAt && s.upstreamRevision && s.upstreamRevision !== s.revision
           : filter === "disabled"
             ? !s.enabled
             : s.enabled)) &&
@@ -869,7 +869,7 @@ function Library({
                   </div>
                   <div className="revision-cell">
                     <code>{revision(skill.revision)}</code>
-                    {skill.upstreamRevision &&
+                    {skill.upstreamCheckedAt && skill.upstreamRevision &&
                     skill.upstreamRevision !== skill.revision ? (
                       <span className="update-label">Update available</span>
                     ) : (
