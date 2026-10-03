@@ -1422,7 +1422,7 @@ kbd {
 .safety-badge.unscanned,
 .safety-badge.unavailable,
 .safety-badge.pending {
-  color: #70796e;
+  color: #616b5d;
   background: #eef0eb;
 }
 .discover-title {
@@ -1471,7 +1471,7 @@ kbd {
 }
 .discover-skill-bottom .install-count {
   flex: none;
-  color: #76856e;
+  color: #607054;
   margin-left: 8px;
 }
 .load-more {
@@ -2221,7 +2221,7 @@ kbd {
   font-size: 11px;
 }
 .audit-acknowledgement small {
-  color: #917a49;
+  color: #756035;
 }
 .safety-loading,
 .safety-empty {
@@ -2298,8 +2298,8 @@ kbd {
 }
 .audit-card p { margin-top: 9px; color: var(--muted); }
 .audit-categories { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
-.audit-categories span { padding: 3px 6px; border-radius: 4px; background: #f0f2ec; color: #707a6c; font-size: 9px; }
-.audit-meta { margin-top: 12px; font-size: 9px; color: #8b9587; }
+.audit-categories span { padding: 3px 6px; border-radius: 4px; background: #f0f2ec; color: #606b5b; font-size: 9px; }
+.audit-meta { margin-top: 12px; font-size: 9px; color: #64705d; }
 .audit-meta a { color: #58783f; text-decoration: underline; }
 .skill-metadata {
   display: flex;
