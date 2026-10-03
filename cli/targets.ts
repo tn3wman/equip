@@ -1,0 +1,43 @@
+import { resolve } from "node:path";
+import type { AgentTarget } from "./sync.ts";
+
+export interface CompatibleAgent {
+  id: string;
+  globalPath: string;
+  projectPath: string;
+}
+
+export function selectAgentTargets(
+  compatible: CompatibleAgent[],
+  detected: CompatibleAgent[],
+  ids?: string[],
+  project?: string,
+  profile?: string,
+): AgentTarget[] {
+  const selected = ids?.length
+    ? ids.map((id) => {
+        const agent = compatible.find((item) => item.id === id);
+        if (!agent) throw new Error(`Unknown agent: ${id}`);
+        return agent;
+      })
+    : detected;
+  return selected.flatMap((agent) => {
+    if (project)
+      return [
+        {
+          id: agent.id,
+          path: resolve(project, agent.projectPath),
+          profile,
+          project,
+        },
+      ];
+    if (!agent.globalPath) {
+      if (ids?.length)
+        throw new Error(
+          `${agent.id} supports project skills only; provide --project`,
+        );
+      return [];
+    }
+    return [{ id: agent.id, path: resolve(agent.globalPath), profile }];
+  });
+}
