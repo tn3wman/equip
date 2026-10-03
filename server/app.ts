@@ -958,7 +958,6 @@ export async function createApp(
       const nextRevision = resolved.revision || revision(resolved.files);
       skill.upstreamRevision =
         nextRevision === skill.revision ? undefined : nextRevision;
-      persist(req);
       return skill;
     }),
   );
