@@ -188,13 +188,15 @@ async function pointsTo(path: string, expected: string) {
   const info = await lstat(path).catch(() => null);
   if (!info?.isSymbolicLink()) return false;
   const link = await readlink(path).catch(() => "");
-  return resolve(dirname(path), link) === resolve(expected);
+  const parent = await realpath(dirname(path));
+  const target = await realpath(expected).catch(() => resolve(expected));
+  return resolve(parent, link) === target;
 }
 
 async function createManagedLink(source: string, destination: string) {
   const target = process.platform === "win32"
     ? source
-    : relative(dirname(destination), source);
+    : relative(await realpath(dirname(destination)), await realpath(source));
   await symlink(target, destination, process.platform === "win32" ? "junction" : "dir");
 }
 

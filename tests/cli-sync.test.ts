@@ -759,3 +759,19 @@ test("shared agent roots adopt an updated Equip link without changing the origin
     assert.equal(await readFile(join(repository, "demo/SKILL.md"), "utf8"), "one");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("links resolve correctly through agent roots at different physical depths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-alias-"));
+  const physical = join(root, "nested/configuration/skills"), alias = join(root, "agent"), home = join(root, "state");
+  try {
+    await mkdir(physical, { recursive: true });
+    await symlink(physical, alias);
+    const target = [{ id: "codex", path: alias }];
+    assert.equal((await synchronize(desired([skill("one")]), target, home))[0].status, "synchronized");
+    assert.equal(await readFile(join(alias, "demo/SKILL.md"), "utf8"), "one");
+    assert.equal((await synchronize({ ...desired([skill("two", "r2")]), generation: 2 }, target, home))[0].status, "synchronized");
+    assert.equal(await readFile(join(physical, "demo/SKILL.md"), "utf8"), "two");
+    assert.equal((await synchronize({ ...desired([]), generation: 3 }, target, home))[0].status, "synchronized");
+    await assert.rejects(lstat(join(physical, "demo")), /ENOENT/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
