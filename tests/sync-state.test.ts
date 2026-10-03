@@ -97,3 +97,15 @@ test("excluded destinations stay synchronized after confirmed removal", () => {
     "synchronized",
   );
 });
+
+test("completed disconnections no longer count as deployment destinations", () => {
+  const disconnected = {
+    ...device,
+    disconnectedAt: new Date().toISOString(),
+  };
+  assert.deepEqual(deployment(skill, [device, disconnected]), {
+    status: "synchronized",
+    complete: 1,
+    total: 1,
+  });
+});

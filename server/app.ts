@@ -410,6 +410,10 @@ export async function createApp(
   const emailAuthEnabled =
     options.emailAuthEnabled ?? Boolean(options.sendSignIn || process.env.EQUIP_RESEND_API_KEY);
   const accountLocks = new Map<string, Promise<void>>();
+  const deviceAuthorizationAttempts = new Map<
+    string,
+    { count: number; until: number }
+  >();
   const runAccountLocked = async <T>(
     accountId: string,
     work: () => Promise<T> | T,
@@ -431,6 +435,7 @@ export async function createApp(
   };
   const app = express();
   app.disable("x-powered-by");
+  if (process.env.RAILWAY_ENVIRONMENT_ID) app.set("trust proxy", 1);
   app.use(express.json({ limit: "40mb" }));
   app.use(cookieParser());
   app.get("/api/health", async (_req, res) => {
@@ -450,6 +455,7 @@ export async function createApp(
     demo = false,
   ) => {
     const token = crypto.randomBytes(32).toString("base64url");
+    await db.run("DELETE FROM sessions WHERE expires_at<=?", Date.now());
     await db.run(
       "INSERT INTO sessions(token_hash,account_id,demo,expires_at) VALUES(?,?,?,?)",
       digest(token),
@@ -605,7 +611,9 @@ export async function createApp(
     const workspace = clone(req.workspace!);
     const cutoff = Date.now() - 2 * 60_000;
     workspace.devices.forEach((device) => {
-      if (!device.demo) device.online = Date.parse(device.lastSeen) >= cutoff;
+      if (!device.demo)
+        device.online =
+          !device.disconnectedAt && Date.parse(device.lastSeen) >= cutoff;
     });
     res.json(workspace);
   });
@@ -1094,6 +1102,7 @@ export async function createApp(
       if (mode !== "retain" && mode !== "remove")
         throw httpError(400, "mode must be retain or remove.");
       device.disconnect = mode;
+      delete device.disconnectedAt;
       bump(req.workspace!);
       return device;
     }),
@@ -1135,8 +1144,35 @@ export async function createApp(
   app.post("/api/device/authorize", async (req, res, next) => {
     try {
       const { name, os, arch } = req.body ?? {};
-      if (![name, os, arch].every((v) => typeof v === "string" && v))
+      if (
+        typeof name !== "string" ||
+        !name.trim() ||
+        name.length > 120 ||
+        typeof os !== "string" ||
+        !os ||
+        os.length > 40 ||
+        typeof arch !== "string" ||
+        !arch ||
+        arch.length > 40
+      )
         throw httpError(400, "name, os, and arch are required.");
+      const now = Date.now();
+      const key = req.ip || "unknown";
+      const attempts = deviceAuthorizationAttempts.get(key);
+      const allowance =
+        attempts && attempts.until > now
+          ? attempts
+          : { count: 0, until: now + 10 * 60_000 };
+      allowance.count += 1;
+      deviceAuthorizationAttempts.set(key, allowance);
+      if (deviceAuthorizationAttempts.size > 2_000)
+        for (const [address, item] of deviceAuthorizationAttempts)
+          if (item.until <= now) deviceAuthorizationAttempts.delete(address);
+      if (allowance.count > 30)
+        throw httpError(
+          429,
+          "Too many device authorization requests. Try again shortly.",
+        );
       const deviceCode = crypto.randomBytes(32).toString("base64url");
       const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
       const part = () =>
@@ -1146,6 +1182,10 @@ export async function createApp(
       const userCode = `${part()}-${part()}`;
       const expiresIn = 600;
       await db.run(
+        "DELETE FROM device_authorizations WHERE expires_at<=?",
+        now,
+      );
+      await db.run(
         "INSERT INTO device_authorizations VALUES(?,?,?,?,?,?,?,?)",
         digest(deviceCode),
         userCode,
@@ -1154,7 +1194,7 @@ export async function createApp(
         os,
         arch,
         "pending",
-        Date.now() + expiresIn * 1000,
+        now + expiresIn * 1000,
       );
       res.status(201).json({
         deviceCode,
@@ -1683,6 +1723,7 @@ export async function createApp(
       const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
       device.online = false;
       device.disconnect = req.body?.mode === "remove" ? "remove" : "retain";
+      device.disconnectedAt = iso();
       await saveWorkspace(db, req.accountId!, req.workspace!);
       await db.run(
         "UPDATE device_tokens SET revoked_at=? WHERE account_id=? AND device_id=?",

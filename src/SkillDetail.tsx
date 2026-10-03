@@ -61,6 +61,7 @@ export default function SkillDetail({
   const installed = workspace.skills.some(
     (s) => s.id === skill.id && s.selected,
   );
+  const devices = workspace.devices.filter((device) => !device.disconnectedAt);
   const data = actual || skill;
   const files = data.files.length ? data.files : data.draft || [];
   const activeFile = files.find((f) => f.path === file) || files[0];
@@ -427,7 +428,7 @@ export default function SkillDetail({
                 New computers and newly detected agents receive this skill
                 automatically. Turn off a destination to make an exception.
               </p>
-              {workspace.devices.map((device) => (
+              {devices.map((device) => (
                 <div className="target-device" key={device.id}>
                   <div>
                     <strong>{device.name}</strong>
@@ -479,7 +480,7 @@ export default function SkillDetail({
                   })}
                 </div>
               ))}
-              {!workspace.devices.length && (
+              {!devices.length && (
                 <p className="muted-copy">
                   No computers connected yet. Your first connection will receive
                   this skill.
@@ -507,35 +508,37 @@ export default function SkillDetail({
           )}
           {tab === "history" && (
             <>
-              <div className="update-setting">
-                <div>
-                  <h3>Automatic updates</h3>
-                  <p>
-                    Allow Equip to select and deploy new upstream revisions. You
-                    can roll back at any time.
-                  </p>
+              {skill.kind === "third-party" && (
+                <div className="update-setting">
+                  <div>
+                    <h3>Automatic updates</h3>
+                    <p>
+                      Allow Equip to select and deploy new upstream revisions.
+                      You can roll back at any time.
+                    </p>
+                  </div>
+                  <button
+                    role="switch"
+                    aria-checked={skill.autoUpdate}
+                    aria-label="Automatic updates"
+                    className={`switch ${skill.autoUpdate ? "on" : ""}`}
+                    disabled={busy}
+                    onClick={() =>
+                      act(
+                        () =>
+                          api(`/skills/${skill.id}`, "PATCH", {
+                            autoUpdate: !skill.autoUpdate,
+                          }),
+                        !skill.autoUpdate
+                          ? "Automatic updates enabled."
+                          : "Updates now require your approval.",
+                      )
+                    }
+                  >
+                    <span />
+                  </button>
                 </div>
-                <button
-                  role="switch"
-                  aria-checked={skill.autoUpdate}
-                  aria-label="Automatic updates"
-                  className={`switch ${skill.autoUpdate ? "on" : ""}`}
-                  disabled={busy || skill.kind === "custom"}
-                  onClick={() =>
-                    act(
-                      () =>
-                        api(`/skills/${skill.id}`, "PATCH", {
-                          autoUpdate: !skill.autoUpdate,
-                        }),
-                      !skill.autoUpdate
-                        ? "Automatic updates enabled."
-                        : "Updates now require your approval.",
-                    )
-                  }
-                >
-                  <span />
-                </button>
-              </div>
+              )}
               {skill.kind === "third-party" && (
                 <button
                   className="button small"

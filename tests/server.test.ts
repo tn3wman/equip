@@ -396,14 +396,38 @@ test("device authorization is account-bound, single-use, and receipts drive stat
     }),
   });
   assert.equal(arbitraryConflict.response.status, 200);
+  const disconnectRequested = await post(
+    `/api/devices/${tokenResult.body.deviceId}/disconnect`,
+    { mode: "retain" },
+    cookie,
+  );
+  assert.equal(disconnectRequested.response.status, 200);
+  assert.equal(disconnectRequested.body.disconnect, "retain");
+  assert.equal(disconnectRequested.body.disconnectedAt, undefined);
+  const pendingDisconnect = await call("/api/device/desired", {
+    headers: bearer,
+  });
+  assert.equal(pendingDisconnect.body.disconnect, "retain");
   const disconnected = await call("/api/device/disconnected", {
     method: "POST",
     headers: bearer,
     body: JSON.stringify({ mode: "retain" }),
   });
   assert.equal(disconnected.response.status, 200);
+  const completedWorkspace = await call("/api/workspace", {}, cookie);
+  const completedDevice = completedWorkspace.body.devices.find(
+    (device: any) => device.id === tokenResult.body.deviceId,
+  );
+  assert.equal(completedDevice.online, false);
+  assert.ok(!Number.isNaN(Date.parse(completedDevice.disconnectedAt)));
   const revoked = await call("/api/device/desired", { headers: bearer });
   assert.equal(revoked.response.status, 401);
+  const requestedAgain = await post(
+    `/api/devices/${tokenResult.body.deviceId}/disconnect`,
+    { mode: "remove" },
+    cookie,
+  );
+  assert.equal(requestedAgain.body.disconnectedAt, undefined);
 });
 
 test("target exceptions remain overrides, stale receipts do not sync, and import consumes a conflict", async () => {

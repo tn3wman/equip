@@ -80,6 +80,7 @@ export interface Device {
   receipts: Receipt[];
   demo?: boolean;
   disconnect?: "retain" | "remove";
+  disconnectedAt?: string;
   resolutions?: Record<string, "replace" | "preserve" | "import">;
 }
 export interface Activity {

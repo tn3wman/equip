@@ -5,6 +5,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type ComponentType,
   type FormEvent,
 } from "react";
 import {
@@ -64,8 +65,30 @@ import type {
   SyncStatus,
   SkillFile,
 } from "../shared/types";
-const SkillDetail = lazy(() => import("./SkillDetail"));
-const Editor = lazy(() => import("./Editor"));
+const lazyReloadKey = "equip:stale-chunk-reload";
+function lazyWithReload<T extends ComponentType<any>>(
+  load: () => Promise<{ default: T }>,
+) {
+  return lazy(async () => {
+    try {
+      const module = await load();
+      sessionStorage.removeItem(lazyReloadKey);
+      return module;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const staleChunk =
+        /dynamically imported module|loading chunk|chunkloaderror/i.test(message);
+      if (staleChunk && !sessionStorage.getItem(lazyReloadKey)) {
+        sessionStorage.setItem(lazyReloadKey, "1");
+        location.reload();
+        return new Promise<never>(() => undefined);
+      }
+      throw error;
+    }
+  });
+}
+const SkillDetail = lazyWithReload(() => import("./SkillDetail"));
+const Editor = lazyWithReload(() => import("./Editor"));
 import { deployment, deviceStatus } from "./sync-state";
 
 const pages = [
@@ -261,8 +284,9 @@ export default function App() {
         )}
       </div>
     );
+  const activeDevices = workspace.devices.filter((d) => !d.disconnectedAt);
   const selectedSkills = workspace.skills.filter((s) => s.selected);
-  const pending = workspace.devices.filter((d) => !d.online).length;
+  const pending = activeDevices.filter((d) => !d.online).length;
   const startEditor = (skill?: Skill) => {
     setEdit(skill);
     setSelected(undefined);
@@ -402,7 +426,7 @@ export default function App() {
               <span />
               {workspace.demo
                 ? "Demo workspace"
-                : workspace.devices.some((d) => d.online)
+                : activeDevices.some((d) => d.online && !d.disconnect)
                   ? "Devices connected"
                   : "No computers online"}
             </span>
@@ -546,7 +570,7 @@ export default function App() {
       {connect && (
         <ConnectDialog
           onClose={() => setConnect(false)}
-          devices={workspace.devices}
+          devices={activeDevices}
           skills={workspace.skills}
           generation={workspace.generation}
         />
@@ -675,7 +699,8 @@ function Library({
         .toLowerCase()
         .includes(query.toLowerCase()),
   );
-  const offline = workspace.devices.filter((d) => !d.online);
+  const devices = workspace.devices.filter((d) => !d.disconnectedAt);
+  const offline = devices.filter((d) => !d.online && !d.disconnect);
   return (
     <div className="page library-page">
       <div className="page-heading">
@@ -707,8 +732,8 @@ function Library({
         </span>
         <span>
           <Laptop size={15} />
-          <strong>{workspace.devices.length}</strong> connected{" "}
-          {workspace.devices.length === 1 ? "computer" : "computers"}
+          <strong>{devices.length}</strong> connected{" "}
+          {devices.length === 1 ? "computer" : "computers"}
         </span>
         {updates > 0 && (
           <button
@@ -801,7 +826,7 @@ function Library({
               <span />
             </div>
             {visible.map((skill) => {
-              const state = deployment(skill, workspace.devices);
+              const state = deployment(skill, devices);
               const status = state.status;
               return (
                 <button
@@ -939,7 +964,7 @@ function Library({
             </button>
           </div>
           <div className="fleet-list">
-            {workspace.devices.slice(0, 4).map((device) => (
+            {devices.slice(0, 4).map((device) => (
               <button
                 key={device.id}
                 className="fleet-device"
@@ -954,7 +979,9 @@ function Library({
                   <strong>{device.name}</strong>
                   <small>
                     {device.agents.length} agents ·{" "}
-                    {device.online
+                    {device.disconnect
+                      ? "Disconnection pending"
+                      : device.online
                       ? deviceStatus(
                           device,
                           workspace.skills,
@@ -966,12 +993,18 @@ function Library({
                   </small>
                 </span>
                 <span
-                  className={`online-dot ${device.online ? "on" : "off"}`}
-                  aria-label={device.online ? "Online" : "Offline"}
+                  className={`online-dot ${device.online && !device.disconnect ? "on" : "off"}`}
+                  aria-label={
+                    device.disconnect
+                      ? "Disconnection pending"
+                      : device.online
+                        ? "Online"
+                        : "Offline"
+                  }
                 />
               </button>
             ))}
-            {!workspace.devices.length && (
+            {!devices.length && (
               <div className="fleet-empty">
                 <Laptop size={26} />
                 <p>Connect your first computer to put your skills to work.</p>
@@ -1309,6 +1342,7 @@ function Devices({
   const [expanded, setExpanded] = useState<string | null>(null);
   const [disconnect, setDisconnect] = useState<Device>();
   const [mode, setMode] = useState<"retain" | "remove">("retain");
+  const devices = workspace.devices.filter((d) => !d.disconnectedAt);
   return (
     <div className="page">
       <div className="page-heading">
@@ -1326,11 +1360,11 @@ function Devices({
       <div className="workspace-summary">
         <span>
           <span className="online-dot on" />
-          {workspace.devices.filter((d) => d.online).length} online
+          {devices.filter((d) => d.online && !d.disconnect).length} online
         </span>
         <span>
           <span className="online-dot off" />
-          {workspace.devices.filter((d) => !d.online).length} offline
+          {devices.filter((d) => !d.online && !d.disconnect).length} offline
         </span>
         <span>
           <Layers size={15} />
@@ -1345,7 +1379,7 @@ function Devices({
         </div>
       )}
       <div className="device-list">
-        {workspace.devices.map((device) => {
+        {devices.map((device) => {
           const status = deviceStatus(
             device,
             workspace.skills,
@@ -1377,7 +1411,11 @@ function Devices({
                   <Status
                     status={status}
                     label={
-                      status === "synchronized" ? "Online & synced" : undefined
+                      device.disconnect
+                        ? "Disconnection pending"
+                        : status === "synchronized"
+                          ? "Online & synced"
+                          : undefined
                     }
                   />
                   <small>Last sync {ago(device.lastSync)}</small>
@@ -1412,13 +1450,19 @@ function Devices({
                   View installations <ArrowRight size={13} />
                 </button>
               </div>
-              {!device.online && (
+              {device.disconnect ? (
+                <div className="device-offline">
+                  <WifiOff size={15} />
+                  Disconnection pending. This computer will finish when it
+                  reconnects.
+                </div>
+              ) : !device.online ? (
                 <div className="device-offline">
                   <WifiOff size={15} />
                   Changes are queued. This computer will catch up when it
                   reconnects.
                 </div>
-              )}
+              ) : null}
               {expanded === device.id && (
                 <div className="device-expanded">
                   <h3>Detected locations</h3>
@@ -1534,15 +1578,17 @@ function Devices({
                         ? "Sample data, not a device receipt"
                         : "Only this computer’s local agents are connected."}
                     </span>
-                    <button
-                      className="text-link danger"
-                      onClick={() => {
-                        setDisconnect(device);
-                        setMode("retain");
-                      }}
-                    >
-                      Disconnect computer
-                    </button>
+                    {!device.disconnect && (
+                      <button
+                        className="text-link danger"
+                        onClick={() => {
+                          setDisconnect(device);
+                          setMode("retain");
+                        }}
+                      >
+                        Disconnect computer
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
@@ -1550,7 +1596,7 @@ function Devices({
           );
         })}
       </div>
-      {!workspace.devices.length && (
+      {!devices.length && (
         <Empty
           title="Your first computer is one command away"
           description="Connect a computer and Equip will detect its agents, install your skills, and keep them synchronized."

@@ -4,7 +4,7 @@ export function deployment(
   devices: Device[],
 ): { status: SyncStatus; complete: number; total: number } {
   const destinations = devices
-    .filter((d) => !d.disconnect)
+    .filter((d) => !d.disconnect && !d.disconnectedAt)
     .map((device) => ({
       device,
       agents: device.agents.filter(

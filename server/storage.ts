@@ -186,6 +186,61 @@ export async function migrateLegacySqlite(store: Store, sqlitePath: string) {
   }
 }
 
+export async function backfillDisconnectedDevices(store: Store) {
+  await store.transaction(async (transaction) => {
+    const accounts = await transaction.all<{ id: string; workspace: string }>(
+      "SELECT id,workspace FROM accounts",
+    );
+    const tokens = await transaction.all<{
+      account_id: string;
+      device_id: string;
+      revoked_at: number | string | null;
+    }>("SELECT account_id,device_id,revoked_at FROM device_tokens");
+    const active = new Set(
+      tokens
+        .filter((token) => token.revoked_at === null)
+        .map((token) => `${token.account_id}:${token.device_id}`),
+    );
+    const revoked = new Map<string, number>();
+    for (const token of tokens) {
+      if (token.revoked_at === null) continue;
+      const key = `${token.account_id}:${token.device_id}`;
+      const timestamp = Number(token.revoked_at);
+      if (Number.isFinite(timestamp) && timestamp > (revoked.get(key) ?? 0))
+        revoked.set(key, timestamp);
+    }
+    for (const account of accounts) {
+      const workspace = JSON.parse(account.workspace) as {
+        devices?: Array<{
+          id: string;
+          disconnect?: "retain" | "remove";
+          disconnectedAt?: string;
+        }>;
+      };
+      let changed = false;
+      for (const device of workspace.devices ?? []) {
+        const key = `${account.id}:${device.id}`;
+        const timestamp = revoked.get(key);
+        if (
+          device.disconnect &&
+          !device.disconnectedAt &&
+          timestamp !== undefined &&
+          !active.has(key)
+        ) {
+          device.disconnectedAt = new Date(timestamp).toISOString();
+          changed = true;
+        }
+      }
+      if (changed)
+        await transaction.run(
+          "UPDATE accounts SET workspace=? WHERE id=?",
+          JSON.stringify(workspace),
+          account.id,
+        );
+    }
+  });
+}
+
 export async function openStore(options: {
   dataDir: string;
   databaseUrl?: string;
@@ -208,6 +263,7 @@ export async function openStore(options: {
     try {
       await initialize(store);
       await migrateLegacySqlite(store, path.join(options.dataDir, "equip.sqlite"));
+      await backfillDisconnectedDevices(store);
       return store;
     } catch (error) {
       await store.close();
@@ -220,5 +276,6 @@ export async function openStore(options: {
   database.pragma("foreign_keys = ON");
   const store = new SQLiteStore(database);
   await initialize(store);
+  await backfillDisconnectedDevices(store);
   return store;
 }

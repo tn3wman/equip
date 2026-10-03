@@ -3,7 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { migrateLegacySqlite, openStore } from "../server/storage.ts";
+import {
+  backfillDisconnectedDevices,
+  migrateLegacySqlite,
+  openStore,
+} from "../server/storage.ts";
 
 test("legacy migration is one-time and never overwrites hosted records", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "equip-storage-"));
@@ -157,6 +161,79 @@ test("account email uniqueness is case-insensitive", async () => {
       ...account.slice(1),
     ),
   );
+  await store.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("historical revoked devices receive an idempotent disconnect timestamp", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "equip-storage-"));
+  const store = await openStore({ dataDir: root });
+  const revokedAt = Date.UTC(2026, 9, 3, 18, 30);
+  const workspace = {
+    devices: [
+      { id: "completed", disconnect: "retain", name: "Completed" },
+      { id: "active", disconnect: "remove", name: "Active" },
+      { id: "ordinary", name: "Ordinary" },
+    ],
+  };
+  await store.run(
+    "INSERT INTO accounts VALUES(?,?,?,?,?,?)",
+    "account",
+    "Owner",
+    "owner@example.com",
+    "hash",
+    JSON.stringify(workspace),
+    "created",
+  );
+  await store.run(
+    "INSERT INTO device_tokens VALUES(?,?,?,?,?)",
+    "completed-token",
+    "account",
+    "completed",
+    revokedAt,
+    revokedAt - 1_000,
+  );
+  await store.run(
+    "INSERT INTO device_tokens VALUES(?,?,?,?,?)",
+    "active-old-token",
+    "account",
+    "active",
+    revokedAt,
+    revokedAt - 1_000,
+  );
+  await store.run(
+    "INSERT INTO device_tokens VALUES(?,?,?,?,?)",
+    "active-token",
+    "account",
+    "active",
+    null,
+    revokedAt + 1_000,
+  );
+  await store.run(
+    "INSERT INTO device_tokens VALUES(?,?,?,?,?)",
+    "ordinary-token",
+    "account",
+    "ordinary",
+    revokedAt,
+    revokedAt - 1_000,
+  );
+
+  await backfillDisconnectedDevices(store);
+  await backfillDisconnectedDevices(store);
+  const saved = JSON.parse(
+    (
+      await store.get<{ workspace: string }>(
+        "SELECT workspace FROM accounts WHERE id=?",
+        "account",
+      )
+    )!.workspace,
+  );
+  assert.equal(
+    saved.devices[0].disconnectedAt,
+    new Date(revokedAt).toISOString(),
+  );
+  assert.equal(saved.devices[1].disconnectedAt, undefined);
+  assert.equal(saved.devices[2].disconnectedAt, undefined);
   await store.close();
   await rm(root, { recursive: true, force: true });
 });
