@@ -1198,7 +1198,7 @@ function Discover({
         </label>
         <span className="catalog-source">
           <span className={live ? "live-dot" : "demo-dot"} />
-          {live ? "Live ecosystem results" : "Curated ecosystem collection"}
+          {loading ? "Connecting to skills.sh" : live ? "Live ecosystem results" : "Catalog unavailable"}
         </span>
       </div>
       {query.trim().length === 1 && <p className="search-guidance" role="status">Type at least 2 characters to search.</p>}
@@ -1234,7 +1234,7 @@ function Discover({
               <div className="discover-skill-top">
                 <SkillIcon skill={skill} />
                 <div className="discover-labels">
-                  {installedSkill && <Status status="synchronized" label="In your library" />}
+                  {installedSkill && <Status status="connected" label="In your library" />}
                   {skill.official && <span className="official-label"><Check size={11} /> Official</span>}
                   <SafetyBadge safety={skill.safety} />
                 </div>

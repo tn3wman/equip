@@ -1076,7 +1076,15 @@ export async function createApp(
       const skill = findSkill(req);
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
-      const resolved: any = await resolveSource(skill.source, skill.name);
+      await reviewSafety(skill.source, skill.name, req.body?.auditAcknowledged);
+      let resolved: any;
+      try { resolved = await resolveSource(skill.source, skill.name); }
+      catch (error: any) {
+        const queued = queueSource(req.workspace!, skill.source, skill.name, "install", skill.id, error?.message ?? "Source unavailable on server.");
+        const request = req.workspace!.sourceRequests!.find(item => item.id === queued.body.id);
+        if (request) { request.auditAcknowledged = req.body?.auditAcknowledged === true; request.automatic = false; }
+        return queued;
+      }
       const metadata = validateFiles(resolved.files, 16_384);
       const safety = await reviewSafety(skill.source, metadata.name, req.body?.auditAcknowledged);
       if (
@@ -1610,9 +1618,13 @@ export async function createApp(
         if (sourceMetadata.name !== resolved.name)
           throw httpError(400, "Resolved source metadata does not match its name.");
         if (sourceRequest.kind !== "import") {
-          resolved.safety = await reviewSafety(sourceRequest.source, resolved.name, sourceRequest.auditAcknowledged);
-          if (sourceRequest.automatic && resolved.safety.status === "unavailable")
-            throw httpError(409, "Security reports could not be checked. The automatic update is waiting for review.");
+          const safety = await resolveSafety(sourceRequest.source, resolved.name);
+          resolved.safety = safety;
+          if (((safety.status === "warn" || safety.status === "fail") && !sourceRequest.auditAcknowledged) || (sourceRequest.automatic && safety.status === "unavailable")) {
+            sourceRequest.reason = "Security reports require manual review. The selected revision is unchanged.";
+            await saveWorkspace(db, req.accountId!, req.workspace!);
+            throw httpError(409, sourceRequest.reason);
+          }
         }
         if (sourceRequest.skillId) {
           const skill = req.workspace!.skills.find(
@@ -1620,6 +1632,7 @@ export async function createApp(
           );
           if (!skill) throw httpError(404, "Requested skill no longer exists.");
           if (resolved.revision !== skill.revision) {
+            skill.safety = resolved.safety;
             skill.files = clone(resolved.files);
             skill.revision = resolved.revision;
             skill.upstreamRevision = undefined;
