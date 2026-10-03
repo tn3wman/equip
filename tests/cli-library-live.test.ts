@@ -168,7 +168,7 @@ test(
       }).then((response) => response.json()) as any;
       assert.equal(finalWorkspace.librarySource, undefined);
       assert.equal(
-        finalWorkspace.skills.find((skill: any) => skill.name === "nova-owned").files[0].content,
+        finalWorkspace.skills.find((skill: any) => skill.name === "nova-owned").files.find((file: any) => file.path === "SKILL.md").content,
         second,
       );
     } finally {
