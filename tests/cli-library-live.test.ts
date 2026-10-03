@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -63,6 +63,7 @@ test(
     const skillRoot = join(nova, "skills", "nova-owned");
     const targetOne = join(root, "target-one");
     const targetTwo = join(root, "target-two");
+    const existingSkill = join(root, "shared-skills", "nova-owned");
     const first = "---\nname: nova-owned\ndescription: First revision\n---\n\n# First\n";
     const second = "---\nname: nova-owned\ndescription: Second revision\n---\n\n# Second\n";
     const third = "---\nname: nova-owned\ndescription: Third revision\n---\n\n# Third\n";
@@ -71,6 +72,9 @@ test(
       await writeFile(join(nova, "skills", "skills-sh.json"), "{}\n");
       await writeFile(join(skillRoot, "SKILL.md"), first);
       await writeFile(join(skillRoot, "reference.txt"), "Complete skill payload.\n".repeat(65_000));
+      await cp(skillRoot, existingSkill, { recursive: true });
+      await mkdir(targetOne, { recursive: true });
+      await symlink(existingSkill, join(targetOne, "nova-owned"), "dir");
       const registration = await fetch(`${base}/api/auth/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -117,12 +121,15 @@ test(
       await runCli(["sync"], environment);
       assert.equal(await readFile(join(targetOne, "nova-owned", "SKILL.md"), "utf8"), second);
       assert.equal(await readFile(join(targetTwo, "nova-owned", "SKILL.md"), "utf8"), second);
+      assert.equal((await lstat(join(targetOne, "nova-owned"))).isSymbolicLink(), true);
+      assert.equal(await readFile(join(existingSkill, "SKILL.md"), "utf8"), second);
       const workspaceResponse = await fetch(`${base}/api/workspace`, {
         headers: { cookie },
       });
       const workspace = await workspaceResponse.json() as any;
       const linkedSkill = workspace.skills.find((skill: any) => skill.name === "nova-owned");
       const ledger = JSON.parse(await readFile(join(equipHome, "ledger.json"), "utf8"));
+      assert.equal(Object.values(ledger.installs).filter((entry: any) => entry.observed).length, 1);
       assert.deepEqual(
         Object.values(ledger.installs).map((entry: any) => entry.revision).sort(),
         [linkedSkill.revision, linkedSkill.revision].sort(),

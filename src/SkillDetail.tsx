@@ -640,7 +640,7 @@ export default function SkillDetail({
           <div className="dialog-body">
             <p>
               {confirm === "remove"
-                ? `${skill.title} will leave your library. Connected computers remove unchanged Equip-managed installations; offline computers follow when they reconnect. Local edits are preserved.`
+                ? `${skill.title} will leave your library. Connected computers remove unchanged Equip-managed installations; offline computers follow when they reconnect. Local edits and preexisting folders or links are preserved.`
                 : "The selected version will become the desired revision for every destination. Offline computers catch up when they reconnect, and local edits still require your decision."}
             </p>
             <div className="dialog-actions">

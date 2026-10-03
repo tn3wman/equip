@@ -48,11 +48,45 @@ test("Nova verifies preexisting linked folders without taking ownership or destr
   const receipts = await synchronize(desired([linked]), [{ id: "codex", path: target }], home);
   assert.equal(receipts[0].status, "synchronized");
   assert.equal(receipts[0].managed, false);
-  await synchronize(desired([]), [{ id: "codex", path: target }], home);
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+
+  const updated = { ...skill("two", "r2"), librarySourceId: "nova" };
+  const updateReceipts = await synchronize(
+    { ...desired([updated]), generation: 2 },
+    [{ id: "codex", path: target }],
+    home,
+  );
+  assert.equal(updateReceipts[0].status, "synchronized");
+  assert.equal(updateReceipts[0].managed, false);
+  assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "two");
+  const backups = await import("node:fs/promises").then((fs) =>
+    fs.readdir(join(home, "backups")),
+  );
+  assert.equal(backups.length, 1);
+  assert.equal(
+    await readFile(join(home, "backups", backups[0], "SKILL.md"), "utf8"),
+    "one",
+  );
+
   await writeFile(join(shared, "demo/SKILL.md"), "local work");
-  const conflict = await synchronize(desired([linked]), [{ id: "codex", path: target }], home);
+  const changed = { ...skill("three", "r3"), librarySourceId: "nova" };
+  const conflict = await synchronize(
+    { ...desired([changed]), generation: 3 },
+    [{ id: "codex", path: target }],
+    home,
+  );
   assert.equal(conflict[0].status, "conflicted");
+  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "local work");
+
+  const removed = await synchronize(
+    { generation: 4, skills: [], resolutions: {} },
+    [{ id: "codex", path: target }],
+    home,
+  );
+  assert.equal(removed[0].managed, false);
+  assert.match(removed[0].message ?? "", /preexisting installation retained/);
+  assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
   assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "local work");
 });
 
@@ -316,6 +350,42 @@ test("journal recovery restores the last directory before retrying an interrupte
     await readFile(join(destination, "SKILL.md"), "utf8"),
     "local-before-crash",
   );
+});
+
+test("interrupted updates require the exact committed transaction even for shared paths or unchanged revisions", async () => {
+  for (const observed of [false, true]) {
+    const root = await mkdtemp(join(tmpdir(), "equip-transaction-"));
+    const target = join(root, "agent");
+    const home = join(root, "state");
+    const shared = join(root, "shared");
+    const linked = { ...skill("original"), ...(observed ? { librarySourceId: "nova" } : {}) };
+    if (observed) {
+      await synchronize(desired([linked]), [{ id: "codex", path: shared }], join(root, "seed"));
+      await mkdir(target);
+      await symlink(join(shared, "demo"), join(target, "demo"));
+    }
+    const targets = [{ id: "codex", path: target }, ...(observed ? [{ id: "claude-code", path: target }] : [])];
+    await synchronize(desired([linked]), targets, home);
+    const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
+    const entries = Object.values(ledger.installs) as any[];
+    const destination = entries[0].canonicalPath || entries[0].path;
+    const incomingRevision = observed ? "r2" : "r1";
+    if (observed) entries[1].revision = incomingRevision;
+    await writeFile(join(home, "ledger.json"), JSON.stringify(ledger));
+    await writeFile(join(destination, "SKILL.md"), "local-before-crash");
+    const oldPath = `${destination}.equip-old-test`;
+    await rename(destination, oldPath);
+    await mkdir(destination);
+    await writeFile(join(destination, "SKILL.md"), "half-installed");
+    await writeFile(join(home, "transaction.json"), JSON.stringify({
+      destination, oldPath, stage: `${destination}.equip-stage-test`, hadOld: true,
+      revision: incomingRevision, transactionId: "not-yet-committed",
+    }));
+    const receipts = await synchronize(desired([linked]), targets, home);
+    assert.ok(receipts.every(receipt => receipt.status === "conflicted"));
+    assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "local-before-crash");
+    if (observed) assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+  }
 });
 
 test("a symlinked skill root is conflicted without traversing or replacing its target", async () => {

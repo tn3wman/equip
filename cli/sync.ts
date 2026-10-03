@@ -38,6 +38,9 @@ interface LedgerEntry {
   revision: string;
   files: Record<string, string>;
   path: string;
+  observed?: true;
+  canonicalPath?: string;
+  transactionId?: string;
 }
 interface Ledger {
   generation: number;
@@ -50,6 +53,7 @@ interface Journal {
   hadOld: boolean;
   revision: string;
   obsoletePath?: string;
+  transactionId?: string;
 }
 
 const digest = (data: Buffer | string) =>
@@ -178,7 +182,10 @@ async function recover(home: string) {
   const ledger = await loadLedger(home);
   const committed = Object.values(ledger.installs).some(
     (entry) =>
-      entry.path === journal.destination && entry.revision === journal.revision,
+      (entry.path === journal.destination ||
+        entry.canonicalPath === journal.destination) &&
+      entry.revision === journal.revision &&
+      (!journal.transactionId || entry.transactionId === journal.transactionId),
   );
   if (committed) {
     await rm(journal.oldPath, { recursive: true, force: true });
@@ -284,6 +291,110 @@ async function install(
     }
   }
   const rootInfo = await lstat(destination).catch(() => null);
+  const desired = desiredHashes(skill.files);
+  if (previous?.observed) {
+    const pointer = await realpath(destination).catch(() => undefined);
+    if (!pointer || pointer !== previous.canonicalPath)
+      return {
+        entry: previous,
+        receipt: {
+          ...base,
+          revision: previous.revision,
+          status: "conflicted",
+          managed: false,
+          message: "Observed installation pointer changed and was preserved",
+          localFiles: [],
+        },
+      };
+    const current = await snapshot(pointer);
+    const matchesDesired = !differs(current.hashes, desired);
+    const matchesBaseline = !differs(current.hashes, previous.files);
+    if (matchesDesired)
+      return {
+        entry: { ...previous, revision: skill.revision, files: desired },
+        receipt: {
+          ...base,
+          status: "synchronized",
+          managed: false,
+          message: "Existing installation matches; original folder or link retained",
+        },
+      };
+    if (action === "import" || action === "preserve")
+      return {
+        release: true,
+        receipt: {
+          ...base,
+          revision: previous.revision,
+          status: "conflicted",
+          managed: false,
+          message:
+            action === "import"
+              ? "Imported local files and released observation"
+              : "Preserved local files and released observation",
+          localFiles: current.files,
+        },
+      };
+    if (!matchesBaseline && action !== "replace")
+      return {
+        entry: previous,
+        receipt: {
+          ...base,
+          revision: previous.revision,
+          status: "conflicted",
+          managed: false,
+          message: "Observed installation changed locally and was preserved",
+          localFiles: current.files,
+        },
+      };
+    const backup = join(
+      home,
+      "backups",
+      `${Date.now()}-${skill.name}-observed-${randomUUID()}`,
+    );
+    await cp(pointer, backup, {
+      recursive: true,
+      dereference: false,
+      preserveTimestamps: true,
+    });
+    const stage = `${pointer}.equip-stage-${randomUUID()}`;
+    const oldPath = `${pointer}.equip-old-${randomUUID()}`;
+    const transactionId = randomUUID();
+    await mkdir(stage, { recursive: true });
+    await writeFiles(stage, skill.files);
+    await saveJsonAtomic(join(home, "transaction.json"), {
+      destination: pointer,
+      stage,
+      oldPath,
+      hadOld: true,
+      revision: skill.revision,
+      transactionId,
+    } satisfies Journal);
+    try {
+      await rename(pointer, oldPath);
+      await rename(stage, pointer);
+    } catch (error) {
+      if (await lstat(oldPath).catch(() => null)) {
+        await rm(pointer, { recursive: true, force: true });
+        await rename(oldPath, pointer);
+      }
+      throw error;
+    }
+    return {
+      entry: {
+        ...previous,
+        revision: skill.revision,
+        files: desired,
+        transactionId,
+      },
+      oldPath,
+      receipt: {
+        ...base,
+        status: "synchronized",
+        managed: false,
+        message: "Updated observed installation; original folder or link retained",
+      },
+    };
+  }
   // Nova's existing installs often point at its shared folder. Verify them,
   // but leave ownership with Nova so removals cannot destroy preexisting work.
   let linkedLocalFiles: SkillFile[] | undefined;
@@ -291,8 +402,25 @@ async function install(
     const existing = await snapshot(await realpath(destination));
     linkedLocalFiles = existing.files;
     if (!differs(existing.hashes, desiredHashes(skill.files)))
-      return { receipt: { ...base, status: "synchronized", managed: false,
-        message: "Existing installation matches; original folder or link retained" } };
+      return {
+        entry: {
+          skillId: skill.id,
+          agent: target.id,
+          profile: target.profile,
+          project: target.project,
+          revision: skill.revision,
+          files: desired,
+          path: destination,
+          observed: true,
+          canonicalPath: await realpath(destination),
+        },
+        receipt: {
+          ...base,
+          status: "synchronized",
+          managed: false,
+          message: "Existing installation matches; original folder or link retained",
+        },
+      };
   }
   if (rootInfo?.isSymbolicLink())
     return {
@@ -314,7 +442,7 @@ async function install(
     !conflict &&
     previous?.path === destination &&
     previous.revision === skill.revision &&
-    !differs(desiredHashes(skill.files), previous.files)
+    !differs(desired, previous.files)
   )
     return { entry: previous, receipt: { ...base, status: "synchronized" } };
   if (conflict && action === "import")
@@ -357,6 +485,7 @@ async function install(
   }
   const stage = `${destination}.equip-stage-${randomUUID()}`;
   const oldPath = `${destination}.equip-old-${randomUUID()}`;
+  const transactionId = randomUUID();
   await mkdir(stage, { recursive: true });
   await writeFiles(stage, skill.files);
   const hadOld = !!(await lstat(destination).catch(() => null));
@@ -367,6 +496,7 @@ async function install(
     hadOld,
     revision: skill.revision,
     obsoletePath,
+    transactionId,
   } satisfies Journal);
   try {
     if (hadOld) await rename(destination, oldPath);
@@ -385,8 +515,9 @@ async function install(
     profile: target.profile,
     project: target.project,
     revision: skill.revision,
-    files: desiredHashes(skill.files),
+    files: desired,
     path: destination,
+    transactionId,
   };
   return {
     entry,
@@ -492,6 +623,22 @@ export async function synchronize(
     );
     for (const [key, old] of Object.entries(ledger.installs))
       if (!wanted.has(key)) {
+        if (old.observed) {
+          delete next.installs[key];
+          receipts.push({
+            skillId: old.skillId,
+            agent: old.agent,
+            profile: old.profile,
+            project: old.project,
+            revision: old.revision,
+            status: "synchronized",
+            managed: false,
+            message: "Released observation; preexisting installation retained",
+            path: old.path,
+            timestamp: new Date().toISOString(),
+          });
+          continue;
+        }
         if (!(await lstat(old.path).catch(() => null))) {
           delete next.installs[key];
           receipts.push({ skillId: old.skillId, agent: old.agent,
