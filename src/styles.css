@@ -4012,6 +4012,21 @@ kbd {
   outline: 2px solid #719648;
   outline-offset: -3px;
 }
+@media (max-width: 700px) {
+  .detail-panel {
+    display: block;
+    overflow-y: auto;
+  }
+  .detail-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #fbfcf7;
+  }
+  .detail-content {
+    overflow: visible;
+  }
+}
 .field,
 .dialog-body > p,
 .dialog-body p,
