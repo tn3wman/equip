@@ -1505,8 +1505,9 @@ function Devices({
                     <span className="agent-glyph">{agent.name.charAt(0)}</span>
                     {agent.name}
                     <small>
+                      {agent.profile ? `${agent.profile} · ` : ""}
                       {agent.aliases?.length || 1}{" "}
-                      {agent.aliases?.length ? "configurations" : "configuration"}
+                      {(agent.aliases?.length || 1) === 1 ? "configuration" : "configurations"}
                     </small>
                   </span>
                 ))}
@@ -1542,10 +1543,10 @@ function Devices({
                         <code>{agent.path}</code>
                         <span>
                           {agent.project ? "Project: " + agent.project : "Global"}
-                          {" · "}{agent.aliases?.length ? "Shared skill folder" : agent.profile || "default"}
+                          {" · "}{(agent.aliases?.length ?? 0) > 1 ? "Shared skill folder" : agent.profile || "default"}
                         </span>
                       </div>
-                      {agent.aliases?.map((alias) => (
+                      {(agent.aliases?.length ?? 0) > 1 && agent.aliases?.map((alias) => (
                         <div className="agent-location alias" key={`${alias.profile}:${alias.path}`}>
                           <strong>{alias.profile}</strong>
                           <code>{alias.path}</code>

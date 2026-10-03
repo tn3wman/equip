@@ -37,6 +37,14 @@ function profileName(prefix: string, path: string) {
   return name.replace(/^\.+/, "") || "custom";
 }
 
+function conventionalProfileName(prefix: string, name: string) {
+  if (name === prefix) return true;
+  if (/\.(?:lock|tmp|temp|bak)$/i.test(name)) return false;
+  if (!name.startsWith(`${prefix}_`) && !name.startsWith(`${prefix}-`))
+    return false;
+  return /^[A-Za-z0-9_-]+$/.test(name.slice(prefix.length + 1));
+}
+
 async function directory(path: string) {
   return stat(path)
     .then((info) => info.isDirectory())
@@ -138,10 +146,7 @@ export async function discoverAgentProfiles(
       { root: defaultRoot, profile: profileName(specification.prefix, defaultRoot) },
       ...entries
         .filter(
-          (entry) =>
-            (entry.name === specification.prefix ||
-              entry.name.startsWith(`${specification.prefix}_`) ||
-              entry.name.startsWith(`${specification.prefix}-`)),
+          (entry) => conventionalProfileName(specification.prefix, entry.name),
         )
         .map((entry) => {
           const root = join(home, entry.name);

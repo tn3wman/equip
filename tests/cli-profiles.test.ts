@@ -18,6 +18,7 @@ test("profile discovery finds conventional and suffixed agent homes", async () =
   await Promise.all([
     mkdir(join(home, ".claude")),
     mkdir(join(home, ".claude_nova")),
+    mkdir(join(home, ".claude_nova.lock/skills"), { recursive: true }),
     mkdir(join(home, ".codex")),
     mkdir(join(home, ".codex_purse")),
   ]);
@@ -66,6 +67,11 @@ test("profile discovery finds conventional and suffixed agent homes", async () =
         ],
       },
     ],
+  );
+  assert.ok(
+    !profiles.some((profile) =>
+      profile.globalPath.includes(".claude_nova.lock"),
+    ),
   );
 });
 
