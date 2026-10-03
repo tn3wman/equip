@@ -31,6 +31,8 @@ import {
   navigateTabs,
 } from "./components";
 import type { Skill, Workspace, SkillFile, Target } from "../shared/types";
+import type { SkillSafety } from "../shared/types";
+import { SafetyBadge, SafetyReport } from "./Safety";
 
 export default function SkillDetail({
   skill,
@@ -58,11 +60,15 @@ export default function SkillDetail({
   const [error, setError] = useState("");
   const [confirm, setConfirm] = useState<"remove" | "rollback" | null>(null);
   const [versionId, setVersionId] = useState("");
+  const [safety, setSafety] = useState<SkillSafety | undefined>(skill.safety);
+  const [safetyLoading, setSafetyLoading] = useState(skill.kind === "third-party");
+  const [auditAcknowledged, setAuditAcknowledged] = useState(false);
   const installed = workspace.skills.some(
     (s) => s.id === skill.id && s.selected,
   );
   const devices = workspace.devices.filter((device) => !device.disconnectedAt);
   const data = actual || skill;
+  const flagged = safety?.status === "warn" || safety?.status === "fail";
   const files = data.files.length ? data.files : data.draft || [];
   const activeFile = files.find((f) => f.path === file) || files[0];
   useEffect(() => {
@@ -105,6 +111,17 @@ export default function SkillDetail({
     api<Skill>(`/skills/${skill.id}`).then(value => { if (!disposed) setActual(value); }).catch(error => { if (!disposed) setError(error.message); }).finally(() => { if (!disposed) setLoading(false); });
     return () => { disposed = true; };
   }, [skill.id, skill.revision, installed]);
+  useEffect(() => {
+    if (skill.kind !== "third-party") return;
+    let disposed = false;
+    setSafetyLoading(true);
+    setAuditAcknowledged(false);
+    api<SkillSafety>(`/skills/audits?source=${encodeURIComponent(skill.source)}&name=${encodeURIComponent(skill.name)}`)
+      .then((result) => { if (!disposed) setSafety(result); })
+      .catch((requestError) => { if (!disposed) setSafety({ status: "unavailable", audits: [], checkedAt: new Date().toISOString(), error: requestError.message, scope: "upstream" }); })
+      .finally(() => { if (!disposed) setSafetyLoading(false); });
+    return () => { disposed = true; };
+  }, [skill.source, skill.name, skill.kind, skill.revision]);
   const act = async (
     fn: () => Promise<any>,
     message: string,
@@ -200,7 +217,7 @@ export default function SkillDetail({
             ) : (
               <>
                 <Github size={13} />
-                {skill.source}
+                {skill.sourceType ? `${skill.sourceType} · ` : ""}{skill.author || skill.source}
                 <a
                   href={
                     skill.source.startsWith("http")
@@ -221,6 +238,7 @@ export default function SkillDetail({
                 label={skill.versions.length ? "In your library" : "Draft"}
               />
             )}
+            {skill.kind === "third-party" && <SafetyBadge safety={safety} loading={safetyLoading} />}
           </div>
           <div className="detail-actions">
             {installed ? (
@@ -236,10 +254,10 @@ export default function SkillDetail({
                 ) : (
                   <button
                     className="button primary"
-                    disabled={busy}
+                    disabled={busy || safetyLoading || (flagged && !auditAcknowledged)}
                     onClick={() =>
                       act(
-                        () => api(`/skills/${skill.id}/update`, "POST"),
+                        () => api(`/skills/${skill.id}/update`, "POST", auditAcknowledged ? { auditAcknowledged: true } : undefined),
                         "Updated revision selected. Computers will confirm installation.",
                       )
                     }
@@ -280,13 +298,14 @@ export default function SkillDetail({
             ) : (
               <button
                 className="button primary"
-                disabled={busy}
+                disabled={busy || safetyLoading || (flagged && !auditAcknowledged)}
                 onClick={() =>
                   act(
                     () =>
                       api("/skills/install", "POST", {
                         source: skill.source,
                         name: skill.name,
+                        ...(auditAcknowledged ? { auditAcknowledged: true } : {}),
                       }),
                     "Skill added. Connected computers will receive the selected revision.",
                     true,
@@ -298,6 +317,7 @@ export default function SkillDetail({
               </button>
             )}
           </div>
+          {skill.kind === "third-party" && flagged && !safetyLoading && <label className="audit-acknowledgement"><input type="checkbox" checked={auditAcknowledged} onChange={(event) => setAuditAcknowledged(event.target.checked)} /><span><strong>I reviewed the audit findings</strong><small>Required before {installed ? "updating" : "adding"} this skill.</small></span></label>}
         </div>
         {error && (
           <div className="notice error" role="alert">
@@ -336,6 +356,7 @@ export default function SkillDetail({
                   { id: "history", label: "History" },
                 ]
               : []),
+            ...(skill.kind === "third-party" ? [{ id: "security", label: "Security" }] : []),
           ].map((t) => (
             <button
               role="tab"
@@ -369,12 +390,12 @@ export default function SkillDetail({
                   <strong>Agent Skills</strong>
                 </div>
               </div>
-              {skill.requirements.length > 0 && (
+              {data.requirements.length > 0 && (
                 <div className="requirement-box">
                   <Terminal size={16} />
                   <div>
                     <strong>Requirements</strong>
-                    <p>{skill.requirements.join(" · ")}</p>
+                    <p>{data.requirements.join(" · ")}</p>
                   </div>
                 </div>
               )}
@@ -429,6 +450,7 @@ export default function SkillDetail({
               )}
             </div>
           )}
+          {tab === "security" && <SafetyReport safety={safety} loading={safetyLoading} />}
           {tab === "destinations" && (
             <>
               <h3 className="detail-section-title">

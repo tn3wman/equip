@@ -13,6 +13,12 @@ test("Vercel output requires a safe external API origin", () => {
 test("Vercel output proxies backend paths before static files and the SPA fallback", () => {
   const config = createVercelConfig("https://api.example.com");
   assert.equal(config.version, 3);
+  const catalogRoute = config.routes.findIndex(route => route.src === "/api/discover");
+  const auditRoute = config.routes.findIndex(route => route.src === "/api/skills/audits");
+  const backendRoute = config.routes.findIndex(route => route.src === "/api/(.*)");
+  assert.ok(catalogRoute > 0 && catalogRoute < backendRoute);
+  assert.ok(auditRoute > 0 && auditRoute < backendRoute);
+  assert.equal(config.routes[catalogRoute].dest, "/catalog");
   assert.deepEqual(
     config.routes.filter((route) => "dest" in route && route.dest?.startsWith("https://")),
     [

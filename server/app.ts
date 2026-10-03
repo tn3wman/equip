@@ -13,6 +13,8 @@ import YAML from "yaml";
 import type {
   Activity,
   DesiredState,
+  SkillSafety,
+  DiscoveryView,
   Device,
   Receipt,
   Skill,
@@ -21,6 +23,7 @@ import type {
   Target,
   Workspace,
 } from "../shared/types.ts";
+import { discoverSkills, fetchSkillSafety } from "../shared/discovery.ts";
 import { skillArchive } from "../shared/archive.ts";
 import { demoCatalog } from "./catalog.ts";
 import {
@@ -474,6 +477,7 @@ export async function createApp(
     publicDir?: string;
     autoUpdateIntervalMs?: number;
     sourceResolver?: (source: string, name?: string) => Promise<any>;
+    safetyResolver?: (source: string, name: string) => Promise<SkillSafety>;
     publicUrl?: string;
     registrationEmail?: string;
     databaseUrl?: string;
@@ -734,70 +738,28 @@ export async function createApp(
     res.json(workspace);
   });
 
-  app.get("/api/discover", async (req, res) => {
+  app.get("/api/discover", async (req, res, next) => {
     try {
       const query = String(req.query.q ?? "");
-      const rawCategory = String(req.query.category ?? "");
-      const category =
-        rawCategory.toLowerCase() === "all skills" ? "" : rawCategory;
-      if (!query.trim()) {
-        const selectedCategory = category.toLowerCase();
-        return res.json({
-          skills: demoCatalog
-            .filter((s) => s.kind === "third-party")
-            .filter(
-              (skill) =>
-                !selectedCategory ||
-                skill.category.toLowerCase() === selectedCategory,
-            ),
-          live: false,
-        });
-      }
-      const result = await (await upstream()).discoverSkills(query, "");
-      if (result.skills.length || result.live) return res.json(result);
-      const q = query.toLowerCase();
-      const selectedCategory = category.toLowerCase();
-      const skills = demoCatalog
-        .filter((s) => s.kind === "third-party")
-        .filter(
-          (s) =>
-            (!q ||
-              `${s.title} ${s.description} ${s.author}`
-                .toLowerCase()
-                .includes(q)) &&
-            (!selectedCategory ||
-              s.category.toLowerCase() === selectedCategory),
-        );
-      res.json({
-        skills,
-        live: false,
-        error:
-          result.error ??
-          "Live catalog unavailable. Showing the bundled demo catalog.",
-      });
-    } catch (error: any) {
-      const q = String(req.query.q ?? "").toLowerCase();
-      const rawCategory = String(req.query.category ?? "").toLowerCase();
-      const category = rawCategory === "all skills" ? "" : rawCategory;
-      const skills = demoCatalog
-        .filter((s) => s.kind === "third-party")
-        .filter(
-          (s) =>
-            (!q ||
-              `${s.title} ${s.description} ${s.author}`
-                .toLowerCase()
-                .includes(q)) &&
-            (!category || s.category.toLowerCase() === category),
-        );
-      res.json({
-        skills,
-        live: false,
-        error:
-          error?.message ??
-          "Live catalog unavailable. Showing the bundled demo catalog.",
-      });
-    }
+      const view = String(req.query.view ?? "all-time");
+      const page = Number(req.query.page ?? 0);
+      if (!["all-time", "trending", "hot", "official"].includes(view) || !Number.isInteger(page) || page < 0 || page > 10000 || query.length > 200)
+        throw httpError(400, "Invalid discovery parameters.");
+      res.json(await discoverSkills(query, view as DiscoveryView, page));
+    } catch (error) { next(error); }
   });
+  const resolveSafety = options.safetyResolver ?? fetchSkillSafety;
+  app.get("/api/skills/audits", async (req, res, next) => {
+    try {
+      res.json(await resolveSafety(String(req.query.source ?? ""), String(req.query.name ?? "")));
+    } catch (error) { next(error); }
+  });
+  const reviewSafety = async (source: string, name: string, acknowledged: unknown) => {
+    const safety = await resolveSafety(source, name);
+    if ((safety.status === "warn" || safety.status === "fail") && acknowledged !== true)
+      throw httpError(409, "Upstream security reports contain findings. Inspect the reports and acknowledge them before installing or updating this skill.");
+    return safety;
+  };
   app.post(
     "/api/skills/inspect",
     auth(false),
@@ -945,10 +907,11 @@ export async function createApp(
       if (!source) throw httpError(400, "source or skillId is required.");
       let resolved: any;
       const sourceName = req.body?.name ?? catalog?.name;
+      if (sourceName) await reviewSafety(source, String(sourceName), req.body?.auditAcknowledged);
       try {
         resolved = await resolveSource(source, sourceName);
       } catch (error: any) {
-        return queueSource(
+        const queued = queueSource(
           req.workspace!,
           source,
           sourceName,
@@ -956,14 +919,19 @@ export async function createApp(
           undefined,
           error?.message ?? "Source unavailable on server.",
         );
+        const request = req.workspace!.sourceRequests!.find(item => item.id === queued.body.id);
+        if (request) request.auditAcknowledged = req.body?.auditAcknowledged === true;
+        return queued;
       }
       const metadata = validateFiles(resolved.files, 16_384);
+      const safety = await reviewSafety(source, metadata.name, req.body?.auditAcknowledged);
       resolved.name = metadata.name;
       resolved.description = metadata.description;
       if (req.workspace!.skills.some((skill) => skill.name === resolved.name))
         throw httpError(409, "A skill with this name already exists.");
       const skill: Skill = {
         ...resolved,
+        safety,
         id: id("skill"),
         kind: "third-party",
         selected: true,
@@ -1110,12 +1078,14 @@ export async function createApp(
         throw httpError(400, "Custom skills have no upstream source.");
       const resolved: any = await resolveSource(skill.source, skill.name);
       const metadata = validateFiles(resolved.files, 16_384);
+      const safety = await reviewSafety(skill.source, metadata.name, req.body?.auditAcknowledged);
       if (
         req.workspace!.skills.some(
           (other) => other.id !== skill.id && other.name === metadata.name,
         )
       )
         throw httpError(409, "A skill with this name already exists.");
+      skill.safety = safety;
       skill.name = metadata.name;
       skill.description = metadata.description;
       skill.files = clone(resolved.files);
@@ -1636,7 +1606,14 @@ export async function createApp(
           !resolved.revision
         )
           throw httpError(400, "Resolved source does not match the request.");
-        validateFiles(resolved.files, 16_384);
+        const sourceMetadata = validateFiles(resolved.files, 16_384);
+        if (sourceMetadata.name !== resolved.name)
+          throw httpError(400, "Resolved source metadata does not match its name.");
+        if (sourceRequest.kind !== "import") {
+          resolved.safety = await reviewSafety(sourceRequest.source, resolved.name, sourceRequest.auditAcknowledged);
+          if (sourceRequest.automatic && resolved.safety.status === "unavailable")
+            throw httpError(409, "Security reports could not be checked. The automatic update is waiting for review.");
+        }
         if (sourceRequest.skillId) {
           const skill = req.workspace!.skills.find(
             (item) => item.id === sourceRequest.skillId,
@@ -2123,6 +2100,17 @@ export async function createApp(
                 changed = true;
                 continue;
               }
+              const safety = await resolveSafety(skill.source, skill.name);
+              skill.safety = safety;
+              if (safety.status === "warn" || safety.status === "fail" || safety.status === "unavailable") {
+                const description = safety.status === "unavailable"
+                  ? "Security reports could not be checked. The selected revision is unchanged."
+                  : "Upstream security reports contain findings. Review and approve this update manually.";
+                if (!workspace.activity.some(item => item.type === "update-review" && item.skillId === skill.id && item.description === description))
+                  activity(workspace, { type: "update-review", title: `${skill.title} update needs review`, description, status: "pending", skillId: skill.id });
+                changed = true;
+                continue;
+              }
               skill.files = clone(resolved.files);
               skill.revision = nextRevision;
               skill.upstreamRevision = undefined;
@@ -2173,6 +2161,7 @@ export async function createApp(
                   kind: "install",
                   skillId: skill.id,
                   reason: description,
+                  automatic: true,
                 });
               changed = true;
             }

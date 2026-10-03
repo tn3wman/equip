@@ -64,7 +64,10 @@ import type {
   Workspace,
   SyncStatus,
   SkillFile,
+  DiscoveryResult,
+  DiscoveryView,
 } from "../shared/types";
+import { SafetyBadge } from "./Safety";
 const lazyReloadKey = "equip:stale-chunk-reload";
 function lazyWithReload<T extends ComponentType<any>>(
   load: () => Promise<{ default: T }>,
@@ -472,8 +475,7 @@ export default function App() {
             <Discover
               workspace={workspace}
               open={setSelected}
-              run={run}
-              busy={busy}
+              notify={notify}
             />
           )}
           {page === "devices" && (
@@ -1079,54 +1081,63 @@ function Library({
 function Discover({
   workspace,
   open,
-  run,
-  busy,
+  notify,
 }: {
   workspace: Workspace;
   open: (s: Skill) => void;
-  run: (fn: () => Promise<unknown>, message: string) => Promise<void>;
-  busy: boolean;
+  notify: (message: string) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [category, setCategory] = useState("All skills");
+  const [view, setView] = useState<DiscoveryView>("all-time");
   const [catalog, setCatalog] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(true);
   const [live, setLive] = useState(false);
   const [source, setSource] = useState("");
   const [sourceName, setSourceName] = useState("");
   const [importing, setImporting] = useState(false);
+  const [sourceInspecting, setSourceInspecting] = useState(false);
+  const [sourceQueueing, setSourceQueueing] = useState(false);
+  const [sourceError, setSourceError] = useState("");
   const [loadError, setLoadError] = useState("");
+  const [page, setCatalogPage] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const requestId = useRef(0);
+  const search = query.trim().length >= 2 ? query.trim() : "";
   useEffect(() => {
-    let active = true;
+    const id = ++requestId.current;
     const controller = setTimeout(() => {
       setLoading(true);
-      api<{ skills: Skill[]; live: boolean; error?: string }>(
-        `/discover?q=${encodeURIComponent(query)}&category=${encodeURIComponent(category)}`,
+      api<DiscoveryResult>(
+        `/discover?q=${encodeURIComponent(search)}&view=${view}&page=${page}`,
       )
         .then((data) => {
-          if (active) {
-            setCatalog(data.skills);
+          if (id === requestId.current) {
+            setCatalog((current) => page ? [...current, ...data.skills] : data.skills);
             setLive(data.live);
             setLoadError(data.error || "");
+            setHasMore(Boolean(data.pagination?.hasMore));
           }
         })
         .catch((e) => {
-          if (active) setLoadError(e.message);
+          if (id === requestId.current) setLoadError(e.message);
         })
         .finally(() => {
-          if (active) setLoading(false);
+          if (id === requestId.current) setLoading(false);
         });
     }, 250);
     return () => {
-      active = false;
       clearTimeout(controller);
     };
-  }, [query, category]);
-  const selected = new Set(
-    workspace.skills
-      .filter((s) => s.selected)
-      .map((s) => `${s.source}:${s.name}`),
-  );
+  }, [search, view, page]);
+  useEffect(() => { setCatalogPage(0); setCatalog([]); }, [search, view]);
+  const sourceKey = (skill: Pick<Skill, "source" | "name">) => {
+    let source = skill.source.trim().toLowerCase().replace(/\.git$/, "").replace(/^git\+/, "");
+    source = source.replace(/^https?:\/\/(www\.)?github\.com\//, "").replace(/^git@github\.com:/, "");
+    source = source.split("@")[0].replace(/^\/+|\/+$/g, "");
+    return `${source}:${skill.name.trim().toLowerCase()}`;
+  };
+  const installed = new Map(workspace.skills.filter((skill) => skill.selected).map((skill) => [sourceKey(skill), skill]));
+  const openResolved = (skill: Skill) => open(installed.get(sourceKey(skill)) || skill);
   return (
     <div className="page">
       <div className="page-heading">
@@ -1190,21 +1201,16 @@ function Discover({
           {live ? "Live ecosystem results" : "Curated ecosystem collection"}
         </span>
       </div>
-      {!query.trim() && (
+      {query.trim().length === 1 && <p className="search-guidance" role="status">Type at least 2 characters to search.</p>}
+      {!search && (
         <div className="category-tabs">
-          {[
-            "All skills",
-            "Development",
-            "Design",
-            "Productivity",
-            "Testing",
-          ].map((c) => (
+          {([{ id: "all-time", label: "Popular" }, { id: "trending", label: "Trending" }, { id: "hot", label: "Hot" }, { id: "official", label: "Official" }] as const).map((item) => (
             <button
-              className={category === c ? "active" : ""}
-              onClick={() => setCategory(c)}
-              key={c}
+              className={view === item.id ? "active" : ""}
+              onClick={() => setView(item.id)}
+              key={item.id}
             >
-              {c}
+              {item.label}
             </button>
           ))}
         </div>
@@ -1215,24 +1221,25 @@ function Discover({
           {loadError}
         </div>
       )}
-      {loading ? (
+      {loading && page === 0 ? (
         <div className="catalog-loading">
           <Loader2 className="spin" size={20} />
           Finding skills…
         </div>
       ) : (
         <div className="discover-grid">
-          {catalog.map((skill) => (
-            <article className="discover-skill" key={skill.id}>
+          {catalog.map((skill) => {
+            const installedSkill = installed.get(sourceKey(skill));
+            return <article className="discover-skill" key={skill.catalogId || skill.id}>
               <div className="discover-skill-top">
                 <SkillIcon skill={skill} />
-                {selected.has(`${skill.source}:${skill.name}`) ? (
-                  <Status status="synchronized" label="In your library" />
-                ) : (
-                  <span className="category-label">{skill.category}</span>
-                )}
+                <div className="discover-labels">
+                  {installedSkill && <Status status="synchronized" label="In your library" />}
+                  {skill.official && <span className="official-label"><Check size={11} /> Official</span>}
+                  <SafetyBadge safety={skill.safety} />
+                </div>
               </div>
-              <button className="discover-title" onClick={() => open(skill)}>
+              <button className="discover-title" onClick={() => openResolved(skill)}>
                 {skill.title}
                 <ArrowUpRight size={17} />
               </button>
@@ -1243,20 +1250,22 @@ function Discover({
               <div className="discover-skill-bottom">
                 <span>
                   <Github size={12} />
-                  {skill.source === "custom" ? "Your workspace" : skill.source}
+                  {skill.sourceType ? `${skill.sourceType} · ` : ""}{skill.author || skill.source}
                 </span>
+                {typeof skill.installs === "number" && <span className="install-count"><ArrowDownToLine size={11} />{skill.installs.toLocaleString()}</span>}
                 <button
                   className="icon-button"
                   aria-label={`Inspect ${skill.title}`}
-                  onClick={() => open(skill)}
+                  onClick={() => openResolved(skill)}
                 >
                   <Plus size={17} />
                 </button>
               </div>
-            </article>
-          ))}
+            </article>;
+          })}
         </div>
       )}
+      {hasMore && <div className="load-more"><button className="button" disabled={loading} onClick={() => setCatalogPage((value) => value + 1)}>{loading ? <Loader2 className="spin" size={15} /> : null}Load more</button></div>}
       {!loading && !catalog.length && (
         <Empty
           title="No skills found"
@@ -1269,15 +1278,40 @@ function Discover({
             className="dialog-body"
             onSubmit={async (e) => {
               e.preventDefault();
-              await run(
-                () =>
-                  api("/skills/install", "POST", {
-                    source,
-                    name: sourceName || undefined,
-                  }),
-                "Source requested. Your library shows the selected revision or any pending device resolution.",
-              );
-              setImporting(false);
+              setSourceInspecting(true);
+              setSourceError("");
+              try {
+                const result = await api<Partial<Skill>>("/skills/inspect", "POST", { source, name: sourceName || undefined });
+                const fallbackName = sourceName || source.replace(/\.git$/, "").split("/").filter(Boolean).at(-1) || "skill";
+                const inspected: Skill = {
+                  id: result.id || result.catalogId || `inspect:${source}:${fallbackName}`,
+                  name: result.name || fallbackName,
+                  title: result.title || result.name || fallbackName,
+                  description: result.description || "Inspect the source files and audit reports before adding this skill.",
+                  author: result.author || source.replace(/^https?:\/\/(www\.)?github\.com\//, "").split("/")[0],
+                  source: result.source || source,
+                  kind: "third-party",
+                  category: result.category || "Community",
+                  icon: result.icon || "code",
+                  color: result.color || "#d4eaa1",
+                  selected: false,
+                  enabled: true,
+                  autoUpdate: false,
+                  revision: result.revision || "",
+                  versions: result.versions || [],
+                  files: result.files || [],
+                  requirements: result.requirements || [],
+                  targets: result.targets || [],
+                  updatedAt: result.updatedAt || new Date().toISOString(),
+                  ...result,
+                };
+                setImporting(false);
+                open(inspected);
+              } catch (inspectError) {
+                setSourceError((inspectError as Error).message);
+              } finally {
+                setSourceInspecting(false);
+              }
             }}
           >
             <p>
@@ -1293,6 +1327,7 @@ function Discover({
                 required
               />
             </label>
+            {sourceError && <div className="notice error" role="alert"><AlertTriangle size={15} />{sourceError}</div>}
             <label className="field">
               Skill name{" "}
               <span className="field-hint">
@@ -1306,8 +1341,8 @@ function Discover({
             </label>
             <div className="notice">
               <Github size={16} />
-              Private repositories use the credentials on the connected
-              computer. Server-side access may require an authenticated source.
+              Connected computers can resolve private sources using credentials
+              that stay on that computer.
             </div>
             <div className="dialog-actions">
               <button
@@ -1317,15 +1352,37 @@ function Discover({
               >
                 Cancel
               </button>
-              <button className="button primary" disabled={busy || !source}>
-                {busy ? (
+              <button className="button primary" disabled={sourceInspecting || !source}>
+                {sourceInspecting ? (
                   <Loader2 size={16} className="spin" />
                 ) : (
                   <ArrowDownToLine size={16} />
                 )}
-                Resolve & add skill
+                Inspect skill
               </button>
             </div>
+            {sourceError && <button
+              type="button"
+              className="button source-fallback"
+              disabled={sourceQueueing || !source}
+              onClick={async () => {
+                setSourceQueueing(true);
+                try {
+                  const result = await api<{ pending?: boolean }>("/skills/install", "POST", { source, name: sourceName || undefined });
+                  setImporting(false);
+                  notify(result.pending
+                    ? "Source queued. A connected computer will resolve it with its existing repository access."
+                    : "Skill added. Connected computers will receive the selected revision.");
+                } catch (queueError) {
+                  setSourceError((queueError as Error).message);
+                } finally {
+                  setSourceQueueing(false);
+                }
+              }}
+            >
+              {sourceQueueing ? <Loader2 size={16} className="spin" /> : <Laptop size={16} />}
+              Resolve on a connected computer
+            </button>}
           </form>
         </Dialog>
       )}

@@ -2,6 +2,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
+import { build as bundle } from "esbuild";
 
 const outputRoot = fileURLToPath(new URL("../.vercel/output/", import.meta.url));
 
@@ -50,6 +51,8 @@ export function createVercelConfig(apiUrl: string): { version: 3; routes: Vercel
     routes: [
       { src: "/.*", headers: securityHeaders, continue: true },
       { src: "/(?:api|cli|install)(?:/.*|\\..*)?", headers: uncached, continue: true },
+      { src: "/api/discover", dest: "/catalog" },
+      { src: "/api/skills/audits", dest: "/catalog" },
       { src: "/api", dest: `${apiUrl}/api` },
       { src: "/api/(.*)", dest: `${apiUrl}/api/$1` },
       { src: "/cli", dest: `${apiUrl}/cli` },
@@ -68,6 +71,13 @@ export async function buildVercelOutput(environment = process.env) {
   await rm(outputRoot, { recursive: true, force: true });
   await build({ build: { outDir: `${outputRoot}/static`, emptyOutDir: true } });
   await mkdir(outputRoot, { recursive: true });
+  const functionRoot = `${outputRoot}/functions/catalog.func`;
+  await mkdir(functionRoot, { recursive: true });
+  await bundle({
+    entryPoints: [fileURLToPath(new URL("../server/catalog-function.ts", import.meta.url))],
+    outfile: `${functionRoot}/index.cjs`, bundle: true, platform: "node", format: "cjs", target: "node22",
+  });
+  await writeFile(`${functionRoot}/.vc-config.json`, JSON.stringify({ runtime: "nodejs22.x", handler: "index.cjs", launcherType: "Nodejs" }));
   await writeFile(
     `${outputRoot}/config.json`,
     `${JSON.stringify(createVercelConfig(apiUrl), null, 2)}\n`,

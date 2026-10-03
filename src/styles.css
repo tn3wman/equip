@@ -1329,6 +1329,11 @@ kbd {
   gap: 6px;
   color: #8b957d;
 }
+.search-guidance {
+  margin: 8px 0 0 14px;
+  color: var(--muted);
+  font-size: 10px;
+}
 .category-tabs {
   display: flex;
   gap: 9px;
@@ -1375,6 +1380,13 @@ kbd {
   margin-bottom: 17px;
   gap: 5px;
 }
+.discover-labels {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  flex-wrap: wrap;
+}
 .category-label {
   font-size: 9px;
   color: #879373;
@@ -1382,6 +1394,36 @@ kbd {
   padding: 4px 7px;
   border-radius: 4px;
   white-space: nowrap;
+}
+.official-label,
+.safety-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 999px;
+  padding: 4px 7px;
+  font-size: 9px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.official-label,
+.safety-badge.pass {
+  color: #53783b;
+  background: #edf4e5;
+}
+.safety-badge.warn {
+  color: #8a6724;
+  background: #f8efd8;
+}
+.safety-badge.fail {
+  color: #a3463d;
+  background: #f8e7e2;
+}
+.safety-badge.unscanned,
+.safety-badge.unavailable,
+.safety-badge.pending {
+  color: #70796e;
+  background: #eef0eb;
 }
 .discover-title {
   font-family: "Manrope Variable", sans-serif;
@@ -1422,13 +1464,31 @@ kbd {
   gap: 5px;
   overflow: hidden;
 }
+.discover-skill-bottom > span:first-child {
+  flex: 1;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.discover-skill-bottom .install-count {
+  flex: none;
+  color: #76856e;
+  margin-left: 8px;
+}
+.load-more {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+}
+.source-fallback {
+  align-self: flex-end;
+}
 .catalog-loading {
   display: flex;
   justify-content: center;
   align-items: center;
   gap: 12px;
   min-height: 220px;
-  color: #879574;
+  color: #65725f;
   font-size: 12px;
 }
 .device-list {
@@ -2110,6 +2170,12 @@ kbd {
 .detail-byline .status {
   margin-left: auto;
 }
+.detail-byline .safety-badge {
+  margin-left: auto;
+}
+.detail-byline .status + .safety-badge {
+  margin-left: 0;
+}
 .detail-actions {
   display: flex;
   align-items: center;
@@ -2132,6 +2198,109 @@ kbd {
 .detail-panel > .notice {
   margin: 0 20px 12px;
 }
+.audit-acknowledgement {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #dec98f;
+  border-radius: 6px;
+  background: #fbf5e5;
+  color: #765b25;
+  cursor: pointer;
+}
+.audit-acknowledgement input {
+  margin: 2px 0 0;
+  accent-color: var(--green);
+}
+.audit-acknowledgement span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+.audit-acknowledgement small {
+  color: #917a49;
+}
+.safety-loading,
+.safety-empty {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.safety-loading {
+  align-items: center;
+}
+.safety-empty strong {
+  display: block;
+  color: var(--ink);
+  margin-bottom: 5px;
+}
+.safety-empty p,
+.safety-scope p,
+.audit-card p {
+  font-size: 11px;
+  line-height: 1.65;
+}
+.safety-scope {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 18px;
+  color: var(--muted);
+}
+.safety-scope .safety-badge {
+  flex: none;
+  margin-top: 2px;
+}
+.audit-card {
+  padding: 16px;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid #aeb7aa;
+  border-radius: 6px;
+  background: #fffefa;
+}
+.audit-card.pass { border-left-color: #789b60; }
+.audit-card.warn { border-left-color: #c89a42; }
+.audit-card.fail { border-left-color: #bb5b50; }
+.audit-heading,
+.audit-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.audit-heading strong {
+  font-size: 12px;
+}
+.audit-heading span {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  color: var(--muted);
+}
+.audit-heading > div {
+  display: flex;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 3px;
+}
+.audit-heading small {
+  color: var(--muted);
+  font-size: 9px;
+}
+.audit-card p { margin-top: 9px; color: var(--muted); }
+.audit-categories { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+.audit-categories span { padding: 3px 6px; border-radius: 4px; background: #f0f2ec; color: #707a6c; font-size: 9px; }
+.audit-meta { margin-top: 12px; font-size: 9px; color: #8b9587; }
+.audit-meta a { color: #58783f; text-decoration: underline; }
 .skill-metadata {
   display: flex;
   gap: 50px;

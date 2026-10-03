@@ -23,6 +23,7 @@ before(async () => {
   const { app, close, db } = await createApp({
     dataDir,
     autoUpdateIntervalMs: 0,
+    safetyResolver: async () => ({ status: "unscanned", audits: [], checkedAt: new Date().toISOString(), scope: "upstream" }),
     sourceResolver: async (source, name) => {
       resolverCalls += 1;
       const skill = demoCatalog.find(

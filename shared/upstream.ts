@@ -18,6 +18,7 @@ import { createRequire } from "node:module";
 import { promisify } from "node:util";
 import { parse as parseYaml } from "yaml";
 import type { Skill, SkillFile } from "./types.ts";
+import { discoverSkills as discoverCatalogSkills } from "./discovery.ts";
 
 const exec = promisify(execFile);
 const localRequire = createRequire(join(process.cwd(), "package.json"));
@@ -257,56 +258,10 @@ export async function checkSkill(
     : { revision: next.revision, files: next.files };
 }
 
-export async function discoverSkills(
-  query = "",
-  category?: string,
-): Promise<{ skills: Skill[]; live: boolean; error?: string }> {
-  try {
-    const response = await fetch(
-      `https://skills.sh/api/search?q=${encodeURIComponent(query)}`,
-      { signal: AbortSignal.timeout(8_000) },
-    );
-    if (!response.ok) throw new Error(`skills.sh returned ${response.status}`);
-    const body = (await response.json()) as {
-      skills?: Array<{
-        id: string;
-        source: string;
-        skillId: string;
-        name: string;
-        installs?: number;
-      }>;
-    };
-    const now = new Date().toISOString();
-    const skills = (body.skills ?? []).map((s): Skill => ({
-      id: s.id,
-      name: s.skillId,
-      title: s.name,
-      description: "",
-      author: s.source.split("/")[0],
-      source: s.source,
-      kind: "third-party",
-      category: category || "Community",
-      icon: "Sparkles",
-      color: "#7067CF",
-      selected: false,
-      enabled: false,
-      autoUpdate: true,
-      revision: "",
-      versions: [],
-      files: [],
-      requirements: [],
-      targets: [],
-      installs: s.installs,
-      updatedAt: now,
-    }));
-    return { skills, live: true };
-  } catch (error) {
-    return {
-      skills: [],
-      live: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+// Keep the server's former empty-category call working while discovery clients
+// adopt the explicit catalog views.
+export function discoverSkills(query = "", view: "all-time" | "trending" | "hot" | "official" | "" = "all-time") {
+  return discoverCatalogSkills(query, view || "all-time");
 }
 
 type UpstreamAgent = {

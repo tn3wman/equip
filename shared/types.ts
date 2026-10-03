@@ -24,6 +24,32 @@ export interface Target {
   project?: string;
   enabled: boolean;
 }
+export interface SkillAudit {
+  provider: string;
+  slug: string;
+  status: "pass" | "warn" | "fail" | "unknown";
+  summary: string;
+  auditedAt?: string;
+  riskLevel?: string;
+  categories?: string[];
+  url: string;
+}
+export interface SkillSafety {
+  status: "pass" | "warn" | "fail" | "unscanned" | "unavailable";
+  audits: SkillAudit[];
+  checkedAt: string;
+  url?: string;
+  error?: string;
+  // Reports concern the upstream skill. They do not attest to Equip's pinned revision.
+  scope: "upstream";
+}
+export type DiscoveryView = "all-time" | "trending" | "hot" | "official";
+export interface DiscoveryResult {
+  skills: Skill[];
+  live: boolean;
+  error?: string;
+  pagination?: { page: number; perPage: number; total: number; hasMore: boolean };
+}
 export interface Skill {
   id: string;
   name: string;
@@ -46,6 +72,12 @@ export interface Skill {
   requirements: string[];
   targets: Target[];
   installs?: number;
+  catalogId?: string;
+  catalogUrl?: string;
+  sourceType?: string;
+  official?: boolean;
+  duplicate?: boolean;
+  safety?: SkillSafety;
   updatedAt: string;
   localOrigin?: { deviceId: string; path: string };
 }
@@ -104,6 +136,8 @@ export interface SourceRequest {
   kind: "install" | "import";
   skillId?: string;
   reason?: string;
+  auditAcknowledged?: boolean;
+  automatic?: boolean;
 }
 export interface Workspace {
   name: string;
