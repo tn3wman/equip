@@ -688,7 +688,6 @@ function Library({
   const [tab, setTab] = useState("all");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
-  const [confirmUnlink, setConfirmUnlink] = useState(false);
   const skills = workspace.skills.filter((s) => s.selected);
   const updates = skills.filter(
     (s) => s.upstreamRevision && s.upstreamRevision !== s.revision,
@@ -708,10 +707,6 @@ function Library({
   );
   const devices = workspace.devices.filter((d) => !d.disconnectedAt);
   const offline = devices.filter((d) => !d.online && !d.disconnect);
-  const librarySource = workspace.librarySource;
-  const sourceDevice = librarySource
-    ? workspace.devices.find((device) => device.id === librarySource.deviceId)
-    : undefined;
   return (
     <div className="page library-page">
       <div className="page-heading">
@@ -756,26 +751,6 @@ function Library({
           </button>
         )}
       </div>
-      {librarySource && (
-        <div className="library-source-banner">
-          <div className="library-source-mark">
-            <Layers size={18} />
-          </div>
-          <div className="library-source-copy">
-            <strong>{librarySource.name} is linked</strong>
-            <span>
-              {librarySource.skillCount} {librarySource.skillCount === 1 ? "skill" : "skills"}
-              {" · "}{sourceDevice?.name || "Disconnected computer"}
-              {" · "}Library updated {ago(librarySource.updatedAt)}
-              {sourceDevice && !sourceDevice.online ? " · Source computer offline" : ""}
-            </span>
-          </div>
-          {librarySource.error && <span className="error-text">Source sync failed: {librarySource.error}</span>}
-          <button className="button small" onClick={() => setConfirmUnlink(true)}>
-            Unlink library
-          </button>
-        </div>
-      )}
       {workspace.sourceRequests?.length ? (
         <div className="notice">
           <ClockIcon />
@@ -870,20 +845,13 @@ function Library({
                     <div>
                       <div className="skill-title">
                         {skill.title}
-                        {skill.librarySourceId ? (
-                          <span className="custom-tag source-tag">From {librarySource?.name || "linked library"}</span>
-                        ) : skill.kind === "custom" && (
+                        {skill.kind === "custom" && (
                           <span className="custom-tag">Custom</span>
                         )}
                       </div>
                       <p>{skill.description}</p>
                       <span className="skill-source">
-                        {skill.librarySourceId ? (
-                          <>
-                            <span className="source-dot" />
-                            Managed by {librarySource?.name || "linked library"}
-                          </>
-                        ) : skill.kind === "custom" ? (
+                        {skill.kind === "custom" ? (
                           <>
                             <span className="source-dot" />
                             Your workspace
@@ -904,9 +872,7 @@ function Library({
                       <span className="update-label">Update available</span>
                     ) : (
                       <span>
-                        {skill.librarySourceId
-                          ? `Managed by ${librarySource?.name || "linked library"}`
-                          : skill.kind === "custom"
+                        {skill.kind === "custom"
                           ? "On publish"
                           : skill.autoUpdate
                             ? "Automatic updates"
@@ -1106,29 +1072,6 @@ function Library({
           </div>
         </aside>
       </div>
-      {confirmUnlink && (
-        <Dialog title={`Unlink ${librarySource?.name || "library"}?`} onClose={() => setConfirmUnlink(false)}>
-          <div className="dialog-body">
-            <p>
-              Your current skills stay installed and remain in Equip. {librarySource?.name || "The linked library"} will no longer add, update, or remove them.
-            </p>
-            <div className="dialog-actions">
-              <button className="button" onClick={() => setConfirmUnlink(false)}>Cancel</button>
-              <button
-                className="button primary"
-                onClick={() =>
-                  run(
-                    () => api("/library/unlink", "POST"),
-                    "Library unlinked. Your current skills remain in Equip.",
-                  ).then(() => setConfirmUnlink(false))
-                }
-              >
-                Unlink library
-              </button>
-            </div>
-          </div>
-        </Dialog>
-      )}
     </div>
   );
 }
@@ -1541,7 +1484,7 @@ function Devices({
                   <div className="notice" style={{ display: "block" }}>
                     <label className="radio-option">
                       <input type="checkbox" checked={device.localSync?.enabled ?? false} disabled={workspace.demo || Boolean(device.disconnect)} onChange={event => run(() => api(`/devices/${device.id}/local-sync`, "PATCH", { enabled: event.target.checked }), event.target.checked ? "Local publishing enabled. New skills and custom edits will sync from this computer." : "Local publishing disabled. Dashboard updates still install.")} />
-                      <span><strong>Publish local skills automatically</strong><small>New skill folders and custom-skill edits from these agent locations go to Equip, then your other computers. Repository and upstream skills keep their own update authority.</small></span>
+                      <span><strong>Publish local skills automatically</strong><small>New skill folders and custom-skill edits from these agent locations go to Equip, then your other computers. Edits to third-party skills are preserved for review.</small></span>
                     </label>
                     {device.localSync?.path && <p className="muted-copy">Shared skill store: <code>{device.localSync.path}</code></p>}
                     {device.localSync?.lastImport && <p className="muted-copy">Last local publication {ago(device.localSync.lastImport)}</p>}

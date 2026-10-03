@@ -51,11 +51,10 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
   for (const path of candidates) {
     try {
       const configured = known.get(basename(path));
-      if (configured?.kind === "third-party" || configured?.librarySourceId) continue;
+      if (configured?.kind === "third-party") continue;
       const local = await localSkill(path);
       const existing = known.get(local.name);
-      // Upstream and repository libraries keep their own update authority.
-      if (existing?.kind === "third-party" || existing?.librarySourceId) continue;
+      if (existing?.kind === "third-party") continue;
       const hash = skillRevision(local.files);
       const prior = seen[path];
       if (prior?.hash === hash) continue;

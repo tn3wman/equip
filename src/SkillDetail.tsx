@@ -62,7 +62,6 @@ export default function SkillDetail({
     (s) => s.id === skill.id && s.selected,
   );
   const devices = workspace.devices.filter((device) => !device.disconnectedAt);
-  const libraryManaged = Boolean(skill.librarySourceId);
   const data = actual || skill;
   const files = data.files.length ? data.files : data.draft || [];
   const activeFile = files.find((f) => f.path === file) || files[0];
@@ -193,25 +192,10 @@ export default function SkillDetail({
           <h2>{data.title}</h2>
           <p>{data.description}</p>
           <div className="detail-byline">
-            {libraryManaged ? (
-              <>
-                <Folder size={13} />
-                From {workspace.librarySource?.name || "linked library"}
-                {skill.kind === "third-party" && (
-                  <a
-                    href={skill.source.startsWith("http") ? skill.source : `https://github.com/${skill.source.split("@")[0]}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    aria-label="View source repository"
-                  >
-                    <Github size={13} /> {skill.source} <ArrowUpRight size={13} />
-                  </a>
-                )}
-              </>
-            ) : skill.kind === "custom" ? (
+            {skill.kind === "custom" ? (
               <>
                 <Pencil size={13} />
-                Created in your workspace
+                Custom skill
               </>
             ) : (
               <>
@@ -241,7 +225,7 @@ export default function SkillDetail({
           <div className="detail-actions">
             {installed ? (
               <>
-                {!libraryManaged && (skill.kind === "custom" ? (
+                {skill.kind === "custom" ? (
                   <button
                     className="button primary"
                     disabled={loading} onClick={() => onEdit(data)}
@@ -267,7 +251,7 @@ export default function SkillDetail({
                     )}
                     Update skill
                   </button>
-                ))}
+                )}
                 <button
                   className="button"
                   disabled={busy}
@@ -535,16 +519,7 @@ export default function SkillDetail({
           )}
           {tab === "history" && (
             <>
-              {libraryManaged && (
-                <div className="source-managed-note">
-                  <Folder size={16} />
-                  <div>
-                    <strong>Managed by {workspace.librarySource?.name || "linked library"}</strong>
-                    <p>Changes and new versions come from the linked source library.</p>
-                  </div>
-                </div>
-              )}
-              {skill.kind === "third-party" && !libraryManaged && (
+              {skill.kind === "third-party" && (
                 <div className="update-setting">
                   <div>
                     <h3>Automatic updates</h3>
@@ -575,7 +550,7 @@ export default function SkillDetail({
                   </button>
                 </div>
               )}
-              {skill.kind === "third-party" && !libraryManaged && (
+              {skill.kind === "third-party" && (
                 <button
                   className="button small"
                   disabled={busy}
@@ -609,7 +584,7 @@ export default function SkillDetail({
                   </div>
                   {v.revision === skill.revision ? (
                     <span className="custom-tag">Selected</span>
-                  ) : libraryManaged ? null : (
+                  ) : (
                     <button
                       className="button small"
                       onClick={() => {

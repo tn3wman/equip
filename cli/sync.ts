@@ -433,8 +433,16 @@ async function install(
   }
   const rootInfo = await lstat(destination).catch(() => null);
   const desired = desiredHashes(skill.files);
+  let migratingObserved = false;
   if (previous?.observed) {
     const pointer = await realpath(destination).catch(() => undefined);
+    // Another agent can share the same physical skill root. If this pass
+    // already redirected that root, adopt its verified Equip link too.
+    if (pointer && pointer !== previous.canonicalPath && await pointsTo(destination, canonical.path) &&
+        !differs((await snapshot(pointer)).hashes, desired)) {
+      const { observed: _observed, ...managed } = previous;
+      return { entry: { ...managed, canonicalPath: canonical.path, revision: skill.revision, files: desired }, receipt: { ...base, status: "synchronized" } };
+    }
     if (!pointer || pointer !== previous.canonicalPath)
       return {
         entry: previous,
@@ -497,46 +505,11 @@ async function install(
       dereference: false,
       preserveTimestamps: true,
     });
-    const stage = `${pointer}.equip-stage-${randomUUID()}`;
-    const oldPath = `${pointer}.equip-old-${randomUUID()}`;
-    const transactionId = randomUUID();
-    await mkdir(stage, { recursive: true });
-    await writeFiles(stage, skill.files);
-    await saveJsonAtomic(join(home, "transaction.json"), {
-      destination: pointer,
-      stage,
-      oldPath,
-      hadOld: true,
-      revision: skill.revision,
-      transactionId,
-    } satisfies Journal);
-    try {
-      await rename(pointer, oldPath);
-      await rename(stage, pointer);
-    } catch (error) {
-      if (await lstat(oldPath).catch(() => null)) {
-        await rm(pointer, { recursive: true, force: true });
-        await rename(oldPath, pointer);
-      }
-      throw error;
-    }
-    return {
-      entry: {
-        ...previous,
-        revision: skill.revision,
-        files: desired,
-        transactionId,
-      },
-      oldPath,
-      receipt: {
-        ...base,
-        status: "synchronized",
-        managed: false,
-        message: "Updated observed installation; original folder or link retained",
-      },
-    };
+    // Replace only the installation, never the repository or external source
+    // behind a preexisting link. The original files remain in place or backup.
+    migratingObserved = true;
   }
-  if (previous?.canonicalPath && previous.path === destination) {
+  if (!migratingObserved && previous?.canonicalPath && previous.path === destination) {
     const intact = previous.copied
       ? !!rootInfo && !rootInfo.isSymbolicLink() &&
         !differs((await snapshot(destination)).hashes, previous.files)
@@ -622,7 +595,7 @@ async function install(
         },
       };
   }
-  if (rootInfo?.isSymbolicLink())
+  if (rootInfo?.isSymbolicLink() && !migratingObserved)
     return {
       entry: previous,
       receipt: {
@@ -634,12 +607,12 @@ async function install(
       },
     };
   const current = await snapshot(destination);
-  const conflict = differs(
+  const conflict = !migratingObserved && differs(
     current.hashes,
     obsoletePath ? undefined : previous?.files,
   );
   if (
-    !conflict &&
+    !conflict && !migratingObserved &&
     previous?.canonicalPath &&
     previous?.path === destination &&
     previous.revision === skill.revision &&

@@ -22,7 +22,7 @@ import { synchronize, type AgentTarget } from "./sync.ts";
 import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
 import { discoverAgentProfiles } from "./profiles.ts";
 import { replaceExecutable } from "./update.ts";
-import { connectLibrary, readLibraryLink, syncLinkedLibrary } from "./library.ts";
+import { libraryImport } from "./library.ts";
 import { localSkill, syncLocalSkills } from "./local.ts";
 import { getDesired } from "./desired.ts";
 
@@ -303,29 +303,13 @@ async function runSync(s: State) {
   const targets = selected.map((t) => ({ ...t, deviceId: s.deviceId }));
   const base = s.server || server;
   await flushReceipts(s, base);
-  let libraryError = "";
-  let libraryPublished = false;
-  let desiredBeforeLibrary = await getDesired(equipHome, base, s.token);
-  const link = await readLibraryLink(equipHome);
-  if (link && !desiredBeforeLibrary.disconnect) {
-    if (link.revision && (!desiredBeforeLibrary.librarySource ||
-        desiredBeforeLibrary.librarySource.id !== link.id ||
-        desiredBeforeLibrary.librarySource.deviceId !== s.deviceId)) {
-      await rm(join(equipHome, "library-link.json"), { force: true });
-    } else {
-      try {
-        libraryPublished = !!(await syncLinkedLibrary(equipHome, payload => request("/api/device/library", {
-          method: "POST", body: JSON.stringify(payload),
-        }, s.token, base)));
-      } catch (error) {
-        libraryError = error instanceof Error ? error.message : String(error);
-      }
-    }
-  }
-  const local = await syncLocalSkills(equipHome, targets, desiredBeforeLibrary, payload => request("/api/device/local", {
+  // Remove state written by releases that treated a folder as a live authority.
+  await rm(join(equipHome, "library-link.json"), { force: true });
+  let desiredBeforeLocal = await getDesired(equipHome, base, s.token);
+  const local = await syncLocalSkills(equipHome, targets, desiredBeforeLocal, payload => request("/api/device/local", {
     method: "POST", body: JSON.stringify(payload),
   }, s.token, base));
-  if (local.changed) desiredBeforeLibrary = await getDesired(equipHome, base, s.token);
+  if (local.changed) desiredBeforeLocal = await getDesired(equipHome, base, s.token);
   await request(
     "/api/device/heartbeat",
     {
@@ -334,7 +318,6 @@ async function runSync(s: State) {
         name: s.name || hostname(),
         os: platform(),
         arch: process.arch,
-        libraryError,
         localSyncPath: join(equipHome, "skills"),
         localSyncError: local.errors.join("\n"),
         agents: targets.map((t) => ({
@@ -350,9 +333,7 @@ async function runSync(s: State) {
     s.token,
     base,
   );
-  let desired = libraryPublished
-    ? await getDesired(equipHome, base, s.token)
-    : desiredBeforeLibrary;
+  let desired = desiredBeforeLocal;
   if (desired.sourceRequests?.length) {
     for (const sourceRequest of desired.sourceRequests) {
       try {
@@ -410,7 +391,7 @@ async function runSync(s: State) {
   await postReceipts(s, base, desired.generation, receipts);
   if (receipts.every((receipt) => receipt.status === "synchronized"))
     s.lastSync = new Date().toISOString();
-  s.lastError = libraryError || local.errors.join("\n") || undefined;
+  s.lastError = local.errors.join("\n") || undefined;
   await saveWorkerFields(s, {
     lastSync: s.lastSync,
     lastError: s.lastError,
@@ -477,17 +458,19 @@ async function main() {
     const operation = args[0] ?? "status";
     const s = await state();
     if (operation === "status") {
-      console.log(JSON.stringify(await readLibraryLink(equipHome) ?? { connected: false }, null, 2));
+      console.log("Libraries are managed by Equip. Folder imports are one-time copies.");
       return;
     }
     if (!s.token) throw new Error("Connect this computer first: equip connect");
-    if (operation === "connect") {
-      if (!args[1]) throw new Error("Use equip library connect /path/to/library [--name My-library]");
-      await connectLibrary(equipHome, args[1], option("--name"));
-      await runSync(s);
-      const linked = await readLibraryLink(equipHome);
-      if (linked?.lastError) throw new Error(linked.lastError);
-      console.log(`${linked?.name} linked. Its skills will synchronize automatically from ${linked?.root}.`);
+    if (operation === "import" || operation === "connect") {
+      if (!args[1]) throw new Error(`Use equip library ${operation} /path/to/library [--name My-library]`);
+      const payload = await libraryImport(args[1], option("--name"));
+      await request("/api/device/library", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }, s.token, s.server || server);
+      const receipts = await runSync(s);
+      console.log(`${payload.name} imported. ${payload.skills.length} skill(s) copied to Equip and ${receipts.filter(r => r.status === "synchronized").length} installation(s) synchronized.${operation === "connect" ? " The folder is not linked." : ""}`);
       return;
     }
     if (operation === "unlink") {
@@ -788,7 +771,6 @@ async function main() {
         targets: s.targets ?? [],
         lastSync: s.lastSync,
         lastError: s.lastError,
-        library: await readLibraryLink(equipHome),
       },
       null,
       2,

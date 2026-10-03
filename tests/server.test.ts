@@ -9,16 +9,18 @@ import { demoCatalog } from "../server/catalog.ts";
 import { librarySnapshotRevision } from "../shared/library.ts";
 import type { LibrarySnapshotSkill } from "../shared/library.ts";
 import { unzipSync } from "fflate";
+import type { Store } from "../server/storage.ts";
 import { getDesired } from "../cli/desired.ts";
 import { readFile, stat } from "node:fs/promises";
 
 let base = "";
+let store: Store;
 let shutdown: () => Promise<void>;
 let resolverCalls = 0;
 
 before(async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "equip-server-test-"));
-  const { app, close } = await createApp({
+  const { app, close, db } = await createApp({
     dataDir,
     autoUpdateIntervalMs: 0,
     sourceResolver: async (source, name) => {
@@ -30,6 +32,7 @@ before(async () => {
       return structuredClone(skill);
     },
   });
+  store = db;
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve) => server.once("listening", resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -152,14 +155,14 @@ test("local publishing is opt-in and revision exports and cached device state st
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("a library can have any valid name and cannot replace another linked library", async () => {
+test("folder imports accept independent library names", async () => {
   const cookie = await register("generic-library@example.com");
   const owner = await connectDevice(cookie, "Any computer");
   const snapshot = { ...libraryBody([novaSkill("generic")]), id: "team-workflows", name: "Team workflows" };
   const first = await call("/api/device/library", { method: "POST", headers: owner.headers, body: JSON.stringify(snapshot) });
   assert.equal(first.response.status, 200);
   const another = await call("/api/device/library", { method: "POST", headers: owner.headers, body: JSON.stringify({ ...snapshot, id: "different-library" }) });
-  assert.equal(another.response.status, 409);
+  assert.equal(another.response.status, 200);
 });
 
 test("demo is explicit, populated, and cannot mutate", async () => {
@@ -421,137 +424,79 @@ test("installed skills default to manual updates and draft skills stay out of de
   );
 });
 
-test("Nova library snapshots are authoritative, atomic, device-bound, and unlink cleanly", async () => {
-  const cookie = await register("nova-owner@example.com");
-  const otherCookie = await register("nova-other@example.com");
-  const owner = await connectDevice(cookie, "Nova owner");
-  const peer = await connectDevice(cookie, "Nova peer");
+test("folder imports are atomic and additive, and Equip owns imported revisions", async () => {
+  const cookie = await register("import-owner@example.com");
+  const otherCookie = await register("import-other@example.com");
+  const owner = await connectDevice(cookie, "Import owner");
+  const peer = await connectDevice(cookie, "Peer");
+  const firstSkills = [novaSkill("alpha", "First", "reference"), novaSkill("beta")];
+  const importBody = libraryBody(firstSkills);
+  const ingest = (body: any, headers = owner.headers) => call("/api/device/library", { method: "POST", headers, body: JSON.stringify(body) });
+  const imported = await ingest(importBody);
+  assert.equal(imported.response.status, 200);
+  assert.equal(imported.body.added, 2);
+  let workspace = (await call("/api/workspace", {}, cookie)).body;
+  assert.equal(workspace.librarySource, undefined);
+  assert.ok(workspace.skills.every((s: any) => !s.librarySourceId));
+  const alpha = workspace.skills.find((s: any) => s.name === "alpha");
+  assert.equal(alpha.versions[0].message, "Imported from Nova");
+  const repeated = await ingest(importBody, peer.headers);
+  assert.equal(repeated.body.generation, imported.body.generation);
+  assert.equal(repeated.body.added, 0);
 
-  const independentFiles = [
-    {
-      path: "SKILL.md",
-      content: "---\nname: independent\ndescription: Independent skill\n---\n",
-    },
-  ];
-  const independent = await post(
-    "/api/skills",
-    { title: "Independent", name: "independent", description: "Independent", files: independentFiles },
-    cookie,
-  );
-  await post(`/api/skills/${independent.body.id}/publish`, { files: independentFiles }, cookie);
+  const tampered = structuredClone(importBody);
+  tampered.skills[0].title = "Tampered";
+  assert.equal((await ingest(tampered)).response.status, 400);
+  const collision = libraryBody([novaSkill("fresh"), novaSkill("alpha", "Source changed")]);
+  assert.equal((await ingest(collision)).response.status, 409);
+  workspace = (await call("/api/workspace", {}, cookie)).body;
+  assert.ok(!workspace.skills.some((s: any) => s.name === "fresh"));
+  assert.equal(workspace.generation, imported.body.generation);
 
-  const firstSkills = [
-    novaSkill("alpha", "First", "reference"),
-    novaSkill("beta"),
-    novaSkill("removed-by-snapshot"),
-  ];
-  const firstBody = libraryBody(firstSkills);
-  const linked = await call("/api/device/library", {
-    method: "POST",
-    headers: owner.headers,
-    body: JSON.stringify(firstBody),
-  });
-  assert.equal(linked.response.status, 200);
-  assert.equal(linked.body.skillCount, 3);
-  const firstWorkspace = await call("/api/workspace", {}, cookie);
-  assert.equal(firstWorkspace.body.librarySource.deviceId, owner.deviceId);
-  assert.equal(firstWorkspace.body.skills.find((skill: any) => skill.name === "alpha").autoUpdate, false);
+  // A smaller source snapshot cannot remove an existing Equip skill.
+  assert.equal((await ingest(libraryBody([firstSkills[0]]))).response.status, 200);
+  assert.ok((await call("/api/workspace", {}, cookie)).body.skills.some((s: any) => s.name === "beta"));
+  const second = novaSkill("alpha", "Dashboard revision", "reference");
+  const published = await post(`/api/skills/${alpha.id}/publish`, { files: second.files }, cookie);
+  assert.equal(published.response.status, 200);
+  const rollback = await post(`/api/skills/${alpha.id}/rollback`, { versionId: alpha.versions[0].id }, cookie);
+  assert.equal(rollback.response.status, 200);
+  assert.deepEqual(rollback.body.files, alpha.files);
+  const automatic = await call(`/api/skills/${alpha.id}`, { method: "PATCH", body: JSON.stringify({ autoUpdate: true }) }, cookie);
+  assert.equal(automatic.response.status, 200);
+  await call(`/api/skills/${alpha.id}`, { method: "DELETE" }, cookie);
+  const stale = await ingest({ ...importBody, expectedRevision: importBody.revision });
+  assert.equal(stale.response.status, 409);
+  workspace = (await call("/api/workspace", {}, cookie)).body;
+  assert.ok(!workspace.skills.some((s: any) => s.name === "alpha"));
+  assert.equal((await call("/api/workspace", {}, otherCookie)).body.skills.length, 0);
+});
 
-  const repeated = await call("/api/device/library", {
-    method: "POST",
-    headers: owner.headers,
-    body: JSON.stringify(firstBody),
-  });
-  assert.equal(repeated.body.generation, linked.body.generation);
-
-  const invalid = structuredClone(firstBody);
-  invalid.skills[0].title = "Tampered after hashing";
-  const rejected = await call("/api/device/library", {
-    method: "POST",
-    headers: owner.headers,
-    body: JSON.stringify(invalid),
-  });
-  assert.equal(rejected.response.status, 400);
-  const afterRejected = await call("/api/workspace", {}, cookie);
-  assert.equal(afterRejected.body.generation, linked.body.generation);
-  assert.equal(afterRejected.body.skills.find((skill: any) => skill.name === "alpha").title, "alpha title");
-
-  const stolen = await call("/api/device/library", {
-    method: "POST",
-    headers: peer.headers,
-    body: JSON.stringify(firstBody),
-  });
-  assert.equal(stolen.response.status, 409);
-
-  const alphaBefore = firstWorkspace.body.skills.find((skill: any) => skill.name === "alpha");
-  const metadataOnly = structuredClone(firstSkills);
-  metadataOnly[0].title = "Renamed alpha";
-  metadataOnly.pop();
-  const metadataUpdate = await call("/api/device/library", {
-    method: "POST",
-    headers: owner.headers,
-    body: JSON.stringify(libraryBody(metadataOnly)),
-  });
-  assert.equal(metadataUpdate.response.status, 200);
-  const afterMetadata = await call("/api/workspace", {}, cookie);
-  const unchangedAlpha = afterMetadata.body.skills.find((skill: any) => skill.name === "alpha");
-  assert.equal(unchangedAlpha.revision, alphaBefore.revision);
-  assert.equal(unchangedAlpha.versions.length, alphaBefore.versions.length);
-  assert.ok(!afterMetadata.body.skills.some((skill: any) => skill.name === "removed-by-snapshot"));
-
-  const enableUpdate = await call(`/api/skills/${unchangedAlpha.id}`, {
-    method: "PATCH",
-    body: JSON.stringify({ autoUpdate: true }),
-  }, cookie);
-  assert.equal(enableUpdate.response.status, 409);
-  const upstreamCheck = await post(`/api/skills/${unchangedAlpha.id}/check`, {}, cookie);
-  assert.equal(upstreamCheck.response.status, 409);
-  const upstreamUpdate = await post(`/api/skills/${unchangedAlpha.id}/update`, {}, cookie);
-  assert.equal(upstreamUpdate.response.status, 409);
-
-  const beta = afterMetadata.body.skills.find((skill: any) => skill.name === "beta");
-  await call(`/api/skills/${beta.id}`, { method: "DELETE" }, cookie);
-  const changedSkills = [novaSkill("alpha", "Second", "reference"), novaSkill("beta")];
-  const changed = await call("/api/device/library", {
-    method: "POST",
-    headers: owner.headers,
-    body: JSON.stringify(libraryBody(changedSkills)),
-  });
-  assert.equal(changed.response.status, 200);
-  const finalWorkspace = await call("/api/workspace", {}, cookie);
-  assert.ok(finalWorkspace.body.skills.some((skill: any) => skill.name === "independent"));
-  assert.ok(!finalWorkspace.body.skills.some((skill: any) => skill.name === "beta"));
-  assert.deepEqual(finalWorkspace.body.librarySource.excludedSkills, ["beta"]);
-  assert.equal(finalWorkspace.body.skills.find((skill: any) => skill.name === "alpha").versions.length, 2);
-
-  const otherWorkspace = await call("/api/workspace", {}, otherCookie);
-  assert.equal(otherWorkspace.body.librarySource, undefined);
-  assert.equal(otherWorkspace.body.skills.length, 0);
-
-  const unlinked = await call("/api/device/library/unlink", {
-    method: "POST",
-    headers: owner.headers,
-    body: "{}",
-  });
-  assert.equal(unlinked.body.unlinked, true);
-  const retained = await call("/api/workspace", {}, cookie);
-  assert.equal(retained.body.librarySource, undefined);
-  assert.ok(retained.body.skills.every((skill: any) => !skill.librarySourceId));
-  assert.ok(retained.body.skills.some((skill: any) => skill.name === "alpha"));
-
-  const relinked = await call("/api/device/library", {
-    method: "POST",
-    headers: owner.headers,
-    body: JSON.stringify(libraryBody([novaSkill("alpha", "Third")])),
-  });
-  assert.equal(relinked.response.status, 409);
-  const matchingRelink = await call("/api/device/library", { method: "POST", headers: owner.headers, body: JSON.stringify(libraryBody([novaSkill("alpha", "Second", "reference")])) });
-  assert.equal(matchingRelink.response.status, 200);
-  const browserUnlink = await post("/api/library/unlink", {}, cookie);
-  assert.equal(browserUnlink.body.unlinked, true);
-  const browserRetained = await call("/api/workspace", {}, cookie);
-  assert.equal(browserRetained.body.librarySource, undefined);
-  assert.ok(browserRetained.body.skills.find((skill: any) => skill.name === "alpha"));
+test("legacy source ownership migrates without losing skills, history, or selections", async () => {
+  const email = "legacy-source@example.com";
+  const cookie = await register(email);
+  const device = await connectDevice(cookie, "Legacy source device");
+  await call("/api/device/library", { method: "POST", headers: device.headers, body: JSON.stringify(libraryBody([novaSkill("legacy-owned")])) });
+  const row = (await store.get<any>("SELECT id,workspace FROM accounts WHERE email=?", email))!;
+  const legacy = JSON.parse(row.workspace);
+  const oldGeneration = legacy.generation;
+  legacy.librarySource = { id: "nova", name: "Nova", deviceId: device.deviceId, revision: "legacy", skillCount: 1 };
+  legacy.skills[0].librarySourceId = "nova";
+  legacy.skills[0].enabled = false;
+  await store.run("UPDATE accounts SET workspace=? WHERE id=?", JSON.stringify(legacy), row.id);
+  const migrated = (await call("/api/workspace", {}, cookie)).body;
+  assert.equal(migrated.librarySource, undefined);
+  assert.equal(migrated.skills[0].librarySourceId, undefined);
+  assert.equal(migrated.generation, oldGeneration + 1);
+  assert.equal(migrated.skills[0].enabled, false);
+  assert.deepEqual(migrated.skills[0].files, legacy.skills[0].files);
+  assert.deepEqual(migrated.skills[0].versions, legacy.skills[0].versions);
+  const files = novaSkill("legacy-owned", "Edited in Equip").files;
+  assert.equal((await post(`/api/skills/${migrated.skills[0].id}/publish`, { files }, cookie)).response.status, 200);
+  const saved = JSON.parse((await store.get<any>("SELECT workspace FROM accounts WHERE id=?", row.id))!.workspace);
+  assert.equal(saved.librarySource, undefined);
+  assert.equal(saved.skills[0].librarySourceId, undefined);
+  assert.equal(saved.generation, oldGeneration + 2);
 });
 
 test("source ingestion accepts long descriptions without weakening custom publishing", async () => {

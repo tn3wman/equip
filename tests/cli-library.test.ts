@@ -1,13 +1,11 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 import {
-  readLibraryLink,
+  libraryImport,
   readLibrarySnapshot,
-  saveLibraryLink,
-  syncLinkedLibrary,
 } from "../cli/library.ts";
 
 async function fixture() {
@@ -147,34 +145,13 @@ test("a manifest mutation during missing-skill resolution rejects the snapshot",
   );
 });
 
-test("linked library sync is idempotent and a failed publish retains the accepted revision", async () => {
+test("library import creates a complete one-time payload without writing link state", async () => {
   const root = await fixture();
-  const home = join(root, "equip-home");
-  const directory = await customSkill(root, "owned-skill", "First");
-  await saveLibraryLink(home, { id: "nova", name: "Nova", root });
-  let publishes = 0;
-  const publish = async (payload: { revision: string }) => {
-    publishes += 1;
-    return { accepted: true, revision: payload.revision };
-  };
-  await syncLinkedLibrary(home, publish);
-  const accepted = await readLibraryLink(home);
-  assert.equal(publishes, 1);
-  assert.ok(accepted?.revision);
-  assert.ok(accepted?.lastSync);
-  await syncLinkedLibrary(home, publish);
-  assert.equal(publishes, 1);
-
-  await writeFile(
-    join(directory, "SKILL.md"),
-    "---\nname: owned-skill\ndescription: Second\n---\n",
-  );
-  await assert.rejects(
-    syncLinkedLibrary(home, async () => ({ accepted: false, revision: "rejected" })),
-    /did not accept the library’s complete skill revision/,
-  );
-  const failed = await readLibraryLink(home);
-  assert.equal(failed?.revision, accepted?.revision);
-  assert.ok(failed?.lastError);
-  assert.equal(await readFile(join(home, "library-link.json"), "utf8").then(JSON.parse).then((link) => link.revision), accepted?.revision);
+  await customSkill(root, "owned-skill", "First");
+  const payload = await libraryImport(root, "Nova Library");
+  assert.equal(payload.id, "nova-library");
+  assert.equal(payload.name, "Nova Library");
+  assert.equal(payload.skills.length, 1);
+  assert.equal(payload.skills[0].name, "owned-skill");
+  assert.match(payload.revision, /^[a-f0-9]{64}$/);
 });

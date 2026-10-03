@@ -39,28 +39,29 @@ const desired = (s: Skill[]): DesiredState => ({
   resolutions: {},
 });
 
-test("Nova verifies preexisting linked folders without taking ownership or destroying them", async () => {
+test("Equip updates observed installations through its store and preserves their original sources", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-nova-links-"));
   const target = join(root, "agent"), shared = join(root, "shared"), home = join(root, "state");
   await synchronize(desired([skill("one")]), [{ id: "codex", path: shared }], join(root, "seed"));
   await mkdir(target);
   await symlink(join(shared, "demo"), join(target, "demo"));
-  const linked = { ...skill("one"), librarySourceId: "nova" };
+  const linked = skill("one");
   const receipts = await synchronize(desired([linked]), [{ id: "codex", path: target }], home);
   assert.equal(receipts[0].status, "synchronized");
   assert.equal(receipts[0].managed, false);
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
 
-  const updated = { ...skill("two", "r2"), librarySourceId: "nova" };
+  const updated = skill("two", "r2");
   const updateReceipts = await synchronize(
     { ...desired([updated]), generation: 2 },
     [{ id: "codex", path: target }],
     home,
   );
   assert.equal(updateReceipts[0].status, "synchronized");
-  assert.equal(updateReceipts[0].managed, false);
+  assert.notEqual(updateReceipts[0].managed, false);
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
-  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "two");
+  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "one");
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
   const backups = await import("node:fs/promises").then((fs) =>
     fs.readdir(join(home, "backups")),
   );
@@ -70,25 +71,26 @@ test("Nova verifies preexisting linked folders without taking ownership or destr
     "one",
   );
 
-  await writeFile(join(shared, "demo/SKILL.md"), "local work");
-  const changed = { ...skill("three", "r3"), librarySourceId: "nova" };
+  await writeFile(join(target, "demo/SKILL.md"), "local work");
+  const changed = skill("three", "r3");
   const conflict = await synchronize(
     { ...desired([changed]), generation: 3 },
     [{ id: "codex", path: target }],
     home,
   );
   assert.equal(conflict[0].status, "conflicted");
-  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "local work");
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "local work");
+  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "one");
 
   const removed = await synchronize(
     { generation: 4, skills: [], resolutions: {} },
     [{ id: "codex", path: target }],
     home,
   );
-  assert.equal(removed[0].managed, false);
-  assert.match(removed[0].message ?? "", /preexisting installation retained/);
+  assert.equal(removed[0].status, "conflicted");
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
-  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "local work");
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "local work");
+  assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "one");
 });
 
 test("identical revision synchronizes to two isolated devices", async () => {
@@ -391,7 +393,7 @@ test("interrupted updates require the exact committed transaction even for share
     const target = join(root, "agent");
     const home = join(root, "state");
     const shared = join(root, "shared");
-    const linked = { ...skill("original"), ...(observed ? { librarySourceId: "nova" } : {}) };
+    const linked = skill("original");
     if (observed) {
       await synchronize(desired([linked]), [{ id: "codex", path: shared }], join(root, "seed"));
       await mkdir(target);
@@ -711,7 +713,7 @@ test("releasing an observed link protects its preexisting canonical source from 
   await cp(join(root, "seed/skills/demo"), join(home, "skills/demo"), { recursive: true });
   await mkdir(original);
   await symlink(join(home, "skills/demo"), join(original, "demo"));
-  const linked = { ...skill("one"), librarySourceId: "library" };
+  const linked = skill("one");
   const targets = [{ id: "codex", path: original }, { id: "claude-code", path: peer }];
   assert.ok((await synchronize(desired([linked]), targets, home)).every(r => r.status === "synchronized"));
   await synchronize(desired([]), targets, home);
@@ -731,4 +733,29 @@ test("a stale failed destination cannot block the next canonical update when ano
   const third = await synchronize({ ...desired([skill("three", "r3")]), generation: 3 }, targets, home);
   assert.deepEqual(third.map(r => r.status), ["synchronized", "conflicted"]);
   assert.equal(await readFile(join(home, "skills/demo/SKILL.md"), "utf8"), "three");
+});
+
+
+test("shared agent roots adopt an updated Equip link without changing the original repository", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-central-observed-"));
+  const home = join(root, "state"), repository = join(root, "repository"), target = join(root, "agent"), alias = join(root, "alias");
+  try {
+    await mkdir(join(repository, "demo/scripts"), { recursive: true });
+    await writeFile(join(repository, "demo/SKILL.md"), "one");
+    await writeFile(join(repository, "demo/scripts/run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+    await mkdir(target);
+    await symlink(join(repository, "demo"), join(target, "demo"));
+    await symlink(target, alias);
+    const targets = [{ id: "codex", path: target }, { id: "claude-code", path: alias }];
+    assert.ok((await synchronize(desired([skill("one")]), targets, home)).every(r => r.status === "synchronized"));
+    const updated = await synchronize({ ...desired([skill("two", "r2")]), generation: 2 }, targets, home);
+    assert.ok(updated.every(r => r.status === "synchronized"));
+    assert.ok(updated.every(r => r.managed !== false));
+    assert.equal(await readFile(join(repository, "demo/SKILL.md"), "utf8"), "one");
+    assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
+    assert.equal(await readFile(join(alias, "demo/SKILL.md"), "utf8"), "two");
+    assert.ok((await synchronize({ ...desired([]), generation: 3 }, targets, home)).every(r => r.status === "synchronized"));
+    await assert.rejects(lstat(join(target, "demo")), /ENOENT/);
+    assert.equal(await readFile(join(repository, "demo/SKILL.md"), "utf8"), "one");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

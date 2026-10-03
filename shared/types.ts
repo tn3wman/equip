@@ -47,7 +47,6 @@ export interface Skill {
   targets: Target[];
   installs?: number;
   updatedAt: string;
-  librarySourceId?: string;
   localOrigin?: { deviceId: string; path: string };
 }
 export interface Agent {
@@ -116,26 +115,15 @@ export interface Workspace {
   generation: number;
   sourceRequests?: SourceRequest[];
   compatibility?: { version: string; count: number; checkedAt: string };
-  librarySource?: {
-    id: string;
-    name: string;
-    deviceId: string;
-    revision: string;
-    updatedAt: string;
-    skillCount: number;
-    excludedSkills?: string[];
-    error?: string;
-  };
 }
 export interface DesiredState {
-  librarySource?: Workspace["librarySource"];
   generation: number;
   skills: Skill[];
   sourceRequests?: SourceRequest[];
   resolutions: Record<string, "replace" | "preserve" | "import">;
   disconnect?: "retain" | "remove";
   localSync?: boolean;
-  localSkills?: Array<Pick<Skill, "id" | "name" | "revision" | "kind" | "librarySourceId">>;
+  localSkills?: Array<Pick<Skill, "id" | "name" | "revision" | "kind">>;
 }
 export interface DeviceAuthorization {
   deviceCode: string;

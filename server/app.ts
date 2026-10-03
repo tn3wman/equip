@@ -213,6 +213,20 @@ async function saveWorkspace(
     accountId,
   );
 }
+
+function parseWorkspace(value: string): Workspace {
+  const workspace: Workspace & { librarySource?: unknown } = JSON.parse(value);
+  let migrated = Boolean(workspace.librarySource);
+  delete workspace.librarySource;
+  for (const skill of workspace.skills) {
+    const legacy = skill as Skill & { librarySourceId?: string };
+    if (legacy.librarySourceId) migrated = true;
+    delete legacy.librarySourceId;
+  }
+  // Imported instructions and history stay intact. Equip now owns every revision.
+  if (migrated) bump(workspace);
+  return workspace;
+}
 function activity(
   workspace: Workspace,
   item: Omit<Activity, "id" | "timestamp">,
@@ -591,7 +605,7 @@ export async function createApp(
         );
         if (account) {
           req.accountId = session.account_id;
-          req.workspace = JSON.parse(account.workspace);
+          req.workspace = parseWorkspace(account.workspace);
           return next();
         }
       }
@@ -686,7 +700,7 @@ export async function createApp(
       )
         throw httpError(401, "Email or password is incorrect.");
       await createSession(res, account.id);
-      res.json(JSON.parse(account.workspace));
+      res.json(parseWorkspace(account.workspace));
     } catch (error) {
       next(error);
     }
@@ -820,7 +834,7 @@ export async function createApp(
       "SELECT workspace FROM accounts WHERE id=?",
       accountId,
     );
-    if (row) req.workspace = JSON.parse(row.workspace);
+    if (row) req.workspace = parseWorkspace(row.workspace);
     const done = () => {
       release();
       if (accountLocks.get(accountId) === tail) accountLocks.delete(accountId);
@@ -1021,8 +1035,6 @@ export async function createApp(
     "/api/skills/:id",
     ...mutate((req) => {
       const skill = findSkill(req);
-      if (skill.librarySourceId && req.body?.autoUpdate === true)
-        throw httpError(409, "Library-managed skills cannot enable upstream updates.");
       for (const key of [
         "enabled",
         "autoUpdate",
@@ -1045,8 +1057,6 @@ export async function createApp(
     ...mutate((req) => {
       const skill = findSkill(req);
       const files = clone(req.body?.files ?? skill.draft ?? skill.files);
-      if (skill.librarySourceId)
-        throw httpError(409, "Edit the linked library source, or unlink it before publishing here.");
       const metadata = validateFiles(files);
       if (
         req.workspace!.skills.some(
@@ -1083,8 +1093,6 @@ export async function createApp(
     "/api/skills/:id/check",
     ...mutate(async (req) => {
       const skill = findSkill(req);
-      if (skill.librarySourceId)
-        throw httpError(409, "Library-managed skills are updated by their linked library.");
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
       const resolved: any = await resolveSource(skill.source, skill.name);
@@ -1098,8 +1106,6 @@ export async function createApp(
     "/api/skills/:id/update",
     ...mutate(async (req) => {
       const skill = findSkill(req);
-      if (skill.librarySourceId)
-        throw httpError(409, "Library-managed skills are updated by their linked library.");
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
       const resolved: any = await resolveSource(skill.source, skill.name);
@@ -1166,12 +1172,6 @@ export async function createApp(
         (s) => s.id === req.params.id,
       );
       if (index < 0) throw httpError(404, "Skill not found.");
-      const removed = req.workspace!.skills[index];
-      if (removed.librarySourceId && req.workspace!.librarySource?.id === removed.librarySourceId) {
-        req.workspace!.librarySource.excludedSkills = Array.from(
-          new Set([...(req.workspace!.librarySource.excludedSkills ?? []), removed.name]),
-        ).sort();
-      }
       req.workspace!.skills.splice(index, 1);
       bump(req.workspace!);
       return { ok: true };
@@ -1257,13 +1257,7 @@ export async function createApp(
   app.post(
     "/api/library/unlink",
     ...mutate((req) => {
-      const source = req.workspace!.librarySource;
-      if (!source) return { ok: true, unlinked: false };
-      for (const skill of req.workspace!.skills)
-        if (skill.librarySourceId === source.id) delete skill.librarySourceId;
-      delete req.workspace!.librarySource;
-      bump(req.workspace!);
-      return { ok: true, unlinked: true };
+      return { ok: true, unlinked: false };
     }),
   );
   app.post(
@@ -1445,7 +1439,7 @@ export async function createApp(
             "SELECT workspace FROM accounts WHERE id=?",
             row.account_id,
           );
-          const workspace: Workspace = JSON.parse(account.workspace);
+          const workspace: Workspace = parseWorkspace(account.workspace);
           workspace.devices.push({
             id: deviceId,
             name: row.name,
@@ -1486,7 +1480,7 @@ export async function createApp(
     if (!account) return res.status(401).json({ error: "invalid_token" });
     req.accountId = row.account_id;
     req.deviceId = row.device_id;
-    req.workspace = JSON.parse(account.workspace);
+    req.workspace = parseWorkspace(account.workspace);
     next();
   };
   app.post(
@@ -1506,7 +1500,7 @@ export async function createApp(
           throw httpError(400, "A local source path is required.");
         let skill = workspace.skills.find(s => s.name === metadata.name);
         if (skill && !sameFiles(skill.files, files)) {
-          if (skill.librarySourceId || skill.kind !== "custom")
+          if (skill.kind !== "custom")
             throw httpError(409, "This skill has a separate source. Import it under another name or resolve its local conflict.");
           if (!req.body.baseRevision || req.body.baseRevision !== skill.revision)
             throw httpError(409, "The dashboard revision changed. Local files were preserved; review the conflict before publishing.");
@@ -1547,126 +1541,40 @@ export async function createApp(
     lockedWorkspace,
     async (req: AuthedRequest, res, next) => {
       try {
+        if (req.body?.expectedRevision !== undefined)
+          throw httpError(409, "Libraries are imported once. Equip manages their revisions; automatic source publishing is disabled.");
         const snapshot = validateLibrarySnapshot(req.body);
         const workspace = req.workspace!;
-        const linked = workspace.librarySource;
-        if (linked && linked.id !== snapshot.id)
-          throw httpError(409, "Unlink the current library before connecting another one.");
-        if (req.body.expectedRevision !== undefined &&
-          (typeof req.body.expectedRevision !== "string" ||
-           linked?.id !== snapshot.id || linked.deviceId !== req.deviceId ||
-           (linked.revision !== req.body.expectedRevision && linked.revision !== snapshot.revision)))
-          throw httpError(409, "The library link changed. Connect it again explicitly.");
-        if (linked && linked.id === snapshot.id && linked.deviceId !== req.deviceId)
-          throw httpError(409, "This library is linked to another device.");
-        if (linked?.id === snapshot.id && linked.revision === snapshot.revision)
-          return res.json({
-            accepted: true,
-            revision: linked.revision,
-            skillCount: linked.skillCount,
-            generation: workspace.generation,
-          });
-
-        const descriptions = new Map<string, string>();
-        for (const incoming of snapshot.skills)
-          descriptions.set(
-            incoming.name,
-            validateFiles(incoming.files, 16_384).description,
-          );
-        const excluded = new Set(linked?.excludedSkills ?? []);
+        // Validate every collision before adding anything. An import never replaces
+        // a dashboard revision or removes skills absent from the source folder.
         for (const incoming of snapshot.skills) {
           const existing = workspace.skills.find(skill => skill.name === incoming.name);
-          if (!excluded.has(incoming.name) && existing && existing.librarySourceId !== snapshot.id && !sameFiles(existing.files, incoming.files))
-            throw httpError(409, `Skill ${incoming.name} already exists with different instructions. Rename it or unlink its source before importing this library.`);
+          if (existing && !sameFiles(existing.files, incoming.files))
+            throw httpError(409, `Skill ${incoming.name} already exists with different instructions. Rename it before importing.`);
         }
-        const incomingNames = new Set(snapshot.skills.map((skill) => skill.name));
-        workspace.skills = workspace.skills.filter(
-          (skill) =>
-            skill.librarySourceId !== snapshot.id || incomingNames.has(skill.name),
-        );
-
+        let added = 0;
         for (const incoming of snapshot.skills) {
-          if (excluded.has(incoming.name)) continue;
-          const existing = workspace.skills.find((skill) => skill.name === incoming.name);
-          const nextRevision = revision(incoming.files);
-          if (existing) {
-            const changed = !sameFiles(existing.files, incoming.files);
-            existing.librarySourceId = snapshot.id;
-            existing.autoUpdate = false;
-            existing.upstreamRevision = undefined;
-            existing.title = incoming.title;
-            existing.description = descriptions.get(incoming.name)!;
-            existing.source = incoming.source;
-            existing.kind = incoming.kind;
-            if (changed) {
-              existing.files = clone(incoming.files);
-              existing.revision = nextRevision;
-              existing.draft = undefined;
-              existing.updatedAt = iso();
-              existing.versions.unshift({
-                id: id("version"),
-                revision: nextRevision,
-                createdAt: iso(),
-                message: `Updated from ${snapshot.name}`,
-                files: clone(incoming.files),
-              });
-            }
-            continue;
-          }
+          if (workspace.skills.some(skill => skill.name === incoming.name)) continue;
+          const metadata = validateFiles(incoming.files, 16_384);
+          const rev = revision(incoming.files);
           workspace.skills.push({
-            id: id("skill"),
-            name: incoming.name,
-            title: incoming.title,
-            description: descriptions.get(incoming.name)!,
-            author: snapshot.name,
-            source: incoming.source,
-            kind: incoming.kind,
+            id: id("skill"), name: incoming.name, title: incoming.title,
+            description: metadata.description, author: snapshot.name,
+            source: incoming.source, kind: incoming.kind,
             category: incoming.kind === "custom" ? "Custom" : "Community",
-            icon: incoming.kind === "custom" ? "wand-sparkles" : "package",
-            color: "#7259ff",
-            selected: true,
-            enabled: true,
-            autoUpdate: false,
-            revision: nextRevision,
-            versions: [{
-              id: id("version"),
-              revision: nextRevision,
-              createdAt: iso(),
-              message: `Linked from ${snapshot.name}`,
-              files: clone(incoming.files),
-            }],
-            files: clone(incoming.files),
-            requirements: [],
-            targets: [],
-            updatedAt: iso(),
-            librarySourceId: snapshot.id,
+            icon: incoming.kind === "custom" ? "wand-sparkles" : "package", color: "#7259ff",
+            selected: true, enabled: true, autoUpdate: false, revision: rev,
+            versions: [{ id: id("version"), revision: rev, createdAt: iso(), message: `Imported from ${snapshot.name}`, files: clone(incoming.files) }],
+            files: clone(incoming.files), requirements: [], targets: [], updatedAt: iso(),
           });
+          added++;
         }
-
-        workspace.librarySource = {
-          id: snapshot.id,
-          name: snapshot.name,
-          deviceId: req.deviceId!,
-          revision: snapshot.revision,
-          updatedAt: iso(),
-          skillCount: snapshot.skills.length,
-          ...(excluded.size ? { excludedSkills: [...excluded].sort() } : {}),
-        };
-        bump(workspace);
-        activity(workspace, {
-          type: "library",
-          title: `${snapshot.name} library updated`,
-          description: `${snapshot.skills.length} skills received from the linked device.`,
-          status: "pending",
-          deviceId: req.deviceId,
-        });
-        await saveWorkspace(db, req.accountId!, workspace);
-        res.json({
-          accepted: true,
-          revision: snapshot.revision,
-          skillCount: snapshot.skills.length,
-          generation: workspace.generation,
-        });
+        if (added) {
+          bump(workspace);
+          activity(workspace, { type: "library", title: `Imported ${added} skills from ${snapshot.name}`, description: "Equip manages their selected revisions and installations.", status: "pending", deviceId: req.deviceId });
+          await saveWorkspace(db, req.accountId!, workspace);
+        }
+        res.json({ accepted: true, revision: snapshot.revision, skillCount: snapshot.skills.length, added, generation: workspace.generation });
       } catch (error) {
         next(error);
       }
@@ -1678,16 +1586,7 @@ export async function createApp(
     lockedWorkspace,
     async (req: AuthedRequest, res, next) => {
       try {
-        const source = req.workspace!.librarySource;
-        if (!source) return res.json({ ok: true, unlinked: false });
-        if (source.deviceId !== req.deviceId)
-          throw httpError(409, "This library is linked to another device.");
-        for (const skill of req.workspace!.skills)
-          if (skill.librarySourceId === source.id) delete skill.librarySourceId;
-        delete req.workspace!.librarySource;
-        bump(req.workspace!);
-        await saveWorkspace(db, req.accountId!, req.workspace!);
-        res.json({ ok: true, unlinked: true });
+        res.json({ ok: true, unlinked: false });
       } catch (error) {
         next(error);
       }
@@ -1838,13 +1737,12 @@ export async function createApp(
       }));
     const desired: DesiredState = {
       generation: req.workspace!.generation,
-      librarySource: req.workspace!.librarySource,
       skills,
       sourceRequests: req.workspace!.sourceRequests ?? [],
       resolutions: device.resolutions ?? {},
       disconnect: device.disconnect,
       localSync: device.localSync?.enabled ?? false,
-      localSkills: req.workspace!.skills.map(({id,name,revision,kind,librarySourceId}) => ({id,name,revision,kind,librarySourceId})),
+      localSkills: req.workspace!.skills.map(({id,name,revision,kind}) => ({id,name,revision,kind})),
     };
     res.json(desired);
   });
@@ -1857,10 +1755,6 @@ export async function createApp(
       device.name = String(req.body?.name ?? device.name);
       device.os = String(req.body?.os ?? device.os);
       device.arch = String(req.body?.arch ?? device.arch);
-      const linkedLibrary = req.workspace!.librarySource;
-      if (linkedLibrary && linkedLibrary.deviceId === req.deviceId &&
-          typeof req.body?.libraryError === "string")
-        linkedLibrary.error = req.body.libraryError.slice(0, 1000) || undefined;
       if (req.body?.agents !== undefined) {
         validateAgents(req.body.agents);
         device.agents = req.body.agents.map((agent: Device["agents"][number]) => ({
@@ -2210,10 +2104,10 @@ export async function createApp(
             "SELECT workspace FROM accounts WHERE id=?",
             account.id,
           );
-          const workspace: Workspace = JSON.parse(fresh.workspace);
+          const workspace: Workspace = parseWorkspace(fresh.workspace);
           let changed = false;
           for (const skill of workspace.skills.filter(
-            (skill) => skill.kind === "third-party" && skill.autoUpdate && !skill.librarySourceId,
+            (skill) => skill.kind === "third-party" && skill.autoUpdate,
           )) {
             try {
               const resolved: any = await resolveSource(

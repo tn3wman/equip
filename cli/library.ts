@@ -1,20 +1,10 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { SkillFile } from "../shared/types.ts";
 import { librarySnapshotRevision, type LibrarySnapshotSkill } from "../shared/library.ts";
 import { resolveSkill } from "../shared/upstream.ts";
-
-export interface LibraryLink {
-  id: string;
-  name: string;
-  root: string;
-  revision?: string;
-  lastSync?: string;
-  lastError?: string;
-}
 
 function safeName(name: string) {
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64)
@@ -86,49 +76,10 @@ export async function readLibrarySnapshot(
   return { skills, revision: librarySnapshotRevision(skills) };
 }
 
-export async function readLibraryLink(home: string): Promise<LibraryLink | undefined> {
-  return readFile(join(home, "library-link.json"), "utf8").then(value => JSON.parse(value)).catch(error => { if (error.code === "ENOENT") return undefined; throw error; });
-}
-
-export async function saveLibraryLink(home: string, link: LibraryLink) {
-  await mkdir(home, { recursive: true });
-  const path = join(home, "library-link.json");
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(link, null, 2), { mode: 0o600 });
-  await rename(temporary, path);
-}
-
-export async function syncLinkedLibrary(
-  home: string,
-  publish: (payload: { id: string; name: string; revision: string; skills: LibrarySnapshotSkill[]; expectedRevision?: string }) => Promise<{ accepted: boolean; revision: string }>,
-) {
-  const link = await readLibraryLink(home);
-  if (!link) return;
-  try {
-    const snapshot = await readLibrarySnapshot(link.root);
-    if (snapshot.revision === link.revision) {
-      if (link.lastError) await saveLibraryLink(home, { ...link, lastError: undefined });
-      return;
-    }
-    const result = await publish({ id: link.id, name: link.name, expectedRevision: link.revision, ...snapshot });
-    if (!result.accepted || result.revision !== snapshot.revision)
-      throw new Error("Equip did not accept the library’s complete skill revision.");
-    await saveLibraryLink(home, { ...link, revision: result.revision, lastSync: new Date().toISOString() });
-    return true;
-  } catch (error) {
-    await saveLibraryLink(home, { ...link, lastError: error instanceof Error ? error.message : String(error) });
-    throw error;
-  }
-}
-
-export async function connectLibrary(home: string, path: string, name?: string) {
+export async function libraryImport(path: string, name?: string) {
   const root = await realpath(resolve(path));
-  // Validate before replacing a working link. No instructions or credentials are changed.
-  await readLibrarySnapshot(root);
   name = name || basename(root);
   const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   if (!id) throw new Error("The library needs a name.");
-  const previous = await readLibraryLink(home);
-  if (previous && previous.id !== id) throw new Error("Unlink the existing library before connecting another one.");
-  await saveLibraryLink(home, { id, name, root });
+  return { id, name, ...await readLibrarySnapshot(root) };
 }
