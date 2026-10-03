@@ -1178,7 +1178,7 @@ export async function createApp(
       name: row.name,
       os: row.os,
       userCode: row.user_code,
-      expiresAt: new Date(row.expires_at).toISOString(),
+      expiresAt: new Date(Number(row.expires_at)).toISOString(),
     });
   });
   app.post(
