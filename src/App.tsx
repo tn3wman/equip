@@ -64,10 +64,13 @@ import type {
   Workspace,
   SyncStatus,
   SkillFile,
+  Receipt,
   DiscoveryResult,
   DiscoveryView,
 } from "../shared/types";
 import { SafetyBadge } from "./Safety";
+import SkillConflict from "./SkillConflict";
+import { reviewedFilesRevision } from "../shared/conflicts";
 const lazyReloadKey = "equip:stale-chunk-reload";
 function lazyWithReload<T extends ComponentType<any>>(
   load: () => Promise<{ default: T }>,
@@ -1404,6 +1407,8 @@ function Devices({
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [disconnect, setDisconnect] = useState<Device>();
+  const [conflict, setConflict] = useState<{ device: Device; receipt: Receipt }>();
+  const [showAllReceipts, setShowAllReceipts] = useState<Record<string, boolean>>({});
   const [mode, setMode] = useState<"retain" | "remove">("retain");
   const devices = workspace.devices.filter((d) => !d.disconnectedAt);
   return (
@@ -1443,6 +1448,8 @@ function Devices({
       )}
       <div className="device-list">
         {devices.map((device) => {
+          const conflicts = device.receipts.filter((receipt) => receipt.status === "conflicted");
+          const visibleReceipts = conflicts.length && !showAllReceipts[device.id] ? conflicts : device.receipts;
           const status = deviceStatus(
             device,
             workspace.skills,
@@ -1488,6 +1495,17 @@ function Devices({
                     }
                   />
                   <small>Last sync {ago(device.lastSync)}</small>
+                  {conflicts.length > 0 && (
+                    <button
+                      className="device-conflict-link"
+                      onClick={() => {
+                        setShowAllReceipts((current) => ({ ...current, [device.id]: false }));
+                        setExpanded(device.id);
+                      }}
+                    >
+                      Review {conflicts.length} {conflicts.length === 1 ? "conflict" : "conflicts"}
+                    </button>
+                  )}
                 </div>
                 <button
                   className="icon-button"
@@ -1568,10 +1586,17 @@ function Devices({
                       ))}
                     </div>
                   ))}
-                  <h3>Installation receipts</h3>
+                  <div className="receipt-heading">
+                    <h3>{conflicts.length && !showAllReceipts[device.id] ? "Conflicts" : "Installation receipts"}</h3>
+                    {conflicts.length > 0 && (
+                      <button className="text-link" onClick={() => setShowAllReceipts((current) => ({ ...current, [device.id]: !current[device.id] }))}>
+                        {showAllReceipts[device.id] ? "Show conflicts" : `All installations (${device.receipts.length})`}
+                      </button>
+                    )}
+                  </div>
                   {device.receipts.length ? (
                     <div className="receipt-table">
-                      {device.receipts.map((r, i) => (
+                      {visibleReceipts.map((r, i) => (
                         <div className="receipt-row" key={i}>
                           <span>
                             <strong>
@@ -1581,7 +1606,7 @@ function Devices({
                             <small>
                               {r.agent}
                               {r.managed === false
-                                ? " · Existing matching installation"
+                                ? r.status === "conflicted" ? " · Preexisting installation" : " · Existing matching installation"
                                 : ""}
                               {r.message ? " · " + r.message : ""}
                             </small>
@@ -1591,70 +1616,10 @@ function Devices({
                           {r.status === "conflicted" && (
                             <div className="conflict-actions">
                               <button
-                                className="button small"
-                                onClick={() =>
-                                  run(
-                                    () =>
-                                      api(
-                                        `/devices/${device.id}/resolve`,
-                                        "POST",
-                                        {
-                                          skillId: r.skillId,
-                                          agent: r.agent,
-                                          profile: r.profile,
-                                          project: r.project,
-                                          action: "preserve",
-                                        },
-                                      ),
-                                    "Local changes preserved. This destination is now excluded.",
-                                  )
-                                }
+                                className="button small conflict-review-button"
+                                onClick={() => setConflict({ device, receipt: r })}
                               >
-                                Keep local
-                              </button>
-                              <button
-                                className="button small"
-                                onClick={() =>
-                                  run(
-                                    () =>
-                                      api(
-                                        `/devices/${device.id}/resolve`,
-                                        "POST",
-                                        {
-                                          skillId: r.skillId,
-                                          agent: r.agent,
-                                          profile: r.profile,
-                                          project: r.project,
-                                          action: "import",
-                                        },
-                                      ),
-                                    "Local changes imported as a custom draft.",
-                                  )
-                                }
-                              >
-                                Import as custom
-                              </button>
-                              <button
-                                className="button small"
-                                onClick={() =>
-                                  run(
-                                    () =>
-                                      api(
-                                        `/devices/${device.id}/resolve`,
-                                        "POST",
-                                        {
-                                          skillId: r.skillId,
-                                          agent: r.agent,
-                                          profile: r.profile,
-                                          project: r.project,
-                                          action: "replace",
-                                        },
-                                      ),
-                                    "Replacement approved. A backup will preserve your local files.",
-                                  )
-                                }
-                              >
-                                Back up & replace
+                                Review differences
                               </button>
                             </div>
                           )}
@@ -1777,6 +1742,40 @@ function Devices({
             </div>
           </div>
         </Dialog>
+      )}
+      {conflict && (
+        <SkillConflict
+          skill={workspace.skills.find((skill) => skill.id === conflict.receipt.skillId)}
+          device={workspace.devices.find(device => device.id === conflict.device.id) || conflict.device}
+          receipt={conflict.receipt}
+          onClose={() => setConflict(undefined)}
+          onResolve={async (action, expectedRevision) => {
+            let accepted = false;
+            let resolutionError: unknown;
+            const expectedLocalRevision = conflict.receipt.localFiles ? await reviewedFilesRevision(conflict.receipt.localFiles) : undefined;
+            await run(
+              async () => {
+                try {
+                  await api(`/devices/${conflict.device.id}/resolve`, "POST", {
+                    skillId: conflict.receipt.skillId,
+                    agent: conflict.receipt.agent,
+                    profile: conflict.receipt.profile,
+                    project: conflict.receipt.project,
+                    action,
+                    expectedRevision,
+                    expectedLocalRevision,
+                  });
+                  accepted = true;
+                } catch (error) {
+                  resolutionError = error;
+                  throw error;
+                }
+              },
+              action === "publish" ? "Local version published. Waiting for device receipts." : "Choice queued. Waiting for this computer to confirm it.",
+            );
+            if (!accepted) throw resolutionError instanceof Error ? resolutionError : new Error("The choice was not queued.");
+          }}
+        />
       )}
     </div>
   );

@@ -833,8 +833,11 @@ export async function synchronize(
             delete next.installs[key];
             await saveJsonAtomic(join(home, "ledger.json"), next);
           } else if (result.entry) {
+            const changed = JSON.stringify(next.installs[key]) !== JSON.stringify(result.entry);
             next.installs[key] = result.entry;
-            await saveJsonAtomic(join(home, "ledger.json"), next);
+            // A receipt is needed on each pass, but an unchanged installation
+            // does not need another full ledger write for every agent.
+            if (changed) await saveJsonAtomic(join(home, "ledger.json"), next);
             if (result.oldPath)
               await rm(result.oldPath, { recursive: true, force: true }).catch(
                 () => {},

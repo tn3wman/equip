@@ -1254,17 +1254,99 @@ export async function createApp(
     ...mutate((req) => {
       const device = req.workspace!.devices.find((d) => d.id === req.params.id);
       if (!device) throw httpError(404, "Device not found.");
-      const { skillId, agent, profile, project, action } = req.body ?? {};
-      if (!["preserve", "replace", "import"].includes(action))
+      const {
+        skillId,
+        agent,
+        profile,
+        project,
+        action,
+        expectedRevision,
+        expectedLocalRevision,
+      } = req.body ?? {};
+      if (!["preserve", "replace", "import", "publish"].includes(action))
         throw httpError(400, "Invalid resolution.");
+      const original = req.workspace!.skills.find((skill) => skill.id === skillId);
+      const receipt = device.receipts.find(
+        (item) =>
+          item.skillId === skillId &&
+          item.agent === agent &&
+          item.profile === profile &&
+          item.project === project,
+      );
+      if (
+        expectedRevision !== undefined &&
+        (!original || expectedRevision !== original.revision)
+      )
+        throw httpError(409, "The Equip revision changed. Review the conflict again.");
+      if (expectedLocalRevision !== undefined && (
+        !receipt?.localFiles || expectedLocalRevision !== revision(receipt.localFiles)
+      ))
+        throw httpError(409, "The device conflict changed. Review the conflict again.");
+      if (action === "publish") {
+        if (typeof expectedRevision !== "string" || typeof expectedLocalRevision !== "string")
+          throw httpError(400, "Publishing a conflict requires the reviewed Equip and local revisions.");
+        if (!original) throw httpError(404, "Skill not found.");
+        if (receipt?.status !== "conflicted" || !receipt.localFiles?.length)
+          throw httpError(409, "A current conflicted local skill is required.");
+        const files = clone(receipt.localFiles);
+        const metadata = validateFiles(files, 16_384);
+        if (metadata.name !== original.name)
+          throw httpError(409, "A renamed local skill must be imported as a separate draft.");
+        const rev = revision(files);
+        const changed =
+          canonicalFiles(original.files) !== canonicalFiles(files) ||
+          original.kind !== "custom" ||
+          original.author !== req.workspace!.name ||
+          original.autoUpdate ||
+          original.description !== metadata.description ||
+          original.upstreamRevision !== undefined ||
+          original.upstreamCheckedAt !== undefined ||
+          original.catalogId !== undefined ||
+          original.catalogUrl !== undefined ||
+          original.sourceType !== undefined ||
+          original.official !== undefined ||
+          original.duplicate !== undefined ||
+          original.safety !== undefined;
+        if (changed) {
+          original.description = metadata.description;
+          original.files = files;
+          original.revision = rev;
+          original.kind = "custom";
+          original.author = req.workspace!.name;
+          original.autoUpdate = false;
+          original.updatedAt = iso();
+          original.versions.unshift({
+            id: id("version"),
+            revision: rev,
+            createdAt: iso(),
+            message: `Published local conflict from ${device.name}`,
+            files: clone(files),
+          });
+          original.upstreamRevision = undefined;
+          original.upstreamCheckedAt = undefined;
+          original.catalogId = undefined;
+          original.catalogUrl = undefined;
+          original.installs = undefined;
+          original.sourceType = undefined;
+          original.official = undefined;
+          original.duplicate = undefined;
+          original.safety = undefined;
+          bump(req.workspace!);
+          activity(req.workspace!, {
+            type: "publish",
+            title: `${original.title} published from ${device.name}`,
+            description: `Revision ${rev} is ready for connected devices.`,
+            status: "pending",
+            deviceId: device.id,
+            skillId: original.id,
+          });
+        }
+        device.resolutions ??= {};
+        delete device.resolutions[resolutionKey(skillId, agent, profile, project)];
+        delete device.resolutions[`${skillId}:${agent}`];
+        return device;
+      }
       if (action === "import") {
-        const receipt = device.receipts.find(
-          (item) =>
-            item.skillId === skillId &&
-            item.agent === agent &&
-            item.profile === profile &&
-            item.project === project,
-        );
         if (receipt?.localFiles && receipt.localFiles.length === 0)
           throw httpError(400, "There are no local files to import.");
       }
