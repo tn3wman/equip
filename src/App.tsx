@@ -98,7 +98,7 @@ function lazyWithReload<T extends ComponentType<any>>(
 const SkillDetail = lazyWithReload(() => import("./SkillDetail"));
 const Editor = lazyWithReload(() => import("./Editor"));
 const InstructionsPage = lazyWithReload(() => import("./Instructions"));
-import { deployment, deviceStatus } from "./sync-state";
+import { conflictDevices, deployment, deviceStatus } from "./sync-state";
 
 const pages = [
   "library",
@@ -853,6 +853,7 @@ function Library({
             {visible.map((skill) => {
               const state = deployment(skill, devices);
               const status = state.status;
+              const needsReview = status === "conflicted" ? conflictDevices(skill, devices) : [];
               return (
                 <button
                   className={`skill-row ${!skill.enabled ? "is-disabled" : ""}`}
@@ -916,6 +917,7 @@ function Library({
                           ? "Unpublished"
                           : `${state.complete} of ${state.total} computers`}
                     </small>
+                    {!!needsReview.length && <small className="conflict-origin">{needsReview.length === 1 ? `${needsReview[0].name} needs review` : `${needsReview.length} computers need review`}</small>}
                   </div>
                   <MoreHorizontal className="row-more" size={18} />
                 </button>
@@ -1627,7 +1629,7 @@ function Devices({
                               {r.message ? " · " + r.message : ""}
                             </small>
                           </span>
-                          <code>{revision(r.revision)}</code>
+                          <code>{r.status === "conflicted" && !r.revision ? "No baseline" : revision(r.revision)}</code>
                           <Status status={r.status} />
                           {r.status === "conflicted" && (
                             <div className="conflict-actions">

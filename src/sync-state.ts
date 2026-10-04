@@ -54,6 +54,17 @@ export function deployment(
     total: destinations.length,
   };
 }
+export function conflictDevices(skill: Skill, devices: Device[]): Device[] {
+  return devices.filter(device => !device.disconnect && !device.disconnectedAt &&
+    device.agents.some(agent => !skill.targets.some(target =>
+      target.deviceId === device.id && target.agent === agent.id &&
+      (!target.profile || target.profile === agent.profile) &&
+      (!target.project || target.project === agent.project) && !target.enabled) &&
+      device.receipts.some(receipt => !receipt.kind && receipt.skillId === skill.id &&
+        receipt.agent === agent.id && receipt.profile === agent.profile &&
+        receipt.project === agent.project && receipt.status === "conflicted")));
+}
+
 export function deviceStatus(
   device: Device,
   skills: Skill[],

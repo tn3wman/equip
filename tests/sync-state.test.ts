@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deployment, deviceStatus } from "../src/sync-state.ts";
+import { conflictDevices, deployment, deviceStatus } from "../src/sync-state.ts";
 import type { Device, Instructions, Skill } from "../shared/types.ts";
 const skill = {
   id: "skill",
@@ -108,6 +108,97 @@ test("completed disconnections no longer count as deployment destinations", () =
     complete: 1,
     total: 1,
   });
+});
+
+test("conflict origins identify only the affected active computer", () => {
+  const conflicted = {
+    ...device,
+    id: "aitopatom",
+    name: "aitopatom",
+    receipts: [{ ...receipt, status: "conflicted" as const }],
+  };
+  const synchronized = {
+    ...device,
+    id: "mac",
+    name: "Mac",
+  };
+
+  assert.deepEqual(deployment(skill, [conflicted, synchronized]), {
+    status: "conflicted",
+    complete: 1,
+    total: 2,
+  });
+  assert.deepEqual(
+    conflictDevices(skill, [conflicted, synchronized]).map(({ id }) => id),
+    ["aitopatom"],
+  );
+});
+
+test("conflict origins require an exact enabled destination receipt", () => {
+  const profiles = {
+    ...device,
+    agents: [
+      { id: "codex", name: "Codex", path: "/agent" },
+      {
+        id: "codex",
+        name: "Codex",
+        path: "/work",
+        profile: "work",
+        project: "/project",
+      },
+    ],
+    receipts: [
+      { ...receipt, skillId: "other", status: "conflicted" as const },
+      {
+        ...receipt,
+        profile: "work",
+        project: "/other-project",
+        status: "conflicted" as const,
+      },
+      {
+        ...receipt,
+        profile: "work",
+        project: "/project",
+        status: "conflicted" as const,
+      },
+    ],
+  };
+  const configured = {
+    ...skill,
+    targets: [
+      {
+        deviceId: "device",
+        agent: "codex",
+        profile: "work",
+        project: "/project",
+        enabled: false,
+      },
+    ],
+  };
+
+  assert.deepEqual(conflictDevices(configured, [profiles]), []);
+  assert.deepEqual(conflictDevices(skill, [profiles]).map(({ id }) => id), [
+    "device",
+  ]);
+});
+
+test("conflict origins ignore disconnecting and disconnected computers", () => {
+  const conflicted = {
+    ...device,
+    receipts: [{ ...receipt, status: "conflicted" as const }],
+  };
+
+  assert.deepEqual(
+    conflictDevices(skill, [
+      { ...conflicted, id: "disconnecting", disconnect: "retain" },
+      {
+        ...conflicted,
+        id: "disconnected",
+        disconnectedAt: new Date().toISOString(),
+      },
+    ]),
+    [],
+  );
 });
 
 test("published instructions keep older workers pending until locations are reported", () => {
