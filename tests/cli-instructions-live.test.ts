@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, lstat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
@@ -24,4 +24,9 @@ test('the bundled CLI detects instruction locations, syncs the same global polic
  for(const {home,state} of homes) await exec(process.execPath,[resolve('dist/equip.cjs'),'sync'],{env:{...process.env,EQUIP_HOME:state,EQUIP_AGENT_HOME:home,EQUIP_SKILLS_ROOT:resolve('node_modules/skills'),EQUIP_NO_SERVICE:'1'},timeout:10000});
  for(const {home} of homes){assert.equal(await readFile(join(home,'.claude/CLAUDE.md'),'utf8'),published.files[0].content);assert.equal(await readFile(join(home,'.codex/AGENTS.md'),'utf8'),published.files[0].content);}
  const w=await(await fetch(base+'/api/workspace',{headers:{cookie}})).json();assert.ok(w.devices.every((d:any)=>d.instructionLocations.length===2&&d.receipts.length===2&&d.receipts.every((r:any)=>r.kind==='instructions'&&r.status==='synchronized'&&r.revision===published.revision)));
+ const first=homes[0];
+ await exec(process.execPath,[resolve('dist/equip.cjs'),'disconnect','--remove'],{env:{...process.env,EQUIP_HOME:first.state,EQUIP_AGENT_HOME:first.home,EQUIP_SKILLS_ROOT:resolve('node_modules/skills'),EQUIP_NO_SERVICE:'1'},timeout:10000});
+ assert.equal(await lstat(join(first.home,'.claude/CLAUDE.md')).catch(()=>null),null);
+ assert.equal(await lstat(join(first.home,'.codex/AGENTS.md')).catch(()=>null),null);
+ assert.equal(await readFile(join(homes[1].home,'.claude/CLAUDE.md'),'utf8'),published.files[0].content);
 });

@@ -14,7 +14,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileHashes, sameInstalledFileHashes } from "./file-state.ts";
 import type {
   DesiredState,
@@ -22,6 +22,7 @@ import type {
   Skill,
   SkillFile,
 } from "../shared/types.ts";
+import type { RecoveryArchive } from "./recovery.ts";
 
 export interface AgentTarget {
   id: string;
@@ -58,6 +59,8 @@ interface Journal {
   revision: string;
   obsoletePath?: string;
   transactionId?: string;
+  skillId?: string;
+  expectedFiles?: Record<string, string>;
 }
 
 const digest = (data: Buffer | string) =>
@@ -192,11 +195,27 @@ async function createManagedLink(source: string, destination: string) {
   await symlink(target, destination, process.platform === "win32" ? "junction" : "dir");
 }
 
+async function archiveChanged(
+  archive: RecoveryArchive | undefined,
+  skillId: string,
+  current: { files: SkillFile[]; hashes: Record<string, string> },
+  path: string,
+) {
+  if (Object.values(current.hashes).some((hash) => hash.startsWith("symlink:")))
+    throw new Error("Local files contain a symbolic link that cannot be archived safely");
+  if (!archive)
+    throw new Error("Local files require recovery archiving before replacement");
+  await archive({ skillId, files: current.files, path });
+  if (differs((await snapshot(path)).hashes,current.hashes))
+    throw new Error('Local files changed during archival and were preserved');
+}
+
 async function prepareCanonical(
   skill: Skill,
   home: string,
   entries: LedgerEntry[],
   replace: boolean,
+  archive?: RecoveryArchive,
 ): Promise<CanonicalState> {
   safeName(skill.name);
   const path = join(home, "skills", skill.name);
@@ -230,18 +249,9 @@ async function prepareCanonical(
           message: "Canonical skill changed locally and was preserved",
         },
       };
-    if (
-      replace ||
-      entries.some((entry) => entry.canonicalPath === path && !entry.observed)
-    ) {
-      const backup = join(
-        home,
-        "backups",
-        `${Date.now()}-${skill.name}-canonical-${randomUUID()}`,
-      );
-      await mkdir(dirname(backup), { recursive: true });
-      await cp(path, backup, { recursive: true, dereference: false, preserveTimestamps: true });
-    }
+    const locallyChanged = !baselines.some((baseline) => !differs(current.hashes, baseline));
+    if (locallyChanged && (replace || entries.some((entry) => entry.canonicalPath === path && !entry.observed)))
+      await archiveChanged(archive, skill.id, current, path);
   }
   const stage = `${path}.equip-stage-${randomUUID()}`;
   const oldPath = `${path}.equip-old-${randomUUID()}`;
@@ -255,6 +265,8 @@ async function prepareCanonical(
     hadOld: !!info,
     revision: skill.revision,
     transactionId,
+    skillId: skill.id,
+    expectedFiles: hashes,
   } satisfies Journal);
   if (info) await rename(path, oldPath);
   await mkdir(dirname(path), { recursive: true });
@@ -264,7 +276,7 @@ async function prepareCanonical(
   return { path, hashes, transactionId };
 }
 
-async function recover(home: string) {
+async function recover(home: string, archive?: RecoveryArchive) {
   const path = join(home, "transaction.json");
   const journal = JSON.parse(
     await readFile(path, "utf8").catch(() => "null"),
@@ -283,10 +295,27 @@ async function recover(home: string) {
     if (journal.obsoletePath)
       await rm(journal.obsoletePath, { recursive: true, force: true });
   } else if (await lstat(journal.oldPath).catch(() => null)) {
-    await rm(journal.destination, { recursive: true, force: true });
+    const destinationInfo = await lstat(journal.destination).catch(() => null);
+    if (destinationInfo) {
+      if (!journal.expectedFiles || !journal.skillId)
+        throw new Error("Interrupted legacy skill update requires manual recovery; destination was preserved");
+      const current = await snapshot(journal.destination);
+      if (differs(current.hashes, journal.expectedFiles))
+        await archiveChanged(archive, journal.skillId, current, journal.destination);
+      await rm(journal.destination, { recursive: true, force: true });
+    }
     await rename(journal.oldPath, journal.destination);
-  } else if (!journal.hadOld)
-    await rm(journal.destination, { recursive: true, force: true });
+  } else if (!journal.hadOld) {
+    const destinationInfo = await lstat(journal.destination).catch(() => null);
+    if (destinationInfo) {
+      if (!journal.expectedFiles || !journal.skillId)
+        throw new Error("Interrupted legacy skill install requires manual recovery; destination was preserved");
+      const current = await snapshot(journal.destination);
+      if (differs(current.hashes, journal.expectedFiles))
+        await archiveChanged(archive, journal.skillId, current, journal.destination);
+      await rm(journal.destination, { recursive: true, force: true });
+    }
+  }
   await rm(journal.stage, { recursive: true, force: true });
   await rm(path, { force: true });
 }
@@ -302,6 +331,7 @@ async function install(
     string,
     Promise<{ files: SkillFile[]; hashes: Record<string, string> }>
   >,
+  archive?: RecoveryArchive,
 ): Promise<{
   entry?: LedgerEntry;
   release?: boolean;
@@ -409,22 +439,9 @@ async function install(
           },
         };
       if (oldChanged) {
-        const backup = join(
-          home,
-          "backups",
-          `${Date.now()}-${basename(obsoletePath)}-${randomUUID()}`,
-        );
-        await cp(
-          previous?.canonicalPath && await pointsTo(obsoletePath, previous.canonicalPath)
-            ? previous.canonicalPath
-            : obsoletePath,
-          backup,
-          {
-          recursive: true,
-          dereference: false,
-          preserveTimestamps: true,
-          },
-        );
+        const archivedPath = previous?.canonicalPath && await pointsTo(obsoletePath, previous.canonicalPath)
+          ? previous.canonicalPath : obsoletePath;
+        await archiveChanged(archive, skill.id, await snapshot(archivedPath), archivedPath);
       }
     }
   }
@@ -460,16 +477,7 @@ async function install(
       const current = await snapshot(pointer!);
       const matchesDesired = !differs(current.hashes, desired);
       const matchesBaseline = !differs(current.hashes, previous.files);
-      if (matchesDesired)
-        return {
-          entry: { ...previous, revision: skill.revision, files: desired },
-          receipt: {
-            ...base,
-            status: "synchronized",
-            managed: false,
-            message: "Existing installation matches; original folder or link retained",
-          },
-        };
+      if (matchesDesired) migratingObserved = true;
       if (action === "import" || action === "preserve")
         return {
           release: true,
@@ -485,7 +493,7 @@ async function install(
             localFiles: current.files,
           },
         };
-      if (!matchesBaseline && action !== "replace")
+      if (!matchesDesired && !matchesBaseline && action !== "replace")
         return {
           entry: previous,
           receipt: {
@@ -497,18 +505,11 @@ async function install(
             localFiles: current.files,
           },
         };
-      const backup = join(
-        home,
-        "backups",
-        `${Date.now()}-${skill.name}-observed-${randomUUID()}`,
-      );
-      await cp(pointer!, backup, {
-        recursive: true,
-        dereference: false,
-        preserveTimestamps: true,
-      });
+      if (!matchesDesired) {
+        await archiveChanged(archive, skill.id, current, pointer!);
+      }
       // Replace only the installation, never the repository or external source
-      // behind a preexisting link. The original files remain in place or backup.
+      // behind a preexisting link. The original files remain in place.
       migratingObserved = true;
     }
   }
@@ -549,6 +550,8 @@ async function install(
           hadOld: true,
           revision: skill.revision,
           transactionId,
+          skillId: skill.id,
+          expectedFiles: canonical.hashes,
         } satisfies Journal);
         await rename(destination, oldPath);
         await rename(stage, destination);
@@ -576,35 +579,17 @@ async function install(
       };
     }
   }
-  // Matching preexisting folders can be observed without taking ownership.
-  // Removals retain them, and updates still check their recorded baseline.
+  // Exact preexisting installs can safely converge on the canonical store.
+  // Replacing a link moves only the link itself, never its external target.
   let linkedLocalFiles: SkillFile[] | undefined;
   let replacingUnownedLink = false;
+  let matchingPreexisting = false;
   if (rootInfo && !previous) {
     const existing = await snapshot(await realpath(destination));
     linkedLocalFiles = existing.files;
-    if (!differs(existing.hashes, desiredHashes(skill.files)))
-      return {
-        entry: {
-          skillId: skill.id,
-          agent: target.id,
-          profile: target.profile,
-          project: target.project,
-          revision: skill.revision,
-          files: desired,
-          path: destination,
-          observed: true,
-          canonicalPath: await realpath(destination),
-        },
-        receipt: {
-          ...base,
-          status: "synchronized",
-          managed: false,
-          message: "Existing installation matches; original folder or link retained",
-        },
-      };
+    matchingPreexisting = !differs(existing.hashes, desired);
   }
-  if (rootInfo?.isSymbolicLink() && !migratingObserved) {
+  if (rootInfo?.isSymbolicLink() && !migratingObserved && !matchingPreexisting) {
     linkedLocalFiles ??= (await snapshot(await realpath(destination))).files;
     if (action === "import" || action === "preserve")
       return {
@@ -634,26 +619,15 @@ async function install(
           localFiles: linkedLocalFiles ?? [],
         },
       };
-    const backup = join(
-      home,
-      "backups",
-      `${Date.now()}-${skill.name}-linked-${randomUUID()}`,
-    );
-    await mkdir(backup, { recursive: true });
-    await cp(await realpath(destination), join(backup, "contents"), {
-      recursive: true,
-      dereference: false,
-      preserveTimestamps: true,
-    });
-    await writeFile(
-      join(backup, "original-link.json"),
-      JSON.stringify({ target: await readlink(destination) }, null, 2),
-      { mode: 0o600 },
-    );
+    await archiveChanged(archive, skill.id, {
+      files: linkedLocalFiles ?? [],
+      hashes: (await snapshot(await realpath(destination))).hashes,
+    }, destination);
     replacingUnownedLink = true;
   }
   const current = await snapshot(destination);
-  const conflict = !migratingObserved && !replacingUnownedLink && differs(
+  const conflict = !migratingObserved && !replacingUnownedLink &&
+    !matchingPreexisting && differs(
     current.hashes,
     obsoletePath ? undefined : previous?.files,
   );
@@ -692,16 +666,7 @@ async function install(
       },
     };
   if (conflict) {
-    const backup = join(
-      home,
-      "backups",
-      `${Date.now()}-${skill.name}-${randomUUID()}`,
-    );
-    await cp(destination, backup, {
-      recursive: true,
-      dereference: false,
-      preserveTimestamps: true,
-    });
+    await archiveChanged(archive, skill.id, current, destination);
   }
   await mkdir(dirname(destination), { recursive: true });
   const transactionId = randomUUID();
@@ -730,6 +695,8 @@ async function install(
     revision: skill.revision,
     obsoletePath,
     transactionId,
+    skillId: skill.id,
+    expectedFiles: canonical.hashes,
   } satisfies Journal);
   try {
     if (rootInfo) await rename(destination, oldPath);
@@ -767,6 +734,7 @@ export async function synchronize(
   desired: DesiredState,
   targets: AgentTarget[],
   home: string,
+  archive?: RecoveryArchive,
 ): Promise<Receipt[]> {
   await mkdir(home, { recursive: true });
   const lockPath = join(home, "sync.lock");
@@ -791,7 +759,7 @@ export async function synchronize(
     await lock.writeFile(
       JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
     );
-    await recover(home);
+    await recover(home, archive);
     const ledger = await loadLedger(home);
     const next: Ledger = {
       generation: ledger.generation,
@@ -820,6 +788,7 @@ export async function synchronize(
               Object.entries(desired.resolutions).some(
                 ([key, action]) => key.startsWith(`${skill.id}:`) && action === "replace",
               ),
+              archive,
             );
             canonicals.set(skill.id, canonical);
           }
@@ -839,6 +808,7 @@ export async function synchronize(
             home,
             await canonical,
             canonicalSnapshots,
+            archive,
           );
           if (result.release) {
             delete next.installs[key];
@@ -867,7 +837,7 @@ export async function synchronize(
         } catch (error) {
           if (ledger.installs[key]) next.installs[key] = ledger.installs[key];
           else delete next.installs[key];
-          await recover(home).catch(() => {});
+          await recover(home, archive).catch(() => {});
           receipts.push({
             skillId: skill.id,
             agent: target.id,
@@ -881,7 +851,7 @@ export async function synchronize(
           });
         }
       }
-    await recover(home);
+    await recover(home, archive);
     const wanted = new Set(
       targets.flatMap((t) =>
         desired.skills
@@ -957,16 +927,24 @@ export async function synchronize(
           desired.resolutions[`${old.skillId}:${old.agent}`];
         if (!changed || action === "replace") {
           if (changed) {
-            const backup = join(
-              home,
-              "backups",
-              `${Date.now()}-removed-${basename(old.path)}-${randomUUID()}`,
-            );
-            await cp(managedLink && old.canonicalPath ? old.canonicalPath : old.path, backup, {
-              recursive: true,
-              dereference: false,
-              preserveTimestamps: true,
-            });
+            const archivedPath = managedLink && old.canonicalPath ? old.canonicalPath : old.path;
+            try { await archiveChanged(archive, old.skillId, current, archivedPath); }
+            catch (error) {
+              if (old.canonicalPath) protectedCanonicals.add(old.canonicalPath);
+              receipts.push({
+                skillId: old.skillId,
+                agent: old.agent,
+                profile: old.profile,
+                project: old.project,
+                revision: old.revision,
+                status: "failed",
+                message: error instanceof Error ? error.message : String(error),
+                path: old.path,
+                timestamp: new Date().toISOString(),
+                localFiles: current.files,
+              });
+              continue;
+            }
           }
           await rm(old.path, { recursive: true, force: true });
           if (old.canonicalPath) canonicalGcCandidates.add(old.canonicalPath);
@@ -979,7 +957,7 @@ export async function synchronize(
             revision: old.revision,
             status: "synchronized",
             message: changed
-              ? "Backed up and removed local files"
+              ? "Archived and removed local files"
               : "Removed managed skill",
             path: old.path,
             timestamp: new Date().toISOString(),

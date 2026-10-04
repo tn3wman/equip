@@ -40,7 +40,7 @@ export default function SkillSyncReview({ skill, workspace, onClose, onChange, n
       setQueued(results.some(result => result.status === "fulfilled"));
       await onChange();
       setError(failures.join(" "));
-      if (!failures.length) notify("Equip version selected. Computers will back up local copies and confirm installation.");
+      if (!failures.length) notify("Equip version selected. Computers will save differing versions in history and confirm installation.");
     } catch (requestError) { setError((requestError as Error).message); }
     finally { setBusy(false); }
   };
@@ -60,7 +60,7 @@ export default function SkillSyncReview({ skill, workspace, onClose, onChange, n
       <div className="sync-selected"><GitBranch size={20} /><div><strong>Equip controls the installed version</strong><p>Selected revision <code>{revision(skill.revision)}</code>{skill.kind === "third-party" ? ` from ${skill.source}` : ""}.</p></div></div>
       {onInspect && <button className="text-link" onClick={onInspect}>View skill details and upstream updates</button>}
       <p>A local copy differs from Equip. This can happen when connecting a computer with an existing installation, or after editing files locally.</p>
-      <p>Use Equip's version to make every selected computer and agent consistent. Equip backs up each differing local copy before replacing its installation. Original folders behind existing links stay untouched.</p>
+      <p>Use Equip's version to make every selected computer and agent consistent. Equip saves differing local versions in history before linking agents to its canonical copy.</p>
       {locations.map(({ device, receipt }, index) => <div className="sync-conflict-location" key={`${device.id}:${index}`}>
         <div><strong>{device.name}</strong><small>{[device.agents.find(agent => agent.id === receipt.agent && agent.profile === receipt.profile && agent.project === receipt.project)?.name || receipt.agent, receipt.profile, receipt.project].filter(Boolean).join(" · ")}</small><code title={receipt.path}>{receipt.path}</code></div>
         <button className="text-link" onClick={() => setReview({ device, receipt })}>Review differences</button>

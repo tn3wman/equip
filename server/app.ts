@@ -1106,8 +1106,11 @@ export async function createApp(
       const version = typeof req.query.revision === "string" ? skill.versions.find(v => v.revision === req.query.revision) : undefined;
       if (req.query.revision && !version) throw httpError(404, "Revision not found.");
       const files = version?.files ?? skill.files;
-      if (!files.length || !skill.revision) throw httpError(409, "Publish this skill before exporting it.");
-      const metadata = validateFiles(files, 16_384);
+      if (!files.length || (!version && !skill.revision)) throw httpError(409, "Publish this skill before exporting it.");
+      // Recovery can contain damaged instructions. Export the intact folder even
+      // when it is intentionally unsuitable for publication or rollback.
+      if (version) validateFileEntries(files);
+      const metadata = version ? {name:skill.name} : validateFiles(files, 16_384);
       const rev = version?.revision ?? skill.revision;
       const archive = await skillArchive(metadata.name, files);
       res.set({ "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="${metadata.name}-${rev}.zip"`, "X-Equip-Revision": rev, "Cache-Control": "private, no-store" });
@@ -1899,6 +1902,58 @@ export async function createApp(
         }
         await saveWorkspace(db, req.accountId!, req.workspace!);
         res.json(document);
+      } catch (error) { next(error); }
+    },
+  );
+  app.post(
+    "/api/device/recovery",
+    deviceAuth,
+    lockedWorkspace,
+    async (req: AuthedRequest, res, next) => {
+      try {
+        const workspace = req.workspace!;
+        const device = workspace.devices.find(item => item.id === req.deviceId);
+        if (!device) throw httpError(401, "invalid_token");
+        if (typeof req.body?.skillId !== "string" || !req.body.skillId)
+          throw httpError(400, "skillId is required.");
+        if (req.body.kind !== undefined && req.body.kind !== "instructions")
+          throw httpError(400, "kind must be instructions when provided.");
+        if (req.body.path !== undefined &&
+            (typeof req.body.path !== "string" || !req.body.path ||
+             req.body.path.length > 2048 || req.body.path.includes("\0")))
+          throw httpError(400, "path must be a non-empty local path of at most 2048 characters.");
+
+        const isInstructions = req.body.kind === "instructions";
+        const item = isInstructions
+          ? (workspace.instructions ?? []).find(document => document.id === req.body.skillId)
+          : workspace.skills.find(skill => skill.id === req.body.skillId);
+        if (!item)
+          throw httpError(404, isInstructions ? "Instructions not found." : "Skill not found.");
+
+        let files = clone(req.body.files) as SkillFile[];
+        if (isInstructions) {
+          validateInstructionFiles(files);
+          files = files.map(file => ({ ...file, path: (item as Instructions).filename }));
+          validateInstructionFiles(files, (item as Instructions).filename);
+        } else {
+          validateFileEntries(files);
+          if (!files.length) throw httpError(400, "Recovery files cannot be empty.");
+        }
+        const rev = revision(files);
+        const existing = item.versions.find(version =>
+          version.revision === rev && sameFiles(version.files, files));
+        if (!existing) {
+          const source = req.body.path ? ` at ${req.body.path}` : "";
+          item.versions.push({
+            id: id("version"),
+            revision: rev,
+            createdAt: iso(),
+            message: `Recovered from ${device.name}${source}`,
+            files: clone(files),
+          });
+        }
+        await saveWorkspace(db, req.accountId!, workspace);
+        res.json({ id: item.id, revision: rev, archived: true });
       } catch (error) { next(error); }
     },
   );

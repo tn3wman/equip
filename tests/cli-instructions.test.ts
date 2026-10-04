@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, lstat, readlink, realpath } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile, lstat, readlink, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -38,12 +38,12 @@ test('two computers install identical instruction revisions, update, rollback, a
  const removed=await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(removed[0].status,'synchronized');assert.equal(await lstat(a.path).catch(()=>null),null);
 });
 
-test('matching preexisting instructions become a managed link and return on removal',async t=>{
+test('matching preexisting instructions become owned managed links and are removed without backups',async t=>{
  const {state,a}=await fixture(t);const policy=doc('Original\n','AGENTS.md',0o640);await writeFile(a.path,'Original\n',{mode:0o640});
  let result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.ok((await lstat(a.path)).isSymbolicLink());
  const canonical=join(state,'instructions',policy.id,'AGENTS.md');assert.equal(await realpath(a.path),await realpath(canonical));const pointer=await readlink(a.path);
  result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.ok((await lstat(a.path)).isSymbolicLink());assert.equal(await readlink(a.path),pointer);
- await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.ok((await lstat(a.path)).isFile());assert.equal(await readFile(a.path,'utf8'),'Original\n');assert.equal((await stat(a.path)).mode&0o777,0o640);
+ await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await lstat(join(state,'backups')).catch(()=>null),null);
 });
 
 test('an old observed instruction record is migrated to a managed link',async t=>{
@@ -51,35 +51,39 @@ test('an old observed instruction record is migrated to a managed link',async t=
  await writeFile(join(state,'instructions-ledger.json'),JSON.stringify({installs:{[key]:{skillId:policy.id,agent:a.agent,path:a.path,filename:a.filename,revision:policy.revision,hash:policy.revision,observed:true}},canonicals:{}}));
  const result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.equal(result[0].managed,true);assert.ok((await lstat(a.path)).isSymbolicLink());
  assert.equal(await realpath(a.path),await realpath(join(state,'instructions',policy.id,'AGENTS.md')));
- await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.ok((await lstat(a.path)).isFile());assert.equal(await readFile(a.path,'utf8'),'Original\n');
+ await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.equal(await lstat(a.path).catch(()=>null),null);
 });
 
-test('matching external instruction links become managed links and return on removal',async t=>{
+test('matching external instruction links become managed links while their source remains independent',async t=>{
  const {state,a,root}=await fixture(t);const external=join(root,'external.md');await writeFile(external,'Original\n',{mode:0o640});await symlink(external,a.path);const policy=doc('Original\n','AGENTS.md',0o640);
  let result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.ok((await lstat(a.path)).isSymbolicLink());assert.notEqual(await readlink(a.path),external);
  assert.equal(await realpath(a.path),await realpath(join(state,'instructions',policy.id,'AGENTS.md')));assert.equal(await readFile(external,'utf8'),'Original\n');assert.equal((await stat(external)).mode&0o777,0o640);
  result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.notEqual(await readlink(a.path),external);
- await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.equal(await readlink(a.path),external);assert.equal(await readFile(external,'utf8'),'Original\n');assert.equal((await stat(external)).mode&0o777,0o640);
+ await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await readFile(external,'utf8'),'Original\n');assert.equal((await stat(external)).mode&0o777,0o640);
 });
 
-test('unknown local versions remain intact; reviewed replace saves original and restores it on removal',async t=>{
- const {state,a,root}=await fixture(t);await writeFile(a.path,'My work\n',{mode:0o664});const v1=doc();
+test('reviewed replacement requires durable recovery and removal does not resurrect local files',async t=>{
+ const {state,a}=await fixture(t);await writeFile(a.path,'My work\n',{mode:0o664});const v1=doc();
  let result=await synchronizeInstructions(desired(v1),[a],state);assert.equal(result[0].status,'conflicted');assert.equal(result[0].revision,'');assert.equal(await readFile(a.path,'utf8'),'My work\n');
  const key=instructionKey(v1.id,a);const stale={...desired(v1,{[key]:'replace'}),instructionResolutionChecks:{[key]:'stale'}};
  result=await synchronizeInstructions(stale,[a],state);assert.equal(result[0].status,'conflicted');
  const checked=skillRevision((await synchronizeInstructions(desired(v1),[a],state))[0].localFiles!);
  a.localFiles=result[0].localFiles;
- result=await synchronizeInstructions({...desired(v1,{[key]:'replace'}),instructionResolutionChecks:{[key]:checked}},[a],state);
+ result=await synchronizeInstructions({...desired(v1,{[key]:'replace'}),instructionResolutionChecks:{[key]:checked}},[a],state,undefined,async()=>{throw new Error('recovery offline');});
+ assert.equal(result[0].status,'failed');assert.match(result[0].message!,/recovery offline/);assert.equal(await readFile(a.path,'utf8'),'My work\n');
+ const archived:any[]=[];
+ result=await synchronizeInstructions({...desired(v1,{[key]:'replace'}),instructionResolutionChecks:{[key]:checked}},[a],state,undefined,async payload=>{archived.push(payload);});
  assert.equal(result[0].status,'synchronized');assert.equal(await readFile(a.path,'utf8'),'Original\n');
- assert.ok((await readdir(join(state,'backups'))).length);
- await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(await readFile(a.path,'utf8'),'My work\n');
+ assert.equal(archived.length,1);assert.equal(archived[0].skillId,v1.id);assert.equal(archived[0].kind,'instructions');assert.equal(archived[0].files[0].content,'My work\n');
+ assert.equal(await lstat(join(state,'backups')).catch(()=>null),null);
+ await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(await lstat(a.path).catch(()=>null),null);
 });
 
 test('external linked instructions are imported or replaced without changing external work',async t=>{
  const {state,a,root}=await fixture(t);const external=join(root,'source.md');await writeFile(external,'External\n');await symlink(external,a.path);const v1=doc();let r=await synchronizeInstructions(desired(v1),[a],state);assert.equal(r[0].localFiles?.[0].content,'External\n');
  const key=instructionKey(v1.id,a);r=await synchronizeInstructions(desired(v1,{[key]:'import'}),[a],state);assert.equal(r[0].status,'conflicted');assert.equal(await readlink(a.path),external);
- r=await synchronizeInstructions(desired(v1,{[key]:'replace'}),[a],state);assert.equal(r[0].status,'synchronized');assert.equal(await readFile(external,'utf8'),'External\n');
- await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(await readlink(a.path),external);assert.equal(await readFile(external,'utf8'),'External\n');
+ const archived:any[]=[];r=await synchronizeInstructions(desired(v1,{[key]:'replace'}),[a],state,undefined,async payload=>{archived.push(payload);});assert.equal(r[0].status,'synchronized');assert.equal(await readFile(external,'utf8'),'External\n');assert.equal(archived[0].files[0].content,'External\n');
+ await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await readFile(external,'utf8'),'External\n');
 });
 
 test('managed local modifications are preserved and can become the central revision',async t=>{
@@ -137,9 +141,17 @@ test('shadowing is reported as failed, and unsafe destinations remain untouched'
 test('an interrupted file replacement restores the last committed installation',async t=>{
  const {state,a}=await fixture(t);const v1=doc();await synchronizeInstructions(desired(v1),[a],state);
  const old=a.path+'.equip-old-test',stage=a.path+'.equip-stage-test';const fs=await import('node:fs/promises');await fs.rename(a.path,old);await writeFile(a.path,'Interrupted\n');
- await writeFile(join(state,'instructions-transaction.json'),JSON.stringify({path:a.path,old,stage,hadOld:true,id:'uncommitted',key:instructionKey(v1.id,a)}));
- const r=await synchronizeInstructions(desired(v1),[a],state);assert.equal(r[0].status,'synchronized');assert.equal(await readFile(a.path,'utf8'),'Original\n');
- const backups=await readdir(join(state,'backups'));assert.ok(backups.length);assert.equal(await readFile(join(state,'backups',backups[0],'contents'),'utf8'),'Interrupted\n');
+ await writeFile(join(state,'instructions-transaction.json'),JSON.stringify({path:a.path,old,stage,hadOld:true,id:'uncommitted',key:instructionKey(v1.id,a),skillId:v1.id,filename:v1.filename,expectedHash:v1.revision}));
+ const archived:any[]=[];const r=await synchronizeInstructions(desired(v1),[a],state,undefined,async payload=>{archived.push(payload);});assert.equal(r[0].status,'synchronized');assert.equal(await readFile(a.path,'utf8'),'Original\n');
+ assert.equal(archived.length,1);assert.equal(archived[0].files[0].content,'Interrupted\n');assert.equal(await lstat(join(state,'backups')).catch(()=>null),null);
+});
+
+test('interrupted recovery does not archive the staged desired instructions',async t=>{
+ const {state,a}=await fixture(t);const policy=doc();await synchronizeInstructions(desired(policy),[a],state);
+ const old=a.path+'.equip-old-test',stage=a.path+'.equip-stage-test';const fs=await import('node:fs/promises');await fs.rename(a.path,old);await writeFile(a.path,policy.files[0].content,{mode:policy.files[0].mode});
+ await writeFile(join(state,'instructions-transaction.json'),JSON.stringify({path:a.path,old,stage,hadOld:true,id:'uncommitted',key:instructionKey(policy.id,a),skillId:policy.id,filename:policy.filename,expectedHash:policy.revision}));
+ const receipts=await synchronizeInstructions(desired(policy),[a],state);
+ assert.equal(receipts[0].status,'synchronized');assert.equal(await readFile(a.path,'utf8'),'Original\n');assert.equal(await lstat(join(state,'backups')).catch(()=>null),null);
 });
 
 

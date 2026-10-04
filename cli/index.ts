@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname, homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -25,6 +25,8 @@ import { replaceExecutable } from "./update.ts";
 import { libraryImport } from "./library.ts";
 import { localSkill, syncLocalSkills } from "./local.ts";
 import { getDesired } from "./desired.ts";
+import { consolidate } from "./consolidate.ts";
+import type { RecoveryArchive } from "./recovery.ts";
 import { discoverInstructionLocations, synchronizeInstructions, syncLocalInstructions } from "./instructions.ts";
 
 const exec = promisify(execFile);
@@ -271,6 +273,22 @@ async function maybeUpdate(s: State) {
   return changed;
 }
 async function runSync(s: State) {
+  await mkdir(equipHome,{recursive:true});
+  const path = join(equipHome,'worker-sync.lock');
+  let lock;
+  try {lock = await open(path,'wx',0o600);}
+  catch {
+    const owner = JSON.parse(await readFile(path,'utf8').catch(() => '{}'));
+    if (owner.pid) {
+      try {process.kill(owner.pid,0);throw new Error('Equip synchronization is already running.');}
+      catch(error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;}
+    }
+    await rm(path,{force:true});lock=await open(path,'wx',0o600);
+  }
+  try {await lock.writeFile(JSON.stringify({pid:process.pid}));return await applyState(s);}
+  finally {await lock.close();await rm(path,{force:true});}
+}
+async function applyState(s: State) {
   if (!s.token) throw new Error("Not connected. Run equip connect.");
   const configuredTargets = retainedConfiguredTargets(
     s.autoDetect,
@@ -304,6 +322,10 @@ async function runSync(s: State) {
   const targets = selected.map((t) => ({ ...t, deviceId: s.deviceId }));
   const instructionLocations = await discoverInstructionLocations(targets, {home:agentHome, autoDetect:s.autoDetect});
   const base = s.server || server;
+  const archive: RecoveryArchive = async payload => {
+    const result = await request<{archived:boolean}>("/api/device/recovery", {method:"POST",body:JSON.stringify(payload)}, s.token, base);
+    if (result.archived !== true) throw new Error("Equip could not confirm recovery history. Local files were preserved.");
+  };
   await flushReceipts(s, base);
   // Remove state written by releases that treated a folder as a live authority.
   await rm(join(equipHome, "library-link.json"), { force: true });
@@ -382,11 +404,16 @@ async function runSync(s: State) {
             { generation: desired.generation, skills: [], resolutions: {} },
             targets,
             equipHome,
+            archive,
           )
         : [];
     if (desired.disconnect === "remove") receipts.push(...await synchronizeInstructions(
-      {generation:desired.generation,skills:[],resolutions:{},instructions:[]},instructionLocations,equipHome,s.deviceId));
+      {generation:desired.generation,skills:[],resolutions:{},instructions:[]},instructionLocations,equipHome,s.deviceId,archive));
     await postReceipts(s, base, desired.generation, receipts);
+    if (receipts.some(receipt => receipt.status !== 'synchronized')) {
+      await saveWorkerFields(s,{lastError:'Disconnect removal is waiting for local conflicts to be resolved.'});
+      return receipts;
+    }
     await request(
       "/api/device/disconnected",
       { method: "POST", body: JSON.stringify({ mode: desired.disconnect }) },
@@ -397,12 +424,14 @@ async function runSync(s: State) {
     await stopService(s);
     throw new Disconnected(`Disconnected (${desired.disconnect})`);
   }
-  const receipts = await synchronize(desired, targets, equipHome);
-  receipts.push(...await synchronizeInstructions(desired,instructionLocations,equipHome,s.deviceId));
+  const receipts = await synchronize(desired, targets, equipHome,archive);
+  receipts.push(...await synchronizeInstructions(desired,instructionLocations,equipHome,s.deviceId,archive));
   await postReceipts(s, base, desired.generation, receipts);
+  const migration = await consolidate(equipHome,agentHome ?? homedir(),desired,archive);
+  if (command === "tidy") console.log(JSON.stringify(migration,null,2));
   if (receipts.every((receipt) => receipt.status === "synchronized"))
     s.lastSync = new Date().toISOString();
-  s.lastError = [...local.errors,...localInstructions.errors].join("\n") || undefined;
+  s.lastError = [...local.errors,...localInstructions.errors,...migration.errors].join("\n") || undefined;
   await saveWorkerFields(s, {
     lastSync: s.lastSync,
     lastError: s.lastError,
@@ -631,7 +660,7 @@ async function main() {
     }
     return;
   }
-  if (command === "sync") {
+  if (command === "sync" || command === "tidy") {
     const receipts = await runSync(await state());
     for (const r of receipts)
       console.log(
@@ -672,12 +701,14 @@ async function main() {
     const s = await state();
     const mode = has("--remove") ? "remove" : "retain";
     if (s.token) {
-      if (mode === "remove")
-        await synchronize(
-          { generation: Date.now(), skills: [], resolutions: {} },
-          uniqueTargets([...(await targetsFromFlags()), ...(s.targets ?? [])]),
-          equipHome,
-        );
+      if (mode === "remove") {
+        const targets = uniqueTargets([...(s.autoDetect === false ? [] : await targetsFromFlags()), ...(s.targets ?? [])]);
+        const empty = {generation:Date.now(),skills:[],resolutions:{},instructions:[]};
+        const locations = await discoverInstructionLocations(targets,{home:agentHome,autoDetect:s.autoDetect});
+        const receipts = await synchronize(empty,targets,equipHome);
+        receipts.push(...await synchronizeInstructions(empty,locations,equipHome,s.deviceId));
+        if (receipts.some(r => r.status !== "synchronized")) throw new Error("Some local files changed. Resolve their conflicts before disconnecting with removal.");
+      }
       await request(
         "/api/device/disconnected",
         { method: "POST", body: JSON.stringify({ mode }) },
@@ -688,7 +719,7 @@ async function main() {
     await stopService(s);
     await rm(statePath, { force: true });
     console.log(
-      `Disconnected; managed skills ${mode === "remove" ? "removed where unchanged" : "retained"}.`,
+      `Disconnected; managed skills and instructions ${mode === "remove" ? "removed where unchanged" : "retained"}.`,
     );
     return;
   }

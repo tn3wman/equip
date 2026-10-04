@@ -651,7 +651,7 @@ export default function SkillDetail({
                   published version.
                 </div>
               )}
-              {skill.versions.map((v, i) => (
+              {skill.versions.map((v) => (
                 <div className="version-row" key={v.id}>
                   <span className="version-dot" />
                   <div>
@@ -660,6 +660,7 @@ export default function SkillDetail({
                       <code>{revision(v.revision)}</code> · {ago(v.createdAt)}
                     </span>
                   </div>
+                  <a className="button small" href={`/api/skills/${skill.id}/export?revision=${encodeURIComponent(v.revision)}`}><ArrowDownToLine size={13} />Download</a>
                   {v.revision === skill.revision ? (
                     <span className="custom-tag">Selected</span>
                   ) : (

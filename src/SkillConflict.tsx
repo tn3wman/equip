@@ -51,7 +51,7 @@ export default function SkillConflict({
   const contentChanges = comparisons.filter((file) => file.contentChanged).length;
   const comparisonReady = (!skill || Boolean(equipSkill?.files.length)) && !loadError;
   const queuedCopy = queued === "replace"
-    ? `Equip will back up the local ${documentKind === "instructions" ? "file" : "folder"}, then install its version.`
+    ? "Equip will save the local version in history, then install its selected version."
     : queued === "publish"
       ? "Local version published to Equip. Selected destinations are applying that revision; completion requires receipts."
       : queued === "preserve"
@@ -153,7 +153,7 @@ export default function SkillConflict({
           <div className="conflict-queued" role="status"><Check size={17} /><div><strong>{completed ? "Computer confirmed your choice" : queued === "publish" ? "Local version published" : "Choice queued for this computer"}</strong><p>{completed ? "This installation has reconciled. Other selected destinations report their progress in Computers." : `${queuedCopy} The conflict stays visible until the computer reports completion.`}</p></div></div>
         ) : (
           <div className="conflict-choices">
-            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("replace")}><strong>{skill ? "Use Equip version" : "Back up and remove"}</strong><span>{skill ? `Back up the local ${documentKind === "instructions" ? "file" : "folder"}, then replace it with Equip’s revision.` : `Equip removed this ${documentKind === "instructions" ? "document" : "skill"}. Back up local edits, then remove this managed installation.`}</span></button>
+            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("replace")}><strong>{skill ? "Use Equip version" : "Save and remove"}</strong><span>{skill ? "Save the local version in Equip history, then link this agent to Equip’s revision." : `Equip removed this ${documentKind === "instructions" ? "document" : "skill"}. Save local edits in history, then remove this managed installation.`}</span></button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length || !skill} onClick={() => void resolve("publish")}><strong>Use local version everywhere</strong><span>Publish this reviewed local {documentKind === "instructions" ? "file" : "folder snapshot"} to Equip and all selected destinations. Files on this computer are preserved.</span>{documentKind !== "instructions" && skill?.kind === "third-party" && <em>The upstream source stays connected. Automatic updates turn off.</em>}</button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("preserve")}><strong>Keep local on this computer</strong><span>Create an exception here and stop updates for this {documentKind === "instructions" ? "file" : "installation"}.</span></button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length} onClick={() => void resolve("import")}><strong>{documentKind === "instructions" ? "Save local as global draft" : "Save local as custom draft"}</strong><span>{documentKind === "instructions" ? "Review this local copy in the global editor before publishing. Published instructions stay unchanged." : "Keep the local work in Equip as a separate unpublished draft."}</span></button>

@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp, chmod, readlink } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp, chmod, readlink, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { DesiredState, Skill } from "../shared/types.ts";
-import { synchronize } from "../cli/sync.ts";
+import { synchronize as synchronizeRaw } from "../cli/sync.ts";
 import { sameFileHashes, sameInstalledFileHashes } from "../cli/file-state.ts";
+
+const synchronize = (
+  desired: DesiredState,
+  targets: Parameters<typeof synchronizeRaw>[1],
+  home: string,
+) => synchronizeRaw(desired, targets, home, async () => {});
 
 function skill(content: string, revision = "r1"): Skill {
   return {
@@ -68,7 +74,7 @@ test("bundled bytecode and unexpected symlinks remain part of conflict detection
   assert.ok(!sameInstalledFileHashes({ "scripts/__pycache__/notes.md": hash }, {}));
 });
 
-test("same-content preexisting skill links ignore rw modes without altering the source", async t => {
+test("same-content preexisting skill links become canonical without altering or backing up the source", async t => {
   const root = await mkdtemp(join(tmpdir(), "equip-portable-link-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, "original/demo"), target = join(root, "claude"), home = join(root, "state");
@@ -83,14 +89,42 @@ test("same-content preexisting skill links ignore rw modes without altering the 
   const receipts = await synchronize(desired([skill("one")]), agent, home);
   assert.equal(receipts[0].status, "synchronized");
   assert.equal(receipts[0].revision, "r1");
-  assert.equal(receipts[0].managed, false);
-  assert.equal(await readlink(join(target, "demo")), source);
+  assert.notEqual(receipts[0].managed, false);
+  assert.equal(await realpath(join(target, "demo")), await realpath(join(home, "skills/demo")));
   assert.equal((await stat(join(source, "SKILL.md"))).mode & 0o777, 0o664);
   assert.equal((await stat(join(source, "scripts/run.sh"))).mode & 0o777, 0o775);
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
   await chmod(join(source, "SKILL.md"), 0o600);
   assert.equal((await synchronize(desired([skill("two", "r2")]), agent, home))[0].status, "synchronized");
   assert.equal(await readFile(join(source, "SKILL.md"), "utf8"), "one");
   assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
+});
+
+test("legacy observed exact matches migrate to the canonical link without a source backup", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-observed-migration-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "repository/demo"), target = join(root, "agent"), home = join(root, "state");
+  await mkdir(join(source, "scripts"), { recursive: true });
+  await mkdir(target);
+  await writeFile(join(source, "SKILL.md"), "one");
+  await writeFile(join(source, "scripts/run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+  await symlink(source, join(target, "demo"));
+  await synchronize(desired([skill("one")]), [{ id: "codex", path: target }], home);
+
+  const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
+  const entry = Object.values(ledger.installs)[0] as any;
+  entry.observed = true;
+  entry.canonicalPath = await realpath(source);
+  await writeFile(join(home, "ledger.json"), JSON.stringify(ledger));
+  await rm(join(target, "demo"));
+  await symlink(source, join(target, "demo"));
+
+  const receipts = await synchronize(desired([skill("one")]), [{ id: "codex", path: target }], home);
+  assert.equal(receipts[0].status, "synchronized");
+  assert.notEqual(receipts[0].managed, false);
+  assert.equal(await realpath(join(target, "demo")), await realpath(join(home, "skills/demo")));
+  assert.equal(await readFile(join(source, "SKILL.md"), "utf8"), "one");
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
 });
 
 test("managed skill permission changes do not block sync, update, or removal; executable edits do", async t => {
@@ -120,7 +154,7 @@ test("legacy hash comparison preserves file kind and content and accounts for Wi
   assert.ok(!sameFileHashes({ file: `420:${digest}` }, {}, "linux"));
 });
 
-test("Equip updates observed installations through its store and preserves their original sources", async () => {
+test("Equip immediately adopts matching linked installations and preserves their original sources", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-nova-links-"));
   const target = join(root, "agent"), shared = join(root, "shared"), home = join(root, "state");
   await synchronize(desired([skill("one")]), [{ id: "codex", path: shared }], join(root, "seed"));
@@ -129,8 +163,10 @@ test("Equip updates observed installations through its store and preserves their
   const linked = skill("one");
   const receipts = await synchronize(desired([linked]), [{ id: "codex", path: target }], home);
   assert.equal(receipts[0].status, "synchronized");
-  assert.equal(receipts[0].managed, false);
+  assert.notEqual(receipts[0].managed, false);
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+  assert.equal(await realpath(join(target, "demo")), await realpath(join(home, "skills/demo")));
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
 
   const updated = skill("two", "r2");
   const updateReceipts = await synchronize(
@@ -143,15 +179,6 @@ test("Equip updates observed installations through its store and preserves their
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
   assert.equal(await readFile(join(shared, "demo/SKILL.md"), "utf8"), "one");
   assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
-  const backups = await import("node:fs/promises").then((fs) =>
-    fs.readdir(join(home, "backups")),
-  );
-  assert.equal(backups.length, 1);
-  assert.equal(
-    await readFile(join(home, "backups", backups[0], "SKILL.md"), "utf8"),
-    "one",
-  );
-
   await writeFile(join(target, "demo/SKILL.md"), "local work");
   const changed = skill("three", "r3");
   const conflict = await synchronize(
@@ -310,14 +337,7 @@ test("replacing an unknown-base canonical conflict keeps a recovery copy", async
     await readFile(join(target, "demo/SKILL.md"), "utf8"),
     "dashboard",
   );
-  const backups = await import("node:fs/promises").then((fs) =>
-    fs.readdir(join(home, "backups")),
-  );
-  assert.equal(backups.length, 1);
-  assert.equal(
-    await readFile(join(home, "backups", backups[0], "SKILL.md"), "utf8"),
-    "unknown local work",
-  );
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
 });
 
 test("later sync distinguishes an unchanged base from a divergent local edit", async () => {
@@ -365,7 +385,7 @@ test("later sync distinguishes an unchanged base from a divergent local edit", a
   );
 });
 
-test("replace backs up conflicts and removal deletes only unchanged owned installs", async () => {
+test("replace archives conflicts and removal deletes only unchanged owned installs", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");
   const home = join(root, "state");
@@ -576,6 +596,8 @@ test("journal recovery restores the last directory before retrying an interrupte
       stage,
       hadOld: true,
       revision: "r2",
+      skillId: "s1",
+      expectedFiles: { "SKILL.md": `420:${createHash("sha256").update("half-installed").digest("hex")}` },
     }),
   );
   const receipts = await synchronize(
@@ -588,6 +610,59 @@ test("journal recovery restores the last directory before retrying an interrupte
     await readFile(join(destination, "SKILL.md"), "utf8"),
     "local-before-crash",
   );
+});
+
+test("journal recovery archives unexpected destination edits before rollback", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-recovery-edit-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, "agent"), home = join(root, "state"), agents = [{ id: "codex", path: target }];
+  await synchronize(desired([skill("original")]), agents, home);
+  const destination = join(target, "demo"), oldPath = `${destination}.equip-old-test`;
+  await rename(destination, oldPath);
+  await mkdir(destination);
+  await writeFile(join(destination, "SKILL.md"), "unexpected local edit");
+  await writeFile(join(home, "transaction.json"), JSON.stringify({
+    destination, oldPath, stage: `${destination}.equip-stage-test`, hadOld: true,
+    revision: "r2", transactionId: "interrupted", skillId: "s1",
+    expectedFiles: { "SKILL.md": `420:${createHash("sha256").update("staged").digest("hex")}` },
+  }));
+  const archived: Array<{files:Array<{path:string;content:string}>}> = [];
+  const receipts = await synchronizeRaw(desired([skill("original")]), agents, home,
+    async payload => { archived.push(payload as typeof archived[number]); });
+  assert.equal(receipts[0].status, "synchronized");
+  assert.equal(archived[0].files.find(file => file.path === "SKILL.md")?.content, "unexpected local edit");
+  assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "original");
+
+  await rename(destination, oldPath);
+  await mkdir(destination);
+  await writeFile(join(destination, "SKILL.md"), "preserve without archive");
+  await writeFile(join(home, "transaction.json"), JSON.stringify({
+    destination, oldPath, stage: `${destination}.equip-stage-test`, hadOld: true,
+    revision: "r3", transactionId: "interrupted-again", skillId: "s1",
+    expectedFiles: { "SKILL.md": `420:${createHash("sha256").update("staged again").digest("hex")}` },
+  }));
+  await assert.rejects(synchronizeRaw(desired([skill("original")]), agents, home), /require recovery archiving/);
+  assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "preserve without archive");
+});
+
+test("legacy journal recovery preserves an unverifiable destination", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-legacy-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, "agent"), home = join(root, "state"), agents = [{ id: "codex", path: target }];
+  await synchronize(desired([skill("original")]), agents, home);
+  const destination = join(target, "demo"), oldPath = `${destination}.equip-old-test`;
+  await rename(destination, oldPath);
+  await mkdir(destination);
+  await writeFile(join(destination, "SKILL.md"), "unverifiable");
+  await writeFile(join(home, "transaction.json"), JSON.stringify({
+    destination, oldPath, stage: `${destination}.equip-stage-test`, hadOld: true, revision: "r2",
+  }));
+  await assert.rejects(
+    synchronizeRaw(desired([skill("original")]), agents, home, async () => {}),
+    /legacy skill update requires manual recovery/,
+  );
+  assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "unverifiable");
+  assert.ok(await lstat(join(home, "transaction.json")));
 });
 
 test("interrupted updates require the exact committed transaction even for shared paths or unchanged revisions", async () => {
@@ -618,6 +693,8 @@ test("interrupted updates require the exact committed transaction even for share
     await writeFile(join(home, "transaction.json"), JSON.stringify({
       destination, oldPath, stage: `${destination}.equip-stage-test`, hadOld: true,
       revision: incomingRevision, transactionId: "not-yet-committed",
+      skillId: "s1",
+      expectedFiles: { "SKILL.md": `420:${createHash("sha256").update("half-installed").digest("hex")}` },
     }));
     const receipts = await synchronize(desired([linked]), targets, home);
     assert.ok(receipts.every(receipt => receipt.status === "conflicted"));
@@ -683,7 +760,7 @@ test("first-connect symlink resolutions preserve its external target", async () 
   }
 });
 
-test("first-connect symlink replace backs up its pointer and contents without changing its target", async () => {
+test("first-connect symlink replace archives its contents without changing its target", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-linked-replace-"));
   const target = join(root, "agent");
   const external = join(root, "external");
@@ -708,20 +785,7 @@ test("first-connect symlink replace backs up its pointer and contents without ch
   assert.equal(replaced[0].status, "synchronized");
   assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "dashboard");
   assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "external local edit");
-  const backups = await import("node:fs/promises").then((fs) =>
-    fs.readdir(join(home, "backups")),
-  );
-  assert.equal(backups.length, 1);
-  assert.equal(
-    await readFile(join(home, "backups", backups[0], "contents/SKILL.md"), "utf8"),
-    "external local edit",
-  );
-  assert.equal(
-    JSON.parse(
-      await readFile(join(home, "backups", backups[0], "original-link.json"), "utf8"),
-    ).target,
-    external,
-  );
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
 
   const updated = await synchronize(
     { ...desired([skill("later", "r2")]), generation: 2 },
@@ -733,7 +797,7 @@ test("first-connect symlink replace backs up its pointer and contents without ch
   assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "external local edit");
 });
 
-test("replace reconciles a retargeted observed link and backs up its current pointer once", async t => {
+test("replace reconciles a retargeted managed link and archives its current contents once", async t => {
   const root = await mkdtemp(join(tmpdir(), "equip-observed-retarget-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const target = join(root, "agent"), original = join(root, "original"), external = join(root, "external"), home = join(root, "state");
@@ -745,7 +809,7 @@ test("replace reconciles a retargeted observed link and backs up its current poi
   }
   await symlink(original, join(target, "demo"));
   const agents = [{ id: "codex", path: target }];
-  assert.equal((await synchronize(desired([skill("one")]), agents, home))[0].managed, false);
+  assert.notEqual((await synchronize(desired([skill("one")]), agents, home))[0].managed, false);
   await rm(join(target, "demo"));
   await symlink(external, join(target, "demo"));
 
@@ -758,12 +822,7 @@ test("replace reconciles a retargeted observed link and backs up its current poi
   assert.notEqual(replaced[0].managed, false);
   assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
   assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "external edit");
-  const backups = await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups")));
-  assert.equal(backups.length, 2);
-  const linkedBackup = backups.find(folder => folder.includes("-linked-"));
-  assert.ok(linkedBackup);
-  assert.equal(await readFile(join(home, "backups", linkedBackup, "contents/SKILL.md"), "utf8"), "external edit");
-  assert.equal(JSON.parse(await readFile(join(home, "backups", linkedBackup, "original-link.json"), "utf8")).target, external);
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
 
   const repeated = await synchronize(
     { ...desired([skill("two", "r2")]), generation: 3 },
@@ -771,7 +830,7 @@ test("replace reconciles a retargeted observed link and backs up its current poi
     home,
   );
   assert.equal(repeated[0].status, "synchronized");
-  assert.equal(await (await import("node:fs/promises")).readdir(join(home, "backups")).then(items => items.length), 2);
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
 });
 
 test("replace reconciles a swapped managed link without changing its target", async t => {
@@ -803,12 +862,7 @@ test("replace reconciles a swapped managed link without changing its target", as
   assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
   assert.equal(await readFile(join(home, "skills/demo/SKILL.md"), "utf8"), "two");
   assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "swapped contents");
-  const backups = await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups")));
-  assert.equal(backups.length, 2);
-  const linkedBackup = backups.find(folder => folder.includes("-linked-"));
-  assert.ok(linkedBackup);
-  assert.equal(await readFile(join(home, "backups", linkedBackup, "contents/SKILL.md"), "utf8"), "swapped contents");
-  assert.equal(JSON.parse(await readFile(join(home, "backups", linkedBackup, "original-link.json"), "utf8")).target, external);
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
 });
 
 test("a canonical edit conflicts across profiles while resolutions stay isolated", async () => {
@@ -881,7 +935,7 @@ test("removal import preserves non-UTF8 bytes without NUL as base64", async () =
   );
 });
 
-test("removal replace backs up changed directory and removes it", async () => {
+test("removal replace archives a changed directory and removes it", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");
   const home = join(root, "state");
@@ -895,13 +949,69 @@ test("removal replace backs up changed directory and removes it", async () => {
   );
   assert.equal(receipts[0].status, "synchronized");
   await assert.rejects(readFile(join(target, "demo/SKILL.md")));
-  const backups = await import("node:fs/promises").then((fs) =>
-    fs.readdir(join(home, "backups")),
+  assert.deepEqual(await import("node:fs/promises").then(fs => fs.readdir(join(home, "backups"))).catch(() => []), []);
+});
+
+test("changed files are archived before replacement and archive failure preserves them", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-archive-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, "agent"), home = join(root, "state"), agents = [{ id: "codex", path: target }];
+  await synchronize(desired([skill("server")]), agents, home);
+  await writeFile(join(target, "demo/local.txt"), "local");
+  const archived: Array<{skillId:string; files:Array<{path:string;content:string}>; path?:string}> = [];
+  const removed = await synchronizeRaw(
+    { generation: 2, skills: [], resolutions: { "s1:codex::": "replace" } },
+    agents,
+    home,
+    async payload => { archived.push(payload as typeof archived[number]); },
   );
-  assert.equal(
-    await readFile(join(home, "backups", backups[0], "local.txt"), "utf8"),
-    "local",
+  assert.equal(removed[0].status, "synchronized");
+  assert.equal(archived.length, 1);
+  assert.equal(archived[0].skillId, "s1");
+  assert.equal(archived[0].files.find(file => file.path === "local.txt")?.content, "local");
+  assert.equal(archived[0].path, join(home, "skills/demo"));
+
+  await synchronize(desired([skill("server")]), agents, home);
+  await writeFile(join(target, "demo/local.txt"), "keep me");
+  const missing = await synchronizeRaw(
+    { generation: 3, skills: [], resolutions: { "s1:codex::": "replace" } },
+    agents,
+    home,
   );
+  assert.equal(missing[0].status, "failed");
+  assert.match(missing[0].message ?? "", /require recovery archiving/);
+  assert.equal(await readFile(join(target, "demo/local.txt"), "utf8"), "keep me");
+
+  const failed = await synchronizeRaw(
+    { generation: 3, skills: [], resolutions: { "s1:codex::": "replace" } },
+    agents,
+    home,
+    async () => { throw new Error("archive unavailable"); },
+  );
+  assert.equal(failed[0].status, "failed");
+  assert.match(failed[0].message ?? "", /archive unavailable/);
+  assert.equal(await readFile(join(target, "demo/local.txt"), "utf8"), "keep me");
+});
+
+test("replacement fails safely when changed files contain a nested symlink", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-archive-symlink-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, "agent"), home = join(root, "state"), external = join(root, "external");
+  const agents = [{ id: "codex", path: target }];
+  await synchronize(desired([skill("server")]), agents, home);
+  await writeFile(external, "external");
+  await symlink(external, join(target, "demo/local-link"));
+  let called = false;
+  const failed = await synchronizeRaw(
+    { generation: 2, skills: [], resolutions: { "s1:codex::": "replace" } },
+    agents,
+    home,
+    async () => { called = true; },
+  );
+  assert.equal(failed[0].status, "failed");
+  assert.match(failed[0].message ?? "", /symbolic link/);
+  assert.equal(called, false);
+  assert.equal(await readlink(join(target, "demo/local-link")), external);
 });
 
 test("target rules are per-device overrides while unspecified agents stay enabled", async () => {
@@ -999,7 +1109,7 @@ test("rename import releases modified old ownership before exclusion", async () 
   assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "local");
 });
 
-test("rename replace backs up modified old and occupied new folders", async () => {
+test("rename replace archives modified old and occupied new folders", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");
   const home = join(root, "state");
@@ -1026,15 +1136,7 @@ test("rename replace backs up modified old and occupied new folders", async () =
     await readFile(join(target, "renamed/SKILL.md"), "utf8"),
     "server",
   );
-  const backups = await fs.readdir(join(home, "backups"));
-  const contents = await Promise.all(
-    backups.map(async (folder) =>
-      readFile(join(home, "backups", folder, "local.txt"), "utf8").catch(
-        () => "",
-      ),
-    ),
-  );
-  assert.deepEqual(contents.sort(), ["new-local", "old-local"]);
+  assert.deepEqual(await fs.readdir(join(home, "backups")).catch(() => []), []);
 });
 
 test("an unchanged revision leaves the installed directory in place", async () => {
@@ -1088,7 +1190,7 @@ test("removal preserves a locally substituted symlink even when its contents mat
   assert.equal(await readFile(join(root, "local-work/SKILL.md"), "utf8"), "one");
 });
 
-test("releasing an observed link protects its preexisting canonical source from other managed removals", async () => {
+test("removing adopted links removes every managed destination and the unreferenced store", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-observed-canonical-"));
   const home = join(root, "state"), original = join(root, "original"), peer = join(root, "peer");
   await synchronize(desired([skill("one")]), [{ id: "codex", path: join(root, "seed-target") }], join(root, "seed"));
@@ -1099,8 +1201,8 @@ test("releasing an observed link protects its preexisting canonical source from 
   const targets = [{ id: "codex", path: original }, { id: "claude-code", path: peer }];
   assert.ok((await synchronize(desired([linked]), targets, home)).every(r => r.status === "synchronized"));
   await synchronize(desired([]), targets, home);
-  assert.equal((await lstat(join(original, "demo"))).isSymbolicLink(), true);
-  assert.equal(await readFile(join(original, "demo/SKILL.md"), "utf8"), "one");
+  await assert.rejects(lstat(join(original, "demo")), /ENOENT/);
+  assert.equal(await readFile(join(home, "skills/demo/SKILL.md"), "utf8").catch(() => "removed"), "removed");
   await assert.rejects(lstat(join(peer, "demo")), /ENOENT/);
 });
 
