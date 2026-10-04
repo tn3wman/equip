@@ -2266,7 +2266,13 @@ export async function createApp(
     res.set({ ETag: etag, "Cache-Control": "private, no-cache" });
     if (req.headers["if-none-match"] === etag) { res.status(304).end(); return; }
     const account = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
-    req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, account!.workspace));
+    const current = JSON.parse(account!.workspace);
+    // Devices need current revisions, not every historical bundle and draft.
+    for (const field of ["skills", "instructions"] as const) current[field] = (current[field] ?? [])
+      .filter((item: Skill | Instructions) => item.selected && item.enabled && item.revision)
+      .map((item: any) => ({...item,versions:[],draft:undefined,draftBundle:undefined,proposal:undefined}));
+    current.retiredSkills = []; current.retiredInstructions = [];
+    req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, JSON.stringify(current)));
     const skills = req
       .workspace!.skills.filter(
         (s) => s.selected && s.enabled && s.revision && s.files.length,

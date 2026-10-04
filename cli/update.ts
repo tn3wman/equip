@@ -94,7 +94,7 @@ export async function runNpmCommand(
     return exec(options.node ?? process.execPath, [executable, ...args], { timeout, env: options.env });
   if (os === "win32" && [".cmd", ".bat"].includes(extname(executable).toLowerCase())) {
     const quote = (value: string) => `"${value.replace(/%/g, "%%").replace(/"/g, '""')}"`;
-    const command = [quote(executable), ...args.map(quote)].join(" ");
+    const command = `"${[quote(executable), ...args.map(quote)].join(" ")}"`;
     return exec(options.env?.ComSpec || process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], {
       timeout,
       env: options.env,

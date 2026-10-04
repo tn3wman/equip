@@ -1531,6 +1531,7 @@ function Devices({
           });
           const visibleReceipts=filteredReceipts.slice(0,receiptLimit[device.id] ?? 25);
           const skillReceipts=device.receipts.filter(receipt=>receipt.kind!=="instructions");
+          const skillStates=workspace.skills.filter(skill=>skill.selected&&skill.enabled&&skill.revision).map(skill=>deployment(skill,[device])).filter(state=>state.total>0);
           const instructionReceipts=device.receipts.filter(receipt=>receipt.kind==="instructions");
           const status = deviceStatus(
             device,
@@ -1668,10 +1669,10 @@ function Devices({
                   </div>
                   <h3>Detected agents and skill folders</h3>
                   <div className="device-sync-summaries">
-                    <div><strong>Skill sync</strong><span>{skillReceipts.length ? `${skillReceipts.filter(receipt=>receipt.status==="synchronized").length} synchronized · ${skillReceipts.filter(receipt=>receipt.status==="conflicted").length} conflicts` : "Waiting for installation receipts"}</span></div>
-                    <div><strong>Native instructions</strong><span>{device.instructionUnavailable?.length ? `${device.instructionUnavailable.length} unavailable` : instructionReceipts.length ? `${instructionReceipts.filter(receipt=>receipt.status==="synchronized").length} synchronized` : "No instruction receipts yet"}</span></div>
+                    <div><strong>Skill sync</strong><span>{skillReceipts.length ? `${skillStates.filter(state=>state.status==="synchronized").length} / ${skillStates.length} skills at selected revision · ${skillReceipts.length} receipts` : "Waiting for installation receipts"}</span></div>
+                    <div><strong>Native instructions</strong><span>{device.instructionUnavailable?.length ? `${instructionReceipts.filter(receipt=>receipt.status==="synchronized").length} synchronized · ${device.instructionUnavailable.length} unavailable` : instructionReceipts.length ? `${instructionReceipts.filter(receipt=>receipt.status==="synchronized").length} synchronized` : "No instruction receipts yet"}</span></div>
                   </div>
-                  {!!device.instructionUnavailable?.length && <div className="instruction-limit-list"><strong>Instructions unavailable for these configurations</strong>{device.instructionUnavailable.map((item,index)=><div key={`${item.agent}:${item.profile}:${item.project}:${index}`}><span>{item.agent}{item.profile ? ` · ${item.profile}` : ""}{item.project ? ` · ${item.project}` : ""}</span><p>{item.reason}</p></div>)}</div>}
+                  {!!device.instructionUnavailable?.length && <details className="instruction-limit-list"><summary>Review unavailable instruction integrations</summary>{device.instructionUnavailable.map((item,index)=><div key={`${item.agent}:${item.profile}:${item.project}:${index}`}><span>{item.agent}{item.profile ? ` · ${item.profile}` : ""}{item.project ? ` · ${item.project}` : ""}</span><p>{item.reason}</p></div>)}</details>}
                   {agentEntries.slice(0,agentLimit[device.id] ?? 12).map(({group,agent}, index) => (
                     <div className="agent-location-group" key={`${group.id}:${agent.path}:${agent.profile ?? ""}:${agent.project ?? ""}`}>
                       <strong>{group.name}</strong>

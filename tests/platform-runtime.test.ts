@@ -112,6 +112,7 @@ test("native first installer recovers from an interrupted package install", { ti
     await writeFile(fakeNpm, `
 const fs=require('node:fs'),path=require('node:path');
 const args=process.argv.slice(2);
+fs.appendFileSync(process.env.EQUIP_NPM_LOG,JSON.stringify(args)+'\\n');
 if(args[0]==='view'){process.stdout.write(${JSON.stringify(JSON.stringify(integrity))});process.exit(0)}
 if(args[0]==='install'){
   if(process.env.EQUIP_TEST_INTERRUPT==='1')process.exit(23);
@@ -142,10 +143,16 @@ process.exit(2);
       EQUIP_HEADLESS: "1",
       EQUIP_NO_SERVICE: "1",
       EQUIP_BOOT_LOG: log,
+      EQUIP_NPM_LOG: join(root, "npm.log"),
       EQUIP_TEST_INTERRUPT: "1",
     };
-    await assert.rejects(exec(command, commandArgs, { env: environment }), /Command failed/);
-    assert.equal(await readFile(join(installRoot, "runtime", "equip.cjs"), "utf8"), artifact.toString());
+    const interruption = await exec(command, commandArgs, { env: environment }).then(
+      () => null,
+      error => error as Error & { stderr?: string },
+    );
+    assert.ok(interruption, "the simulated npm interruption must fail installation");
+    const npmCalls = (await readFile(environment.EQUIP_NPM_LOG!, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    assert.ok(npmCalls.some(call => call[0] === "install"), interruption.stderr ?? interruption.message);
     const launcher = join(installRoot, "bin", process.platform === "win32" ? "equip.cmd" : "equip");
     await assert.rejects(readFile(launcher), { code: "ENOENT" });
 

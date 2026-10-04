@@ -5,7 +5,7 @@
   font-synthesis: none;
   font-weight: 400;
   --ink: #26332b;
-  --muted: #737b72;
+  --muted: #687266;
   --border: #e3e7de;
   --green: #466734;
   --lime: #d4eaa1;
@@ -311,6 +311,7 @@ p {
   height: 18px;
   border-radius: 4px;
   background: #bed786;
+  color: #26332b;
 }
 .nav-dot {
   width: 5px;
@@ -1158,7 +1159,7 @@ kbd {
   border: 1px solid #e2e8d6;
   border-radius: 6px;
   font-size: 11px;
-  color: #718358;
+  color: #526c42;
   margin-bottom: 18px;
   line-height: 1.6;
 }
@@ -4800,3 +4801,7 @@ kbd {
 .conflict-merge-file p {font-size:13px;color:var(--muted,#53624b);line-height:1.6}
 .conflict-merge-file textarea {display:block;width:100%;min-height:220px;resize:vertical;font-family:var(--font-mono,monospace);font-size:12px;line-height:1.6;padding:14px;border:1px solid var(--border,#d9ded3);border-radius:6px;color:#293228;background:#fff}
 .conflict-merge-sides {display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+
+.instruction-limit-list summary { cursor: pointer; font-weight: 600; }
+
+.radio-option small { color: #526c42 !important; }
