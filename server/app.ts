@@ -1490,6 +1490,15 @@ export async function createApp(
         delete device.instructionResolutionChecks?.[key];
         return device;
       }
+      if (action === "import") {
+        if (!receipt.localFiles?.length)
+          throw httpError(400, "There are no local instructions to import.");
+        validateInstructionFiles(receipt.localFiles, "AGENTS.md");
+        const importedFiles = canonicalInstructionFiles(receipt.localFiles);
+        const importTarget = document ?? req.workspace!.instructions?.[0];
+        if (importTarget?.draft && !sameFiles(importTarget.draft, importedFiles))
+          throw httpError(409, "Publish or review the saved instruction draft before importing another local version.");
+      }
       device.instructionResolutions ??= {};
       device.instructionResolutionChecks ??= {};
       device.instructionResolutions[key] = action;
@@ -2219,27 +2228,33 @@ export async function createApp(
               ? receipt.status === "synchronized" && (!document || receipt.revision === document.revision)
               : receipt.status === "conflicted" && receipt.localFiles !== undefined && (!check || check === localRevision));
             if (!applied || receipt.status === "failed" || receipt.status === "offline") continue;
+            if (action === "import") {
+              try {
+                validateInstructionFiles(receipt.localFiles, "AGENTS.md");
+                const importedFiles = canonicalInstructionFiles(receipt.localFiles!);
+                const importTarget = document ?? req.workspace!.instructions?.[0];
+                if (importTarget?.draft && !sameFiles(importTarget.draft, importedFiles))
+                  throw httpError(409, "The saved instruction draft changed after this import was queued.");
+                if (importTarget) {
+                  importTarget.draft = importedFiles;
+                  importTarget.updatedAt = iso();
+                } else {
+                  req.workspace!.instructions!.push({
+                    id: id("instruction"), title: "Imported instructions", filename: "AGENTS.md",
+                    scope: "global", selected: true, enabled: true,
+                    revision: "", files: [], draft: importedFiles, versions: [], targets: [], updatedAt: iso(),
+                  });
+                }
+              } catch (error: any) {
+                resolutionErrors.push({ skillId: receipt.skillId, agent: receipt.agent, message: error.message });
+                continue;
+              }
+            }
             if (document && (action === "preserve" || action === "import")) {
               const existing = document.targets.find(target => target.deviceId === device.id && sameDestination(target, receipt));
               if (existing) existing.enabled = false;
               else document.targets.push({ deviceId: device.id, agent: receipt.agent, profile: receipt.profile,
                 project: receipt.project, enabled: false });
-            }
-            if (action === "import") {
-              try {
-                validateInstructionFiles(receipt.localFiles);
-                const importedFiles = canonicalInstructionFiles(receipt.localFiles!);
-                req.workspace!.instructions!.push({
-                  id: id("instruction"), title: `${document?.title ?? "Instructions"} local copy`, filename: "AGENTS.md",
-                  scope: "global", selected: true, enabled: true,
-                  revision: "", files: [], draft: importedFiles, versions: [],
-                  targets: [{ deviceId: device.id, agent: receipt.agent, profile: receipt.profile,
-                    project: receipt.project, enabled: false }], updatedAt: iso(),
-                });
-              } catch (error: any) {
-                resolutionErrors.push({ skillId: receipt.skillId, agent: receipt.agent, message: error.message });
-                continue;
-              }
             }
             delete device.instructionResolutions?.[key];
             delete device.instructionResolutionChecks?.[key];

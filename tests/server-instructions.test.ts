@@ -111,22 +111,64 @@ test("devices receive targeted instructions and publish reviewed local conflicts
   assert.equal(document.body.files[0].content, "Local\n");
   assert.equal(conflictReceipt.kind, "instructions");
 
+  const importLocal = files("AGENTS.md", "Import this local version\n");
+  const importLocalRevision = skillRevision(importLocal);
+  await call("/api/device/receipts", "POST", { generation: desired.body.generation, receipts: [{
+    kind: "instructions", skillId: created.body.id, agent: "claude-code", revision: document.body.revision,
+    status: "conflicted", timestamp: new Date().toISOString(), localFiles: importLocal,
+  }] }, auth);
+  const importQueued = await call(`/api/devices/${connected.id}/instructions/resolve`, "POST", {
+    instructionId: created.body.id, agent: "claude-code", action: "import",
+    expectedRevision: document.body.revision, expectedLocalRevision: importLocalRevision,
+  }, { cookie });
+  assert.equal(importQueued.response.status, 200);
+  await call(`/api/instructions/${created.body.id}`, "PATCH", {
+    draft: files("AGENTS.md", "Changed after queueing\n"), expectedRevision: document.body.revision,
+  }, { cookie });
+  await call("/api/device/receipts", "POST", { generation: desired.body.generation, receipts: [{
+    kind: "instructions", skillId: created.body.id, agent: "claude-code", revision: document.body.revision,
+    status: "conflicted", timestamp: new Date().toISOString(), localFiles: importLocal, instructionResolution: "import",
+  }] }, auth);
+  const blockedImport = await call(`/api/instructions/${created.body.id}`, "GET", undefined, { cookie });
+  assert.equal(blockedImport.body.draft[0].content, "Changed after queueing\n");
+  assert.equal(Object.values((await call("/api/device/desired", "GET", undefined, auth)).body.instructionResolutions)[0], "import");
+  await call(`/api/instructions/${created.body.id}`, "PATCH", {
+    draft: importLocal, expectedRevision: document.body.revision,
+  }, { cookie });
+  await call("/api/device/receipts", "POST", { generation: desired.body.generation, receipts: [{
+    kind: "instructions", skillId: created.body.id, agent: "claude-code", revision: document.body.revision,
+    status: "conflicted", timestamp: new Date().toISOString(), localFiles: importLocal, instructionResolution: "import",
+  }] }, auth);
+  const importedDocument = await call(`/api/instructions/${created.body.id}`, "GET", undefined, { cookie });
+  assert.equal(importedDocument.body.draft[0].content, "Import this local version\n");
+  assert.deepEqual(importedDocument.body.files, document.body.files);
+  assert.equal(importedDocument.body.revision, document.body.revision);
+  assert.equal(importedDocument.body.versions.length, document.body.versions.length);
+  await call(`/api/instructions/${created.body.id}`, "PATCH", {
+    draft: files("AGENTS.md", "A different saved draft\n"), expectedRevision: document.body.revision,
+  }, { cookie });
+  const rejectedImport = await call(`/api/devices/${connected.id}/instructions/resolve`, "POST", {
+    instructionId: created.body.id, agent: "claude-code", action: "import",
+    expectedRevision: document.body.revision, expectedLocalRevision: importLocalRevision,
+  }, { cookie });
+  assert.equal(rejectedImport.response.status, 409);
+
   const preserve = await call(`/api/devices/${connected.id}/instructions/resolve`, "POST", {
     instructionId: created.body.id, agent: "claude-code", action: "preserve",
-    expectedRevision: document.body.revision, expectedLocalRevision,
+    expectedRevision: document.body.revision, expectedLocalRevision: importLocalRevision,
   }, { cookie });
   assert.equal(preserve.response.status, 200);
   const queued = await call("/api/device/desired", "GET", undefined, auth);
   assert.equal(Object.values(queued.body.instructionResolutions)[0], "preserve");
   await call("/api/device/receipts", "POST", { generation: queued.body.generation, receipts: [{
     kind: "instructions", skillId: created.body.id, agent: "claude-code", revision: document.body.revision,
-    status: "conflicted", timestamp: new Date().toISOString(), localFiles: local,
+    status: "conflicted", timestamp: new Date().toISOString(), localFiles: importLocal,
   }] }, auth);
   const notYetApplied = await call("/api/device/desired", "GET", undefined, auth);
   assert.equal(Object.values(notYetApplied.body.instructionResolutions)[0], "preserve");
   await call("/api/device/receipts", "POST", { generation: queued.body.generation, receipts: [{
     kind: "instructions", skillId: created.body.id, agent: "claude-code", revision: document.body.revision,
-    status: "conflicted", timestamp: new Date().toISOString(), localFiles: local, instructionResolution: "preserve",
+    status: "conflicted", timestamp: new Date().toISOString(), localFiles: importLocal, instructionResolution: "preserve",
   }] }, auth);
   const preserved = await call("/api/device/desired", "GET", undefined, auth);
   assert.equal(preserved.body.instructions.length, 0);
@@ -134,13 +176,13 @@ test("devices receive targeted instructions and publish reviewed local conflicts
 
   await call(`/api/instructions/${created.body.id}`, "DELETE", undefined, { cookie });
   const removedResolution = await call(`/api/devices/${connected.id}/instructions/resolve`, "POST", {
-    instructionId: created.body.id, agent: "claude-code", action: "preserve", expectedLocalRevision,
+    instructionId: created.body.id, agent: "claude-code", action: "preserve", expectedLocalRevision: importLocalRevision,
   }, { cookie });
   assert.equal(removedResolution.response.status, 200);
   const removedQueued = await call("/api/device/desired", "GET", undefined, auth);
   await call("/api/device/receipts", "POST", { generation: removedQueued.body.generation, receipts: [{
     kind: "instructions", skillId: created.body.id, agent: "claude-code", revision: document.body.revision,
-    status: "conflicted", timestamp: new Date().toISOString(), localFiles: local, instructionResolution: "preserve",
+    status: "conflicted", timestamp: new Date().toISOString(), localFiles: importLocal, instructionResolution: "preserve",
   }] }, auth);
   assert.deepEqual((await call("/api/device/desired", "GET", undefined, auth)).body.instructionResolutions, {});
 });

@@ -56,7 +56,7 @@ export default function SkillConflict({
       ? "Local version published to Equip. Selected destinations are applying that revision; completion requires receipts."
       : queued === "preserve"
         ? "This computer will keep its local version and stop updates for this installation."
-        : "Equip will save the local files as a separate custom draft.";
+        : documentKind === "instructions" ? "Equip will save the local instructions as the global draft. Published instructions stay unchanged." : "Equip will save the local files as a separate custom draft.";
   const latestReceipt = device.receipts.find(item => item.skillId === receipt.skillId && item.agent === receipt.agent && item.profile === receipt.profile && item.project === receipt.project);
   const excluded = skill?.targets.some(target => target.deviceId === device.id && target.agent === receipt.agent && target.profile === receipt.profile && target.project === receipt.project && !target.enabled);
   const completed = Boolean(queued && (
@@ -156,7 +156,7 @@ export default function SkillConflict({
             <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("replace")}><strong>{skill ? "Use Equip version" : "Back up and remove"}</strong><span>{skill ? `Back up the local ${documentKind === "instructions" ? "file" : "folder"}, then replace it with Equip’s revision.` : `Equip removed this ${documentKind === "instructions" ? "document" : "skill"}. Back up local edits, then remove this managed installation.`}</span></button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length || !skill} onClick={() => void resolve("publish")}><strong>Use local version everywhere</strong><span>Publish this reviewed local {documentKind === "instructions" ? "file" : "folder snapshot"} to Equip and all selected destinations. Files on this computer are preserved.</span>{documentKind !== "instructions" && skill?.kind === "third-party" && <em>This becomes a custom fork. Automatic upstream updates turn off.</em>}</button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("preserve")}><strong>Keep local on this computer</strong><span>Create an exception here and stop updates for this {documentKind === "instructions" ? "file" : "installation"}.</span></button>
-            <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length} onClick={() => void resolve("import")}><strong>Save local as custom draft</strong><span>Keep the local work in Equip as a separate unpublished draft.</span></button>
+            <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length} onClick={() => void resolve("import")}><strong>{documentKind === "instructions" ? "Save local as global draft" : "Save local as custom draft"}</strong><span>{documentKind === "instructions" ? "Review this local copy in the global editor before publishing. Published instructions stay unchanged." : "Keep the local work in Equip as a separate unpublished draft."}</span></button>
           </div>
         )}
         {!receipt.localFiles?.length && <p className="conflict-note"><AlertTriangle size={14} /> Local file contents were not included in this receipt, so Equip cannot create a draft.</p>}
