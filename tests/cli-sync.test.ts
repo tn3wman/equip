@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp, chmod, readlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { DesiredState, Skill } from "../shared/types.ts";
 import { synchronize } from "../cli/sync.ts";
+import { sameFileHashes } from "../cli/file-state.ts";
 
 function skill(content: string, revision = "r1"): Skill {
   return {
@@ -37,6 +38,58 @@ const desired = (s: Skill[]): DesiredState => ({
   generation: 1,
   skills: s,
   resolutions: {},
+});
+
+test("same-content preexisting skill links ignore rw modes without altering the source", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-portable-link-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "original/demo"), target = join(root, "claude"), home = join(root, "state");
+  await mkdir(join(source, "scripts"), { recursive: true });
+  await mkdir(target);
+  await writeFile(join(source, "SKILL.md"), "one");
+  await writeFile(join(source, "scripts/run.sh"), "#!/bin/sh\n");
+  await chmod(join(source, "SKILL.md"), 0o664);
+  await chmod(join(source, "scripts/run.sh"), 0o775);
+  await symlink(source, join(target, "demo"));
+  const agent = [{ id: "claude-code", path: target }];
+  const receipts = await synchronize(desired([skill("one")]), agent, home);
+  assert.equal(receipts[0].status, "synchronized");
+  assert.equal(receipts[0].revision, "r1");
+  assert.equal(receipts[0].managed, false);
+  assert.equal(await readlink(join(target, "demo")), source);
+  assert.equal((await stat(join(source, "SKILL.md"))).mode & 0o777, 0o664);
+  assert.equal((await stat(join(source, "scripts/run.sh"))).mode & 0o777, 0o775);
+  await chmod(join(source, "SKILL.md"), 0o600);
+  assert.equal((await synchronize(desired([skill("two", "r2")]), agent, home))[0].status, "synchronized");
+  assert.equal(await readFile(join(source, "SKILL.md"), "utf8"), "one");
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
+});
+
+test("managed skill permission changes do not block sync, update, or removal; executable edits do", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-portable-managed-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, "agent"), home = join(root, "state"), agent = [{ id: "codex", path: target }];
+  await synchronize(desired([skill("one")]), agent, home);
+  await chmod(join(target, "demo/SKILL.md"), 0o600);
+  await chmod(join(target, "demo/scripts/run.sh"), 0o700);
+  assert.equal((await synchronize(desired([skill("one")]), agent, home))[0].status, "synchronized");
+  assert.equal((await synchronize(desired([skill("two", "r2")]), agent, home))[0].status, "synchronized");
+  await chmod(join(target, "demo/scripts/run.sh"), 0o644);
+  const conflicted = await synchronize(desired([skill("three", "r3")]), agent, home);
+  assert.equal(conflicted[0].status, "conflicted");
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
+  await chmod(join(target, "demo/scripts/run.sh"), 0o775);
+  assert.equal((await synchronize(desired([]), agent, home))[0].status, "synchronized");
+  assert.equal(await lstat(join(target, "demo")).catch(() => null), null);
+});
+
+test("legacy hash comparison preserves file kind and content and accounts for Windows permissions", () => {
+  const digest = createHash("sha256").update("same").digest("hex");
+  assert.ok(sameFileHashes({ file: `432:${digest}` }, { file: `420:${digest}` }, "linux"));
+  assert.ok(!sameFileHashes({ file: `493:${digest}` }, { file: `420:${digest}` }, "linux"));
+  assert.ok(sameFileHashes({ file: `438:${digest}` }, { file: `493:${digest}` }, "win32"));
+  assert.ok(!sameFileHashes({ file: `symlink:${digest}` }, { file: `420:${digest}` }, "linux"));
+  assert.ok(!sameFileHashes({ file: `420:${digest}` }, {}, "linux"));
 });
 
 test("Equip updates observed installations through its store and preserves their original sources", async () => {

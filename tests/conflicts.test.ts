@@ -13,7 +13,7 @@ test("review fingerprints match the server for UTF-8, binary, order and modes", 
   assert.equal(await reviewedFilesRevision([...files].reverse()), skillRevision(files));
 });
 
-test("conflict review compares complete bytes, permissions, additions and removals", () => {
+test("conflict review compares complete bytes, executable status, additions and removals", () => {
   const files = compareSkillFiles([
     { path: "same.txt", content: "identical" },
     { path: "SKILL.md", content: "local" },
@@ -34,6 +34,18 @@ test("conflict review compares complete bytes, permissions, additions and remova
   assert.equal(files[1].localText, undefined);
   assert.equal(files[4].contentChanged, false);
   assert.equal(files[4].modeChanged, true);
+});
+
+test("conflict review ignores read/write and executable class differences", () => {
+  const files = compareSkillFiles([
+    { path: "notes.md", content: "same", mode: 0o600 },
+    { path: "run.sh", content: "same", mode: 0o700 },
+  ], [
+    { path: "notes.md", content: "same", mode: 0o664 },
+    { path: "run.sh", content: "same", mode: 0o011 },
+  ]);
+
+  assert.deepEqual(files, []);
 });
 
 test("line comparison aligns insertions and retains both complete versions", () => {

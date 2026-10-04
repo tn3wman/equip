@@ -33,8 +33,8 @@ export default function SkillConflict({
     return () => { cancelled = true; };
   }, [skill?.id, documentKind]);
   const comparisons = useMemo(
-    () => skill && !equipSkill?.files.length ? [] : compareSkillFiles(receipt.localFiles || [], equipSkill?.files || []),
-    [receipt.localFiles, equipSkill?.files, skill?.id],
+    () => skill && !equipSkill?.files.length ? [] : compareSkillFiles(receipt.localFiles || [], equipSkill?.files || [], device.os !== "win32"),
+    [receipt.localFiles, equipSkill?.files, skill?.id, device.os],
   );
   const [selectedPath, setSelectedPath] = useState(comparisons[0]?.path);
   const [queued, setQueued] = useState<Resolution>();
@@ -47,7 +47,7 @@ export default function SkillConflict({
   const lines = allLines.slice(0, 1_500);
   const agent = device.agents.find((candidate) => candidate.id === receipt.agent);
   const scope = [agent?.name || receipt.agent, receipt.profile, receipt.project].filter(Boolean).join(" · ");
-  const permissionChanges = comparisons.filter((file) => file.modeChanged).length;
+  const executableChanges = comparisons.filter((file) => file.modeChanged).length;
   const contentChanges = comparisons.filter((file) => file.contentChanged).length;
   const comparisonReady = (!skill || Boolean(equipSkill?.files.length)) && !loadError;
   const queuedCopy = queued === "replace"
@@ -100,7 +100,7 @@ export default function SkillConflict({
           <div className="conflict-counts" aria-label="Conflict summary">
             <strong>{comparisons.length}</strong><span>changed {comparisons.length === 1 ? "file" : "files"}</span>
             <strong>{contentChanges}</strong><span>content</span>
-            <strong>{permissionChanges}</strong><span>permissions</span>
+            <strong>{executableChanges}</strong><span>executable status</span>
           </div>
         </header>
 
@@ -115,7 +115,7 @@ export default function SkillConflict({
                 onClick={() => setSelectedPath(file.path)}
               >
                 {file.status === "added" ? <FilePlus2 size={14} /> : file.status === "removed" ? <FileX2 size={14} /> : file.status === "permissions" ? <ShieldCheck size={14} /> : <FileCode2 size={14} />}
-                <span><strong>{file.path}</strong><small>{file.status === "added" ? "Only in Equip" : file.status === "removed" ? "Only on this computer" : file.status === "permissions" ? "Permissions differ" : file.modeChanged ? "Content and permissions differ" : "Content differs"}</small></span>
+                <span><strong>{file.path}</strong><small>{file.status === "added" ? "Only in Equip" : file.status === "removed" ? "Only on this computer" : file.status === "permissions" ? "Executable status differs" : file.modeChanged ? "Content and executable status differ" : "Content differs"}</small></span>
               </button>
             )) : <p className="conflict-empty">The file details are unavailable for this receipt.</p>}
           </nav>
@@ -124,7 +124,7 @@ export default function SkillConflict({
             <div className="conflict-pane-title">
               <span>{selected?.path || "No file selected"}</span>
               {selected?.binary && <span>Binary file</span>}
-              {selected?.modeChanged && <span>Local permissions {selected.local?.mode?.toString(8) || "644"} · Equip {selected.equip?.mode?.toString(8) || "644"}</span>}
+              {selected?.modeChanged && <span>Local {selected.local && (selected.local.mode ?? 0o644) & 0o111 ? "executable" : "not executable"} · Equip {selected.equip && (selected.equip.mode ?? 0o644) & 0o111 ? "executable" : "not executable"}</span>}
             </div>
             {selected?.binary && selected.contentChanged ? (
               <div className="binary-diff"><FileCode2 size={24} /><strong>Binary content differs</strong><p>Equip cannot show a line comparison. Choose a version below to keep its exact bytes.</p></div>
@@ -140,7 +140,7 @@ export default function SkillConflict({
                 {allLines.length > lines.length && <div className="diff-truncated">Showing the first 1,500 lines of this comparison.</div>}
               </div>
             ) : selected?.modeChanged ? (
-              <div className="permission-diff"><ShieldCheck size={22} /><strong>File permissions differ</strong><p>Local: <code>{selected.local?.mode?.toString(8) || "644"}</code> · Equip: <code>{selected.equip?.mode?.toString(8) || "644"}</code></p></div>
+              <div className="permission-diff"><ShieldCheck size={22} /><strong>Executable status differs</strong><p>Local: <code>{selected.local && (selected.local.mode ?? 0o644) & 0o111 ? "executable" : "not executable"}</code> · Equip: <code>{selected.equip && (selected.equip.mode ?? 0o644) & 0o111 ? "executable" : "not executable"}</code></p></div>
             ) : (
               <div className="binary-diff"><p>Select a changed file to inspect it.</p></div>
             )}

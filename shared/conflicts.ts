@@ -37,7 +37,7 @@ export async function reviewedFilesRevision(files: SkillFile[]) {
 }
 
 /** Changes are described from the local copy to Equip's selected version. */
-export function compareSkillFiles(local: SkillFile[], equip: SkillFile[]): FileComparison[] {
+export function compareSkillFiles(local: SkillFile[], equip: SkillFile[], compareExecutable = true): FileComparison[] {
   const left = new Map(local.map(file => [file.path, file]));
   const right = new Map(equip.map(file => [file.path, file]));
   const result: FileComparison[] = [];
@@ -45,7 +45,7 @@ export function compareSkillFiles(local: SkillFile[], equip: SkillFile[]): FileC
     const a = left.get(path), b = right.get(path);
     const aBytes = a ? bytes(a) : undefined, bBytes = b ? bytes(b) : undefined;
     const contentChanged = !aBytes || !bBytes || aBytes.length !== bBytes.length || aBytes.some((value, index) => value !== bBytes[index]);
-    const modeChanged = !!a && !!b && (a.mode ?? 0o644) !== (b.mode ?? 0o644);
+    const modeChanged = compareExecutable && !!a && !!b && Boolean((a.mode ?? 0o644) & 0o111) !== Boolean((b.mode ?? 0o644) & 0o111);
     if (!contentChanged && !modeChanged) continue;
     const localText = text(aBytes), equipText = text(bBytes);
     result.push({ path, local: a, equip: b, contentChanged, modeChanged,

@@ -1,9 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { parse } from "yaml";
 import type { DesiredState, SkillFile } from "../shared/types.ts";
-import { canonicalFiles, skillRevision } from "../shared/library.ts";
+import { skillRevision } from "../shared/library.ts";
+import { fileHashes, sameFileHashes, portableFilesRevision } from "./file-state.ts";
 import { collectSkillFiles } from "./library.ts";
 import type { AgentTarget } from "./sync.ts";
 
@@ -21,13 +22,7 @@ export async function localSkill(path: string) {
   return { name: metadata.name as string, files, sourcePath };
 }
 
-function hashes(files: SkillFile[]) {
-  return Object.fromEntries(files.map(f => [f.path, `${f.mode ?? 0o644}:${createHash("sha256").update(Buffer.from(f.content, f.encoding === "base64" ? "base64" : "utf8")).digest("hex")}`]));
-}
-function sameHashes(a: Record<string,string>, b: Record<string,string>) {
-  return Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(k => a[k] === b[k]);
-}
-type Seen = Record<string, { name: string; hash: string; revision: string }>;
+type Seen = Record<string, { name: string; hash: string; portableHash?: string; revision: string }>;
 
 /** Only scans explicit skill roots after the owner enables local publishing. */
 export async function syncLocalSkills(home: string, targets: AgentTarget[], desired: DesiredState, publish: PublishLocal) {
@@ -57,7 +52,7 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
       inspected.set(path, local);
       if (!known.has(local.name)) {
         const copies = newCopies.get(local.name) ?? new Set<string>();
-        copies.add(skillRevision(local.files));
+        copies.add(portableFilesRevision(local.files));
         newCopies.set(local.name, copies);
       }
     } catch (error) { errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`); }
@@ -75,10 +70,11 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
       const existing = known.get(local.name);
       if (existing?.kind === "third-party") continue;
       const hash = skillRevision(local.files);
+      const portableHash = portableFilesRevision(local.files);
       const prior = seen[path];
       const desiredSkill = desired.skills.find(s => s.name === local.name);
-      if (desiredSkill && canonicalFiles(desiredSkill.files) === canonicalFiles(local.files)) {
-        seen[path] = { name: local.name, hash, revision: desiredSkill.revision };
+      if (desiredSkill && sameFileHashes(fileHashes(desiredSkill.files), fileHashes(local.files))) {
+        seen[path] = { name: local.name, hash, portableHash, revision: desiredSkill.revision };
         continue;
       }
       // A baseline belongs to this physical copy. Another profile's ledger
@@ -89,18 +85,18 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
         if (entry.canonicalPath === path || await realpath(entry.path).catch(() => undefined) === path)
           entries.push(entry);
       }
-      if (existing && entries.some(e => sameHashes(e.files, hashes(local.files)))) {
-        seen[path] = { name: local.name, hash, revision: entries.find(e => sameHashes(e.files, hashes(local.files)))!.revision };
+      if (existing && entries.some(e => sameFileHashes(e.files, fileHashes(local.files)))) {
+        seen[path] = { name: local.name, hash, portableHash, revision: entries.find(e => sameFileHashes(e.files, fileHashes(local.files)))!.revision };
         continue;
       }
-      if (prior?.hash === hash) continue;
+      if (prior?.hash === hash || prior?.portableHash === portableHash) continue;
       if (published.has(local.name)) {
-        if (published.get(local.name) !== hash) errors.push(`${local.name}: different local copies need review.`);
+        if (published.get(local.name) !== portableHash) errors.push(`${local.name}: different local copies need review.`);
         continue;
       }
       const result = await publish({ ...local, baseRevision: existing ? entries[0]?.revision || prior?.revision : prior?.revision });
-      seen[path] = { name: local.name, hash, revision: result.revision };
-      published.set(local.name, hash);
+      seen[path] = { name: local.name, hash, portableHash, revision: result.revision };
+      published.set(local.name, portableHash);
       changed ||= result.changed;
     } catch (error) { errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`); }
   }

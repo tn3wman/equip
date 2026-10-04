@@ -4,12 +4,13 @@ import { dirname, join, relative, resolve } from 'node:path';
 import type { DesiredState, InstructionFilename, InstructionLocation, Instructions, Receipt, SkillFile } from '../shared/types.ts';
 import { skillRevision } from '../shared/library.ts';
 import { instructionEnabled, instructionKey } from '../shared/instructions.ts';
+import { portableFilesRevision } from './file-state.ts';
 import { discoverConfigurationRoots, type ProfileDiscoveryOptions } from './profiles.ts';
 import type { AgentTarget } from './sync.ts';
 
 const limit = 256 * 1024;
-interface Entry { skillId: string; agent: string; profile?: string; project?: string; path: string; filename: InstructionFilename; revision: string; hash: string; pointer?: string; observed?: boolean; originalBackup?: string; transaction?: string }
-interface Canonical { path: string; hash: string; revision: string; transaction?: string }
+interface Entry { skillId: string; agent: string; profile?: string; project?: string; path: string; filename: InstructionFilename; revision: string; hash: string; portableHash?: string; pointer?: string; observed?: boolean; originalBackup?: string; transaction?: string }
+interface Canonical { path: string; hash: string; portableHash?: string; revision: string; transaction?: string }
 interface Ledger { installs: Record<string, Entry>; canonicals: Record<string, Canonical> }
 interface Transaction { path: string; stage: string; old: string; hadOld: boolean; id: string; key: string; canonical?: boolean }
 const ledgerPath = (home: string) => join(home, 'instructions-ledger.json');
@@ -32,7 +33,7 @@ async function snapshot(path: string, filename: InstructionFilename) {
   if (data.length > limit || data.includes(0) || !Buffer.from(data.toString('utf8')).equals(data))
     throw new Error('Instructions must be UTF-8 text without NUL bytes; this file was preserved.');
   const files: SkillFile[] = [{path:filename, content:data.toString('utf8'), mode:resolved.mode & 0o777}];
-  return {exists:true, files, hash:skillRevision(files), pointer:info.isSymbolicLink() ? await readlink(path) : undefined};
+  return {exists:true, files, hash:skillRevision(files), portableHash:portableFilesRevision(files), pointer:info.isSymbolicLink() ? await readlink(path) : undefined};
 }
 
 export async function discoverInstructionLocations(targets: AgentTarget[], options: ProfileDiscoveryOptions & { autoDetect?: boolean } = {}): Promise<InstructionLocation[]> {
@@ -161,13 +162,15 @@ export async function syncLocalInstructions(home: string, locations: Instruction
       const entry = ledger.installs[instructionKey(doc.id,location)];
       try {
         const current = await snapshot(location.path,doc.filename);
-        if (!current.exists || current.hash === skillRevision(doc.files)) continue;
+        const desiredPortableHash = portableFilesRevision(doc.files);
+        if (!current.exists || current.portableHash === desiredPortableHash) continue;
         if (!entry || entry.revision !== doc.revision || current.pointer !== entry.pointer) unknown = true;
-        else if (current.hash !== entry.hash) candidates.push(current.files);
+        else if (entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash)
+          candidates.push(current.files);
       } catch (error) {errors.push((error as Error).message);unknown = true;}
     }
     if (!candidates.length) continue;
-    const hashes = new Set(candidates.map(skillRevision));
+    const hashes = new Set(candidates.map(portableFilesRevision));
     if (unknown || hashes.size > 1) {errors.push(`${doc.title}: different local versions need review.`);continue;}
     try {await publish({instructionId:doc.id,baseRevision:doc.revision,files:candidates[0]});changed = true;}
     catch (error) {errors.push(`${doc.title}: ${(error as Error).message}`);}
@@ -203,6 +206,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
       if (!targets.length) continue;
       const canonicalPath = join(home,'instructions',doc.id,doc.filename);
       const desiredHash = skillRevision(doc.files);
+      const desiredPortableHash = portableFilesRevision(doc.files);
       let currentCanonical;
       try {currentCanonical = await snapshot(canonicalPath,doc.filename);}
       catch (error) {
@@ -226,18 +230,20 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
       }))).some(Boolean);
       if (currentCanonical.exists && currentCanonical.pointer) {
         canonicalConflicts.set(doc.id,currentCanonical.files);
-      } else if (currentCanonical.exists && currentCanonical.hash !== desiredHash &&
-          (!previousCanonical || currentCanonical.hash !== previousCanonical.hash) && !replaceRequested) {
+      } else if (currentCanonical.exists && currentCanonical.portableHash !== desiredPortableHash &&
+          (!previousCanonical || (previousCanonical.portableHash
+            ? currentCanonical.portableHash !== previousCanonical.portableHash
+            : currentCanonical.hash !== previousCanonical.hash)) && !replaceRequested) {
         canonicalConflicts.set(doc.id,currentCanonical.files);
-      } else if (currentCanonical.hash !== desiredHash) {
+      } else if (currentCanonical.portableHash !== desiredPortableHash) {
         await mkdir(dirname(canonicalPath),{recursive:true});
         if (currentCanonical.exists) await backup(canonicalPath,home);
         const stage = canonicalPath + '.equip-stage-' + randomUUID();
         await writeFile(stage,doc.files[0].content,{mode:doc.files[0].mode ?? 0o644});
         await chmod(stage,doc.files[0].mode ?? 0o644);
-        await replaceFile(home,ledger,doc.id,canonicalPath,stage,{path:canonicalPath,hash:desiredHash,revision:doc.revision},true);
+        await replaceFile(home,ledger,doc.id,canonicalPath,stage,{path:canonicalPath,hash:desiredHash,portableHash:desiredPortableHash,revision:doc.revision},true);
       } else {
-        ledger.canonicals[doc.id] = {...previousCanonical,path:canonicalPath,hash:desiredHash,revision:doc.revision};
+        ledger.canonicals[doc.id] = {...previousCanonical,path:canonicalPath,hash:currentCanonical.hash,portableHash:desiredPortableHash,revision:doc.revision};
       }
       for (const location of targets) {
         const key = instructionKey(doc.id,location);
@@ -262,14 +268,16 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           if (canonicalConflict) {
             receipts.push({...base,revision:previous?.revision ?? '',status:'conflicted',message:'Equip instruction store changed locally and was preserved.',localFiles:canonicalConflict});continue;
           }
-          const currentDesired = current.hash === desiredHash;
+          const currentDesired = current.portableHash === desiredPortableHash;
           const samePointer = !previous || previous.path === location.path && previous.pointer === current.pointer;
-          const clean = previous && samePointer && current.hash === previous.hash;
+          const clean = previous && samePointer && (previous.portableHash
+            ? current.portableHash === previous.portableHash
+            : current.hash === previous.hash || currentDesired);
           if (current.exists && !currentDesired && (!clean || !samePointer) && action !== 'replace') {
             receipts.push({...base,revision:previous?.revision ?? '',status:'conflicted',managed:Boolean(previous && !previous.observed),message:previous ? 'Local instructions changed and were preserved.' : 'Preexisting instructions have no Equip baseline. Review which version to keep.',localFiles:current.files});continue;
           }
           const alreadyManaged = previous && !previous.observed && samePointer && currentDesired;
-          const entry: Entry = {...base,filename:doc.filename,revision:doc.revision,hash:desiredHash,pointer:current.pointer,originalBackup:previous?.originalBackup};
+          const entry: Entry = {...base,filename:doc.filename,revision:doc.revision,hash:current.hash,portableHash:desiredPortableHash,pointer:current.pointer,originalBackup:previous?.originalBackup};
           // Matching preexisting files can be adopted without choosing between
           // versions. Back up their original file/link and converge on one store.
           // Also migrate older workers' observed entries to managed links.
@@ -286,6 +294,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
               await cp(canonicalPath,stage);
             }
             entry.pointer = (await lstat(stage)).isSymbolicLink() ? await readlink(stage) : undefined;
+            entry.hash = desiredHash;
             await replaceFile(home,ledger,key,location.path,stage,entry);
           }
           ledger.installs[key] = entry;
@@ -310,8 +319,8 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         if (!current.exists || entry.observed || action === 'preserve' || action === 'import') {
           delete ledger.installs[key];
           receipts.push({...base,status:action === 'preserve' || action === 'import' ? 'conflicted' : 'synchronized',...(action ? {instructionResolution:action} : {}),localFiles:action ? current.files : undefined,message:'Released instructions; preexisting or preserved files retained.'});
-        } else if (current.hash === entry.hash && current.pointer === entry.pointer || action === 'replace') {
-          if (current.hash !== entry.hash || current.pointer !== entry.pointer) await backup(entry.path,home);
+        } else if ((entry.portableHash ? current.portableHash === entry.portableHash : current.hash === entry.hash) && current.pointer === entry.pointer || action === 'replace') {
+          if ((entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash) || current.pointer !== entry.pointer) await backup(entry.path,home);
           if (entry.originalBackup) {
             const stage = entry.path + '.equip-stage-' + randomUUID();
             const original = await json<{target?:string}>(join(entry.originalBackup,'original-link.json'),{});

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, lstat, readlink, realpath } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, lstat, readlink, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -94,6 +94,41 @@ test('optional local publishing requires known base and refuses divergent copies
  result=await syncLocalInstructions(state,[a],{...desired(v1),localSync:true},async p=>{calls++;assert.equal(p.baseRevision,v1.revision);assert.equal(p.files[0].content,'Local\n');});assert.equal(calls,1);assert.equal(result.changed,true);
 });
 
+test('local publishing accepts matching edits from managed copies with different read and write permissions',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));
+ const policy=doc();await synchronizeInstructions(desired(policy),[a,b],state);
+ await rm(a.path);await rm(b.path);await writeFile(a.path,'Shared edit\n',{mode:0o600});await writeFile(b.path,'Shared edit\n',{mode:0o664});
+ const ledgerPath=join(state,'instructions-ledger.json');const ledger=JSON.parse(await readFile(ledgerPath,'utf8'));
+ delete ledger.installs[instructionKey(policy.id,a)].pointer;delete ledger.installs[instructionKey(policy.id,b)].pointer;
+ await writeFile(ledgerPath,JSON.stringify(ledger));let calls=0;
+ const result=await syncLocalInstructions(state,[a,b],{...desired(policy),localSync:true},async payload=>{
+   calls++;assert.equal(payload.files[0].content,'Shared edit\n');
+ });
+ assert.equal(calls,1);assert.deepEqual(result,{changed:true,errors:[]});
+});
+
+test('read and write permission changes do not conflict or publish, while executable changes do',async t=>{
+ const {state,a}=await fixture(t);const policy=doc();await synchronizeInstructions(desired(policy),[a],state);
+ await chmod(a.path,0o600);let calls=0;
+ let result=await syncLocalInstructions(state,[a],{...desired(policy),localSync:true},async()=>{calls++;});
+ assert.equal(calls,0);assert.deepEqual(result,{changed:false,errors:[]});
+ let receipts=await synchronizeInstructions(desired(policy),[a],state);assert.equal(receipts[0].status,'synchronized');
+ await chmod(a.path,0o700);
+ result=await syncLocalInstructions(state,[a],{...desired(policy),localSync:true},async()=>{calls++;});
+ assert.equal(calls,1);assert.equal(result.changed,true);
+ receipts=await synchronizeInstructions(desired(policy),[a],state);assert.equal(receipts[0].status,'conflicted');
+});
+
+test('a legacy instruction baseline ignores only portable-equal permission changes',async t=>{
+ const {state,a}=await fixture(t);const policy=doc();await synchronizeInstructions(desired(policy),[a],state);
+ const ledgerPath=join(state,'instructions-ledger.json');const ledger=JSON.parse(await readFile(ledgerPath,'utf8'));
+ delete ledger.installs[instructionKey(policy.id,a)].portableHash;delete ledger.canonicals[policy.id].portableHash;
+ await writeFile(ledgerPath,JSON.stringify(ledger));await chmod(a.path,0o600);
+ let receipts=await synchronizeInstructions(desired(policy),[a],state);assert.equal(receipts[0].status,'synchronized');
+ await writeFile(a.path,'Real edit\n');receipts=await synchronizeInstructions(desired(policy),[a],state);
+ assert.equal(receipts[0].status,'conflicted');assert.equal(await readFile(a.path,'utf8'),'Real edit\n');
+});
+
 test('shadowing is reported as failed, and unsafe destinations remain untouched',async t=>{
  const {state,a}=await fixture(t);await writeFile(join(a.path,'../AGENTS.override.md'),'Override\n');let r=await synchronizeInstructions(desired(doc()),[a],state);assert.equal(r[0].status,'failed');assert.match(r[0].message!,/takes precedence/);
  await rm(a.path);await mkdir(a.path);r=await synchronizeInstructions(desired(doc('New\n')),[a],state);assert.equal(r[0].status,'failed');assert.ok((await stat(a.path)).isDirectory());
@@ -137,4 +172,12 @@ test('a reviewed replacement cannot overwrite a canonical edit made after the he
  a.localFiles=reviewed;await writeFile(a.path,'Newer unreviewed edit\n');const key=instructionKey(policy.id,a);
  const receipts=await synchronizeInstructions({...desired(policy,{[key]:'replace'}),instructionResolutionChecks:{[key]:skillRevision(reviewed)}},[a],state);
  assert.equal(receipts[0].status,'conflicted');assert.equal(await readFile(a.path,'utf8'),'Newer unreviewed edit\n');
+});
+
+test('review checks keep exact fingerprints when only permissions changed after review',async t=>{
+ const {state,a}=await fixture(t);const policy=doc();await writeFile(a.path,'Local edit\n',{mode:0o644});
+ const reviewed=(await synchronizeInstructions(desired(policy),[a],state))[0].localFiles!;
+ await chmod(a.path,0o600);const key=instructionKey(policy.id,a);
+ const receipts=await synchronizeInstructions({...desired(policy,{[key]:'replace'}),instructionResolutionChecks:{[key]:skillRevision(reviewed)}},[a],state);
+ assert.equal(receipts[0].status,'conflicted');assert.equal(await readFile(a.path,'utf8'),'Local edit\n');
 });

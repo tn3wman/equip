@@ -15,6 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { fileHashes, sameFileHashes } from "./file-state.ts";
 import type {
   DesiredState,
   Receipt,
@@ -146,22 +147,13 @@ async function snapshot(
   return { files, hashes };
 }
 function desiredHashes(files: SkillFile[]) {
-  const result: Record<string, string> = {};
-  for (const file of files) {
-    const data = Buffer.from(
-      file.content,
-      file.encoding === "base64" ? "base64" : "utf8",
-    );
-    result[file.path] = `${file.mode ?? 0o644}:${digest(data)}`;
-  }
-  return result;
+  return fileHashes(files);
 }
 function differs(
   current: Record<string, string>,
   owned?: Record<string, string>,
 ) {
-  const keys = new Set([...Object.keys(current), ...Object.keys(owned ?? {})]);
-  return [...keys].some((key) => current[key] !== owned?.[key]);
+  return !sameFileHashes(current, owned);
 }
 async function writeFiles(root: string, files: SkillFile[]) {
   for (const file of files) {

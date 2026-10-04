@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -54,6 +54,35 @@ async function localFolder(root: string, directory: string, name: string, body: 
   await writeFile(join(path, "SKILL.md"), contents(name, body));
   return path;
 }
+
+test("rw changes are neither local publications nor divergent copies, while executable edits publish", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-local-permissions-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), target = join(root, "codex");
+  const path = await localFolder(target, "demo", "demo", "# Same contents");
+  const remote = skill("demo", contents("demo", "# Same contents"), "published-r1");
+  const publications: LocalPublication[] = [];
+  const publish = async (p: LocalPublication) => { publications.push(p); return { id: remote.id, revision: "published-r2", changed: true }; };
+  await chmod(join(path, "SKILL.md"), 0o664);
+  await syncLocalSkills(home, [{ id: "codex", path: target }], desired([remote]), publish);
+  assert.equal(publications.length, 0);
+  await chmod(join(path, "SKILL.md"), 0o600);
+  await syncLocalSkills(home, [{ id: "codex", path: target }], desired([remote]), publish);
+  assert.equal(publications.length, 0);
+  await chmod(join(path, "SKILL.md"), 0o755);
+  await syncLocalSkills(home, [{ id: "codex", path: target }], desired([remote]), publish);
+  assert.equal(publications.length, 1);
+  await chmod(join(path, "SKILL.md"), 0o700);
+  await syncLocalSkills(home, [{ id: "codex", path: target }], desired([remote]), publish);
+  assert.equal(publications.length, 1);
+  const other = await localFolder(join(root, "claude"), "copy", "new-skill", "# Same new skill");
+  const first = await localFolder(target, "new-skill", "new-skill", "# Same new skill");
+  await chmod(join(first, "SKILL.md"), 0o600);
+  await chmod(join(other, "SKILL.md"), 0o664);
+  const result = await syncLocalSkills(home, [{ id: "codex", path: target }, { id: "claude-code", path: join(root, "claude") }], desired([remote]), publish);
+  assert.deepEqual(result.errors, []);
+  assert.equal(publications.filter(p => p.name === "new-skill").length, 1);
+});
 
 test("an unrelated profile ledger entry is not borrowed as the base for an unknown local copy", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "equip-local-reconcile-"));
