@@ -25,6 +25,7 @@ import { replaceExecutable } from "./update.ts";
 import { libraryImport } from "./library.ts";
 import { localSkill, syncLocalSkills } from "./local.ts";
 import { getDesired } from "./desired.ts";
+import { discoverInstructionLocations, synchronizeInstructions, syncLocalInstructions } from "./instructions.ts";
 
 const exec = promisify(execFile);
 const args = process.argv.slice(2);
@@ -301,6 +302,7 @@ async function runSync(s: State) {
         ...configuredTargets,
       ]);
   const targets = selected.map((t) => ({ ...t, deviceId: s.deviceId }));
+  const instructionLocations = await discoverInstructionLocations(targets, {home:agentHome, autoDetect:s.autoDetect});
   const base = s.server || server;
   await flushReceipts(s, base);
   // Remove state written by releases that treated a folder as a live authority.
@@ -310,6 +312,10 @@ async function runSync(s: State) {
     method: "POST", body: JSON.stringify(payload),
   }, s.token, base));
   if (local.changed) desiredBeforeLocal = await getDesired(equipHome, base, s.token);
+  const localInstructions = await syncLocalInstructions(equipHome, instructionLocations, desiredBeforeLocal, payload => request("/api/device/instructions/local", {
+    method:"POST", body:JSON.stringify(payload),
+  },s.token,base),s.deviceId);
+  if (localInstructions.changed) desiredBeforeLocal = await getDesired(equipHome,base,s.token);
   await request(
     "/api/device/heartbeat",
     {
@@ -319,7 +325,9 @@ async function runSync(s: State) {
         os: platform(),
         arch: process.arch,
         localSyncPath: join(equipHome, "skills"),
-        localSyncError: local.errors.join("\n"),
+        localSyncError: [...local.errors,...localInstructions.errors].join("\n"),
+        instructionLocations,
+        instructionUnavailable: targets.filter(t => !t.project && !instructionLocations.some(l => l.agent === t.id)).map(t => ({agent:t.id,reason:"No verified global instruction integration is available for this agent. Its skills continue to synchronize."})),
         agents: targets.map((t) => ({
           id: t.id,
           name: t.name ?? t.id,
@@ -333,7 +341,7 @@ async function runSync(s: State) {
     s.token,
     base,
   );
-  let desired = desiredBeforeLocal;
+  let desired = await getDesired(equipHome,base,s.token);
   if (desired.sourceRequests?.length) {
     for (const sourceRequest of desired.sourceRequests) {
       try {
@@ -376,6 +384,8 @@ async function runSync(s: State) {
             equipHome,
           )
         : [];
+    if (desired.disconnect === "remove") receipts.push(...await synchronizeInstructions(
+      {generation:desired.generation,skills:[],resolutions:{},instructions:[]},instructionLocations,equipHome,s.deviceId));
     await postReceipts(s, base, desired.generation, receipts);
     await request(
       "/api/device/disconnected",
@@ -388,10 +398,11 @@ async function runSync(s: State) {
     throw new Disconnected(`Disconnected (${desired.disconnect})`);
   }
   const receipts = await synchronize(desired, targets, equipHome);
+  receipts.push(...await synchronizeInstructions(desired,instructionLocations,equipHome,s.deviceId));
   await postReceipts(s, base, desired.generation, receipts);
   if (receipts.every((receipt) => receipt.status === "synchronized"))
     s.lastSync = new Date().toISOString();
-  s.lastError = local.errors.join("\n") || undefined;
+  s.lastError = [...local.errors,...localInstructions.errors].join("\n") || undefined;
   await saveWorkerFields(s, {
     lastSync: s.lastSync,
     lastError: s.lastError,

@@ -13,23 +13,25 @@ export default function SkillConflict({
   receipt,
   onClose,
   onResolve,
+  documentKind,
 }: {
   skill?: Skill;
   device: Device;
   receipt: Receipt;
   onClose: () => void;
   onResolve: (action: Resolution, expectedRevision?: string) => Promise<void>;
+  documentKind?: "instructions";
 }) {
   const [equipSkill, setEquipSkill] = useState(skill);
   const [loadError, setLoadError] = useState("");
   useEffect(() => {
     if (!skill || skill.files.length) return;
     let cancelled = false;
-    void api<Skill>(`/skills/${skill.id}`)
+    void api<Skill>(documentKind === "instructions" ? `/instructions/${skill.id}` : `/skills/${skill.id}`)
       .then((complete) => { if (!cancelled) setEquipSkill(complete); })
       .catch((error) => { if (!cancelled) setLoadError((error as Error).message); });
     return () => { cancelled = true; };
-  }, [skill?.id]);
+  }, [skill?.id, documentKind]);
   const comparisons = useMemo(
     () => skill && !equipSkill?.files.length ? [] : compareSkillFiles(receipt.localFiles || [], equipSkill?.files || []),
     [receipt.localFiles, equipSkill?.files, skill?.id],
@@ -49,7 +51,7 @@ export default function SkillConflict({
   const contentChanges = comparisons.filter((file) => file.contentChanged).length;
   const comparisonReady = (!skill || Boolean(equipSkill?.files.length)) && !loadError;
   const queuedCopy = queued === "replace"
-    ? "Equip will back up the local folder, then install its version."
+    ? `Equip will back up the local ${documentKind === "instructions" ? "file" : "folder"}, then install its version.`
     : queued === "publish"
       ? "Local version published to Equip. Selected destinations are applying that revision; completion requires receipts."
       : queued === "preserve"
@@ -78,14 +80,14 @@ export default function SkillConflict({
   };
 
   return (
-    <Dialog title="Review skill conflict" onClose={onClose} wide>
+    <Dialog title={`Review ${documentKind === "instructions" ? "instruction" : "skill"} conflict`} onClose={onClose} wide>
       <div className="conflict-dialog-body">
         <header className="conflict-summary">
           <div>
             <span className="conflict-kicker">{equipSkill?.title || receipt.skillId}</span>
             <h3>{device.name}</h3>
             <p>{scope || "Unknown agent location"}</p>
-            {agent?.aliases && agent.aliases.length > 1 && (
+              {documentKind !== "instructions" && agent?.aliases && agent.aliases.length > 1 && (
               <p>{agent.aliases.map((alias) => alias.profile).join(", ")} share this physical skill folder.</p>
             )}
           </div>
@@ -151,9 +153,9 @@ export default function SkillConflict({
           <div className="conflict-queued" role="status"><Check size={17} /><div><strong>{completed ? "Computer confirmed your choice" : queued === "publish" ? "Local version published" : "Choice queued for this computer"}</strong><p>{completed ? "This installation has reconciled. Other selected destinations report their progress in Computers." : `${queuedCopy} The conflict stays visible until the computer reports completion.`}</p></div></div>
         ) : (
           <div className="conflict-choices">
-            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("replace")}><strong>{skill ? "Use Equip version" : "Back up and remove"}</strong><span>{skill ? "Back up the local folder, then replace it with Equip’s revision." : "Equip removed this skill. Back up local edits, then remove this managed installation."}</span></button>
-            <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length || !skill} onClick={() => void resolve("publish")}><strong>Use local version everywhere</strong><span>Publish this reviewed local folder snapshot to Equip and all selected destinations. Files on this computer are preserved.</span>{skill?.kind === "third-party" && <em>This becomes a custom fork. Automatic upstream updates turn off.</em>}</button>
-            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("preserve")}><strong>Keep local on this computer</strong><span>Create an exception here and stop updates for this installation.</span></button>
+            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("replace")}><strong>{skill ? "Use Equip version" : "Back up and remove"}</strong><span>{skill ? `Back up the local ${documentKind === "instructions" ? "file" : "folder"}, then replace it with Equip’s revision.` : `Equip removed this ${documentKind === "instructions" ? "document" : "skill"}. Back up local edits, then remove this managed installation.`}</span></button>
+            <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length || !skill} onClick={() => void resolve("publish")}><strong>Use local version everywhere</strong><span>Publish this reviewed local {documentKind === "instructions" ? "file" : "folder snapshot"} to Equip and all selected destinations. Files on this computer are preserved.</span>{documentKind !== "instructions" && skill?.kind === "third-party" && <em>This becomes a custom fork. Automatic upstream updates turn off.</em>}</button>
+            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("preserve")}><strong>Keep local on this computer</strong><span>Create an exception here and stop updates for this {documentKind === "instructions" ? "file" : "installation"}.</span></button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length} onClick={() => void resolve("import")}><strong>Save local as custom draft</strong><span>Keep the local work in Equip as a separate unpublished draft.</span></button>
           </div>
         )}

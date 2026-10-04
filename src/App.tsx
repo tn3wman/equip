@@ -45,6 +45,7 @@ import {
   ChevronsUpDown,
   Layers,
   Loader2,
+  FileText,
 } from "lucide-react";
 import { api } from "./api";
 import {
@@ -71,6 +72,7 @@ import type {
 import { SafetyBadge } from "./Safety";
 import SkillConflict from "./SkillConflict";
 import { reviewedFilesRevision } from "../shared/conflicts";
+import { instructionsAsSkill } from "../shared/instructions";
 const lazyReloadKey = "equip:stale-chunk-reload";
 function lazyWithReload<T extends ComponentType<any>>(
   load: () => Promise<{ default: T }>,
@@ -95,10 +97,12 @@ function lazyWithReload<T extends ComponentType<any>>(
 }
 const SkillDetail = lazyWithReload(() => import("./SkillDetail"));
 const Editor = lazyWithReload(() => import("./Editor"));
+const InstructionsPage = lazyWithReload(() => import("./Instructions"));
 import { deployment, deviceStatus } from "./sync-state";
 
 const pages = [
   "library",
+  "instructions",
   "discover",
   "devices",
   "activity",
@@ -335,6 +339,7 @@ export default function App() {
           <div className="nav-section">Workspace</div>
           {[
             { id: "library", label: "Skill library", icon: BookOpen },
+            { id: "instructions", label: "Instructions", icon: FileText },
             { id: "discover", label: "Discover", icon: Compass },
             { id: "devices", label: "Computers", icon: Laptop },
             { id: "activity", label: "Activity", icon: ActivityIcon },
@@ -348,6 +353,8 @@ export default function App() {
               <span>{label}</span>
               {id === "library" ? (
                 <span className="nav-count">{selectedSkills.length}</span>
+              ) : id === "instructions" ? (
+                <span className="nav-count">{workspace.instructions?.filter((item) => item.selected).length ?? 0}</span>
               ) : id === "devices" ? (
                 <span className="nav-dot" />
               ) : null}
@@ -425,6 +432,8 @@ export default function App() {
                 ? "Skill editor"
                 : page === "library"
                   ? "Skill library"
+                  : page === "instructions"
+                    ? "Instructions"
                   : page === "devices"
                     ? "Computers"
                     : page.charAt(0).toUpperCase() + page.slice(1)}
@@ -473,6 +482,11 @@ export default function App() {
               connect={() => setConnect(true)}
               run={run}
             />
+          )}
+          {page === "instructions" && (
+            <Suspense fallback={<div className="catalog-loading"><Loader2 className="spin" size={20} />Opening instructions…</div>}>
+              <InstructionsPage workspace={workspace} refresh={refresh} notify={notify} />
+            </Suspense>
           )}
           {page === "discover" && (
             <Discover
@@ -997,6 +1011,7 @@ function Library({
                           device,
                           workspace.skills,
                           workspace.generation,
+                          workspace.instructions,
                         ) === "synchronized"
                         ? "Synced " + ago(device.lastSync)
                         : "Sync pending"
@@ -1454,6 +1469,7 @@ function Devices({
             device,
             workspace.skills,
             workspace.generation,
+            workspace.instructions,
           );
           const agentTypes = new Set(device.agents.map((agent) => agent.id)).size;
           const configurations = device.agents.reduce(
@@ -1600,7 +1616,7 @@ function Devices({
                         <div className="receipt-row" key={i}>
                           <span>
                             <strong>
-                              {workspace.skills.find((s) => s.id === r.skillId)
+                              {(r.kind === "instructions" ? workspace.instructions?.find((item) => item.id === r.skillId) : workspace.skills.find((s) => s.id === r.skillId))
                                 ?.title || r.skillId}
                             </strong>
                             <small>
@@ -1745,7 +1761,10 @@ function Devices({
       )}
       {conflict && (
         <SkillConflict
-          skill={workspace.skills.find((skill) => skill.id === conflict.receipt.skillId)}
+          skill={conflict.receipt.kind === "instructions"
+            ? (() => { const item = workspace.instructions?.find((instruction) => instruction.id === conflict.receipt.skillId); return item ? instructionsAsSkill(item) : undefined; })()
+            : workspace.skills.find((skill) => skill.id === conflict.receipt.skillId)}
+          documentKind={conflict.receipt.kind}
           device={workspace.devices.find(device => device.id === conflict.device.id) || conflict.device}
           receipt={conflict.receipt}
           onClose={() => setConflict(undefined)}
@@ -1756,8 +1775,8 @@ function Devices({
             await run(
               async () => {
                 try {
-                  await api(`/devices/${conflict.device.id}/resolve`, "POST", {
-                    skillId: conflict.receipt.skillId,
+                  await api(conflict.receipt.kind === "instructions" ? `/devices/${conflict.device.id}/instructions/resolve` : `/devices/${conflict.device.id}/resolve`, "POST", {
+                    ...(conflict.receipt.kind === "instructions" ? { instructionId: conflict.receipt.skillId } : { skillId: conflict.receipt.skillId }),
                     agent: conflict.receipt.agent,
                     profile: conflict.receipt.profile,
                     project: conflict.receipt.project,

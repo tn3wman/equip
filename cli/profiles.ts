@@ -20,7 +20,7 @@ export interface ProfileDiscoveryOptions {
   t3SettingsPath?: string;
 }
 
-const profileAgents = [
+const profileAgents: Array<{id: "claude-code" | "codex"; prefix: string; variable: "CLAUDE_CONFIG_DIR" | "CODEX_HOME"}> = [
   {
     id: "claude-code",
     prefix: ".claude",
@@ -112,6 +112,44 @@ async function t3Profiles(home: string, settingsPath: string) {
   return profiles;
 }
 
+export interface ConfigurationRoot {
+  id: "claude-code" | "codex";
+  root: string;
+  profile?: string;
+}
+
+/** Config roots are independent of skill roots, which profiles may share. */
+export async function discoverConfigurationRoots(options: ProfileDiscoveryOptions = {}): Promise<ConfigurationRoot[]> {
+  const home = resolve(options.home ?? homedir());
+  const environment = options.environment ?? (options.home ? {} : process.env);
+  const [entries, configuredProfiles] = await Promise.all([
+    readdir(home, { withFileTypes: true }).catch(() => []),
+    t3Profiles(home, options.t3SettingsPath ?? join(home, ".t3/userdata/settings.json")),
+  ]);
+  const result: ConfigurationRoot[] = [];
+  for (const specification of profileAgents) {
+    const defaultRoot = resolve(environment[specification.variable]?.trim() || join(home, specification.prefix));
+    const roots = [
+      { root: defaultRoot, profile: profileName(specification.prefix, defaultRoot) },
+      // Keep the default home when a process uses a custom configuration root.
+      { root: join(home, specification.prefix), profile: "default" },
+      ...entries.filter(entry => conventionalProfileName(specification.prefix, entry.name))
+        .map(entry => ({ root: join(home, entry.name), profile: profileName(specification.prefix, join(home, entry.name)) })),
+      ...configuredProfiles.filter(profile => profile.id === specification.id),
+    ];
+    const seen = new Set<string>();
+    for (const candidate of roots) {
+      if (!(await directory(candidate.root))) continue;
+      const canonical = await physical(candidate.root);
+      if (seen.has(canonical)) continue;
+      seen.add(canonical);
+      result.push({ id: specification.id, root: candidate.root,
+        ...(resolve(candidate.root) === defaultRoot ? {} : { profile: candidate.profile }) });
+    }
+  }
+  return result;
+}
+
 /** Detects each physical CLI configuration root without reading its contents. */
 export async function discoverAgentProfiles(
   options: ProfileDiscoveryOptions = {},
@@ -134,7 +172,7 @@ export async function discoverAgentProfiles(
       options.t3SettingsPath ?? join(home, ".t3/userdata/settings.json"),
     ),
   ]);
-  const specializedIds = new Set(profileAgents.map((agent) => agent.id));
+  const specializedIds = new Set<string>(profileAgents.map((agent) => agent.id));
   const result: DetectedAgentProfile[] = detected.filter(
     (agent) => !specializedIds.has(agent.id),
   );

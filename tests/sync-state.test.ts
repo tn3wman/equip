@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deployment, deviceStatus } from "../src/sync-state.ts";
-import type { Device, Skill } from "../shared/types.ts";
+import type { Device, Instructions, Skill } from "../shared/types.ts";
 const skill = {
   id: "skill",
   name: "skill",
@@ -108,4 +108,25 @@ test("completed disconnections no longer count as deployment destinations", () =
     complete: 1,
     total: 1,
   });
+});
+
+test("published instructions keep older workers pending until locations are reported", () => {
+  const instructions = {
+    id: "instructions",
+    filename: "AGENTS.md",
+    scope: "global",
+    selected: true,
+    enabled: true,
+    revision: "instruction-r1",
+    versions: [{ revision: "instruction-r1" }],
+    targets: [],
+  } as unknown as Instructions;
+  assert.equal(deviceStatus(device, [skill], 2, [instructions]), "pending");
+  assert.equal(deviceStatus({ ...device, instructionLocations: [] }, [skill], 2, [instructions]), "synchronized");
+  const capable = {
+    ...device,
+    instructionLocations: [{ agent: "codex", filename: "AGENTS.md" as const, path: "/config/AGENTS.md" }],
+    receipts: [...device.receipts, { ...receipt, kind: "instructions" as const, skillId: "instructions", revision: "instruction-r1" }],
+  };
+  assert.equal(deviceStatus(capable, [skill], 2, [instructions]), "synchronized");
 });

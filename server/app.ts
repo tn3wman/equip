@@ -16,6 +16,8 @@ import type {
   SkillSafety,
   DiscoveryView,
   Device,
+  InstructionLocation,
+  Instructions,
   Receipt,
   Skill,
   SkillFile,
@@ -23,6 +25,7 @@ import type {
   Target,
   Workspace,
 } from "../shared/types.ts";
+import { instructionEnabled, instructionKey } from "../shared/instructions.ts";
 import { discoverSkills, fetchSkillSafety } from "../shared/discovery.ts";
 import { skillArchive } from "../shared/archive.ts";
 import { demoCatalog } from "./catalog.ts";
@@ -199,6 +202,7 @@ function emptyWorkspace(name: string, email: string): Workspace {
     email,
     demo: false,
     skills: [],
+    instructions: [],
     devices: [],
     activity: [],
     generation: 0,
@@ -221,6 +225,21 @@ function parseWorkspace(value: string): Workspace {
   const workspace: Workspace & { librarySource?: unknown } = JSON.parse(value);
   let migrated = Boolean(workspace.librarySource);
   delete workspace.librarySource;
+  workspace.instructions ??= [];
+  for (const document of workspace.instructions) {
+    if (document.filename === "AGENTS.md" && document.scope === "global") continue;
+    document.filename = "AGENTS.md";
+    document.scope = "global";
+    const normalize = (files: SkillFile[]) => files.map(file => ({ ...file, path: "AGENTS.md" }));
+    document.files = normalize(document.files);
+    if (document.draft) document.draft = normalize(document.draft);
+    document.versions = document.versions.map(version => {
+      const files = normalize(version.files);
+      return { ...version, files, revision: revision(files) };
+    });
+    if (document.files.length) document.revision = revision(document.files);
+    migrated = true;
+  }
   for (const skill of workspace.skills) {
     const legacy = skill as Skill & { librarySourceId?: string };
     if (legacy.librarySourceId) migrated = true;
@@ -270,6 +289,7 @@ function validateReceipts(receipts: unknown): asserts receipts is Receipt[] {
   for (const receipt of receipts) {
     if (
       !receipt ||
+      (receipt.kind !== undefined && receipt.kind !== "instructions") ||
       typeof receipt.skillId !== "string" ||
       typeof receipt.agent !== "string" ||
       typeof receipt.revision !== "string" ||
@@ -279,10 +299,83 @@ function validateReceipts(receipts: unknown): asserts receipts is Receipt[] {
     )
       throw httpError(400, "A receipt has invalid fields.");
     if (receipt.localFiles !== undefined)
-      validateFileEntries(receipt.localFiles);
+      receipt.kind === "instructions"
+        ? validateInstructionReceiptFiles(receipt.localFiles)
+        : validateFileEntries(receipt.localFiles);
     if (receipt.managed !== undefined && typeof receipt.managed !== "boolean")
       throw httpError(400, "A receipt has invalid managed state.");
   }
+}
+
+function validateInstructionFiles(files: unknown, filename?: unknown): asserts files is SkillFile[] {
+  if (!Array.isArray(files) || files.length !== 1)
+    throw httpError(400, "Instructions require exactly one file.");
+  const file = files[0] as SkillFile;
+  if (!file || (file.path !== "CLAUDE.md" && file.path !== "AGENTS.md") ||
+      (filename !== undefined && file.path !== filename) || typeof file.content !== "string" ||
+      file.encoding !== undefined || file.content.includes("\0") ||
+      (file.mode !== undefined && (!Number.isInteger(file.mode) || file.mode < 0 || file.mode > 0o777)))
+    throw httpError(400, "Instructions must be one plain UTF-8 CLAUDE.md or AGENTS.md file.");
+  if (Buffer.byteLength(file.content, "utf8") > 256 * 1024)
+    throw httpError(413, "Instructions exceed the 256 KiB limit.");
+}
+
+function validateInstructionReceiptFiles(files: unknown, filename?: unknown): asserts files is SkillFile[] {
+  if (Array.isArray(files) && files.length === 0) return;
+  validateInstructionFiles(files, filename);
+}
+
+function canonicalInstructionFiles(files: SkillFile[]): SkillFile[] {
+  return files.map(file => ({ ...file, path: "AGENTS.md" }));
+}
+
+function validateInstructionLocations(value: unknown): InstructionLocation[] {
+  if (!Array.isArray(value) || value.length > 200)
+    throw httpError(400, "instructionLocations must be an array of at most 200 locations.");
+  const valid = (item: unknown, limit: number) => typeof item === "string" && item.length > 0 && item.length <= limit;
+  return value.map((raw: any) => {
+    if (!raw || !valid(raw.agent, 120) || !valid(raw.path, 2048) ||
+        typeof raw.filename !== "string" || raw.filename.length > 255 ||
+        !/^[^/\\\0]+\.md$/i.test(raw.filename) || raw.filename === ".md" ||
+        (raw.profile !== undefined && !valid(raw.profile, 200)) ||
+        (raw.project !== undefined && !valid(raw.project, 2048)) ||
+        (raw.warning !== undefined && typeof raw.warning !== "string"))
+      throw httpError(400, "An instruction location has invalid fields.");
+    if (raw.localFiles !== undefined) validateInstructionReceiptFiles(raw.localFiles, "AGENTS.md");
+    return {
+      agent: raw.agent, filename: raw.filename, path: raw.path,
+      ...(raw.profile ? { profile: raw.profile } : {}),
+      ...(raw.project ? { project: raw.project } : {}),
+      ...(raw.warning ? { warning: raw.warning.slice(0, 1000) } : {}),
+      ...(raw.localFiles ? { localFiles: clone(raw.localFiles) } : {}),
+    };
+  });
+}
+
+function validateInstructionUnavailable(value: unknown) {
+  if (!Array.isArray(value) || value.length > 100)
+    throw httpError(400, "instructionUnavailable must be an array of at most 100 entries.");
+  return value.map((raw: any) => {
+    if (!raw || typeof raw.agent !== "string" || !raw.agent || raw.agent.length > 120 ||
+        typeof raw.reason !== "string" || !raw.reason || raw.reason.length > 1000)
+      throw httpError(400, "An unavailable instruction adapter has invalid fields.");
+    return { agent: raw.agent, reason: raw.reason };
+  });
+}
+
+function validateInstructionTargets(value: unknown): Target[] {
+  if (!Array.isArray(value) || value.length > 500)
+    throw httpError(400, "targets must be an array of at most 500 targets.");
+  return value.map((raw: any) => {
+    if (!raw || typeof raw.deviceId !== "string" || !raw.deviceId ||
+        raw.deviceId.length > 200 || typeof raw.agent !== "string" || !raw.agent || raw.agent.length > 120 ||
+        typeof raw.enabled !== "boolean" ||
+        (raw.profile !== undefined && (typeof raw.profile !== "string" || !raw.profile || raw.profile.length > 200)) ||
+        (raw.project !== undefined && (typeof raw.project !== "string" || !raw.project || raw.project.length > 2048)))
+      throw httpError(400, "An instruction target has invalid fields.");
+    return { deviceId: raw.deviceId, agent: raw.agent, enabled: raw.enabled,
+      ...(raw.profile ? { profile: raw.profile } : {}), ...(raw.project ? { project: raw.project } : {}) };
+  });
 }
 
 function validateAgents(agents: unknown): asserts agents is Device["agents"] {
@@ -735,6 +828,11 @@ export async function createApp(
         skill.draft = undefined;
         skill.versions = skill.versions.map(version => ({ ...version, files: [] }));
       }
+    if (req.query.view === "dashboard")
+      for (const document of workspace.instructions ?? []) {
+        document.draft = undefined;
+        document.versions = document.versions.map(version => ({ ...version, files: [] }));
+      }
     res.json(workspace);
   });
 
@@ -869,6 +967,136 @@ export async function createApp(
     if (!skill) throw httpError(404, "Skill not found.");
     return skill;
   };
+  const findInstructions = (req: AuthedRequest) => {
+    const document = (req.workspace!.instructions ?? []).find(item => item.id === req.params.id);
+    if (!document) throw httpError(404, "Instructions not found.");
+    return document;
+  };
+  const guardInstructionRevision = (document: Instructions, expected: unknown) => {
+    if (expected !== undefined && expected !== document.revision)
+      throw httpError(409, "The Equip revision changed. Review the instructions again.");
+  };
+
+  app.get("/api/instructions/:id", auth(true), (req: AuthedRequest, res, next) => {
+    try { res.json(findInstructions(req)); } catch (error) { next(error); }
+  });
+  app.post("/api/instructions", ...mutate((req) => {
+    const { title, filename, scope, files } = req.body ?? {};
+    if (typeof title !== "string" || !title.trim() || title.length > 200)
+      throw httpError(400, "title must be 1–200 characters.");
+    if (filename !== "AGENTS.md") throw httpError(400, "filename must be AGENTS.md.");
+    if (scope !== "global") throw httpError(400, "scope must be global.");
+    validateInstructionFiles(files, filename);
+    const document: Instructions = {
+      id: id("instruction"), title: title.trim(), filename, scope,
+      selected: true, enabled: true, revision: "", files: [], draft: clone(files),
+      versions: [], targets: [], updatedAt: iso(),
+    };
+    req.workspace!.instructions!.push(document);
+    return document;
+  }));
+  app.patch("/api/instructions/:id", ...mutate((req) => {
+    const document = findInstructions(req);
+    guardInstructionRevision(document, req.body?.expectedRevision);
+    if (req.body?.title !== undefined) {
+      if (typeof req.body.title !== "string" || !req.body.title.trim() || req.body.title.length > 200)
+        throw httpError(400, "title must be 1–200 characters.");
+      document.title = req.body.title.trim();
+    }
+    if (req.body?.draft !== undefined) {
+      validateInstructionFiles(req.body.draft, document.filename);
+      document.draft = clone(req.body.draft);
+    }
+    if (req.body?.enabled !== undefined) {
+      if (typeof req.body.enabled !== "boolean") throw httpError(400, "enabled must be a boolean.");
+      if (req.body.enabled && document.revision && (req.workspace!.instructions ?? []).some(other =>
+        other.id !== document.id && other.enabled && other.revision))
+        throw httpError(409, "Published global instructions already exist.");
+      document.enabled = req.body.enabled;
+      bump(req.workspace!);
+    }
+    if (req.body?.targets !== undefined) {
+      document.targets = validateInstructionTargets(req.body.targets);
+      bump(req.workspace!);
+    }
+    document.updatedAt = iso();
+    return document;
+  }));
+  app.post("/api/instructions/:id/publish", ...mutate((req) => {
+    const document = findInstructions(req);
+    guardInstructionRevision(document, req.body?.expectedRevision);
+    const files = clone(req.body?.files ?? document.draft ?? document.files);
+    validateInstructionFiles(files, document.filename);
+    if (document.enabled && (req.workspace!.instructions ?? []).some(other =>
+      other.id !== document.id && other.enabled && other.revision))
+      throw httpError(409, "Published global instructions already exist.");
+    const rev = revision(files);
+    document.files = files;
+    document.revision = rev;
+    document.draft = undefined;
+    document.updatedAt = iso();
+    document.versions.unshift({ id: id("version"), revision: rev, createdAt: iso(),
+      message: typeof req.body?.message === "string" ? req.body.message : "Published", files: clone(files) });
+    bump(req.workspace!);
+    activity(req.workspace!, { type: "publish", title: `${document.title} published`,
+      description: `Revision ${rev} is ready for devices.`, status: "pending", skillId: document.id });
+    return document;
+  }));
+  app.post("/api/instructions/:id/rollback", ...mutate((req) => {
+    const document = findInstructions(req);
+    guardInstructionRevision(document, req.body?.expectedRevision);
+    const version = document.versions.find(item => item.id === req.body?.versionId);
+    if (!version) throw httpError(404, "Version not found.");
+    validateInstructionFiles(version.files, document.filename);
+    document.files = clone(version.files);
+    document.revision = version.revision;
+    document.draft = undefined;
+    document.updatedAt = iso();
+    document.versions.unshift({ id: id("version"), revision: version.revision, createdAt: iso(),
+      message: `Rolled back to ${version.revision}`, files: clone(version.files) });
+    bump(req.workspace!);
+    return document;
+  }));
+  app.delete("/api/instructions/:id", ...mutate((req) => {
+    const index = req.workspace!.instructions!.findIndex(item => item.id === req.params.id);
+    if (index < 0) throw httpError(404, "Instructions not found.");
+    req.workspace!.instructions!.splice(index, 1);
+    for (const device of req.workspace!.devices) {
+      device.instructionResolutions = Object.fromEntries(Object.entries(device.instructionResolutions ?? {})
+        .filter(([key]) => !key.startsWith(`${req.params.id}:`)));
+      device.instructionResolutionChecks = Object.fromEntries(Object.entries(device.instructionResolutionChecks ?? {})
+        .filter(([key]) => !key.startsWith(`${req.params.id}:`)));
+    }
+    bump(req.workspace!);
+    return { ok: true };
+  }));
+  app.post("/api/instructions/import", ...mutate((req) => {
+    const device = req.workspace!.devices.find(item => item.id === req.body?.deviceId && !item.disconnectedAt);
+    if (!device) throw httpError(404, "Device not found.");
+    const location = (device.instructionLocations ?? []).find(item => item.path === req.body?.path);
+    if (!location?.localFiles) throw httpError(404, "Reviewed local instructions were not found.");
+    if (req.body?.expectedLocalRevision !== revision(location.localFiles))
+      throw httpError(409, "The device instructions changed. Review them again.");
+    validateInstructionFiles(location.localFiles, "AGENTS.md");
+    const importedFiles = canonicalInstructionFiles(location.localFiles);
+    if (req.body?.instructionId !== undefined) {
+      const document = (req.workspace!.instructions ?? []).find(item => item.id === req.body.instructionId);
+      if (!document) throw httpError(404, "Instructions not found.");
+      if (typeof req.body?.expectedRevision !== "string")
+        throw httpError(400, "Importing into existing instructions requires the reviewed Equip revision.");
+      guardInstructionRevision(document, req.body.expectedRevision);
+      document.draft = importedFiles;
+      document.updatedAt = iso();
+      return document;
+    }
+    if (req.workspace!.instructions!.length)
+      throw httpError(409, "Choose the global instructions document and review its current revision before importing.");
+    const document: Instructions = { id: id("instruction"), title: `Instructions from ${device.name}`,
+      filename: "AGENTS.md", scope: "global", selected: true, enabled: true,
+      revision: "", files: [], draft: importedFiles, versions: [], targets: [], updatedAt: iso() };
+    req.workspace!.instructions!.push(document);
+    return document;
+  }));
   app.get("/api/skills/:id", auth(true), (req: AuthedRequest, res, next) => {
     try { res.json(findSkill(req)); } catch (error) { next(error); }
   });
@@ -1219,6 +1447,58 @@ export async function createApp(
   );
 
   app.post(
+    "/api/devices/:id/instructions/resolve",
+    ...mutate((req) => {
+      const device = req.workspace!.devices.find(item => item.id === req.params.id && !item.disconnectedAt);
+      if (!device) throw httpError(404, "Device not found.");
+      const { instructionId, agent, profile, project, action, expectedRevision, expectedLocalRevision } = req.body ?? {};
+      if (!["replace", "preserve", "import", "publish"].includes(action))
+        throw httpError(400, "Invalid instruction resolution.");
+      const document = (req.workspace!.instructions ?? []).find(item => item.id === instructionId);
+      const receipt = device.receipts.find(item => item.kind === "instructions" && item.skillId === instructionId &&
+        item.agent === agent && item.profile === profile && item.project === project);
+      if (receipt?.status !== "conflicted")
+        throw httpError(409, "A current conflicted instruction file is required.");
+      if (document && expectedRevision !== undefined && expectedRevision !== document.revision)
+        throw httpError(409, "The Equip revision changed. Review the instructions again.");
+      if (receipt.localFiles !== undefined && typeof expectedLocalRevision !== "string")
+        throw httpError(400, "Resolving a conflict requires the reviewed local revision.");
+      if (expectedLocalRevision !== undefined && (!receipt.localFiles || expectedLocalRevision !== revision(receipt.localFiles)))
+        throw httpError(409, "The device instructions changed. Review them again.");
+      const key = instructionKey(instructionId, { agent, profile, project });
+      if (action === "publish") {
+        if (!document) throw httpError(404, "Instructions not found.");
+        if (typeof expectedRevision !== "string" || typeof expectedLocalRevision !== "string")
+          throw httpError(400, "Publishing a conflict requires the reviewed Equip and local revisions.");
+        if (receipt?.status !== "conflicted" || !receipt.localFiles?.length)
+          throw httpError(409, "A current conflicted instruction file is required.");
+        validateInstructionFiles(receipt.localFiles);
+        const files = canonicalInstructionFiles(receipt.localFiles);
+        const rev = revision(files);
+        if (!sameFiles(document.files, files)) {
+          document.files = files;
+          document.revision = rev;
+          document.updatedAt = iso();
+          document.versions.unshift({ id: id("version"), revision: rev, createdAt: iso(),
+            message: `Published local conflict from ${device.name}`, files: clone(files) });
+          bump(req.workspace!);
+          activity(req.workspace!, { type: "publish", title: `${document.title} published from ${device.name}`,
+            description: `Revision ${rev} is ready for connected devices.`, status: "pending",
+            deviceId: device.id, skillId: document.id });
+        }
+        delete device.instructionResolutions?.[key];
+        delete device.instructionResolutionChecks?.[key];
+        return device;
+      }
+      device.instructionResolutions ??= {};
+      device.instructionResolutionChecks ??= {};
+      device.instructionResolutions[key] = action;
+      device.instructionResolutionChecks[key] = expectedLocalRevision ?? (receipt?.localFiles ? revision(receipt.localFiles) : receipt?.revision ?? "");
+      bump(req.workspace!);
+      return device;
+    }),
+  );
+  app.post(
     "/api/devices/:id/disconnect",
     ...mutate((req) => {
       const device = req.workspace!.devices.find((d) => d.id === req.params.id);
@@ -1555,6 +1835,37 @@ export async function createApp(
     next();
   };
   app.post(
+    "/api/device/instructions/local",
+    deviceAuth,
+    lockedWorkspace,
+    async (req: AuthedRequest, res, next) => {
+      try {
+        const device = req.workspace!.devices.find(item => item.id === req.deviceId)!;
+        if (!device.localSync?.enabled) throw httpError(403, "Local publishing is disabled for this device.");
+        const document = (req.workspace!.instructions ?? []).find(item => item.id === req.body?.instructionId);
+        if (!document || !document.revision) throw httpError(404, "Published instructions not found.");
+        if (req.body?.baseRevision !== document.revision)
+          throw httpError(409, "The Equip revision changed. Local files were preserved for review.");
+        validateInstructionFiles(req.body?.files, document.filename);
+        const files = clone(req.body.files) as SkillFile[];
+        if (!sameFiles(document.files, files)) {
+          const rev = revision(files);
+          document.files = files;
+          document.revision = rev;
+          document.updatedAt = iso();
+          document.versions.unshift({ id: id("version"), revision: rev, createdAt: iso(),
+            message: `Published local edit from ${device.name}`, files: clone(files) });
+          bump(req.workspace!);
+          activity(req.workspace!, { type: "publish", title: `${document.title} published from ${device.name}`,
+            description: `Revision ${rev} is ready for connected devices.`, status: "pending",
+            deviceId: device.id, skillId: document.id });
+        }
+        await saveWorkspace(db, req.accountId!, req.workspace!);
+        res.json(document);
+      } catch (error) { next(error); }
+    },
+  );
+  app.post(
     "/api/device/local",
     deviceAuth,
     lockedWorkspace,
@@ -1807,7 +2118,7 @@ export async function createApp(
   );
   app.get("/api/device/desired", deviceAuth, (req: AuthedRequest, res) => {
     const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
-    const etag = `"${digest(JSON.stringify([req.accountId, device.id, req.workspace!.generation, req.workspace!.sourceRequests, device.resolutions, device.disconnect, device.localSync?.enabled]))}"`;
+    const etag = `"${digest(JSON.stringify([req.accountId, device.id, req.workspace!.generation, req.workspace!.sourceRequests, device.resolutions, device.instructionResolutions, device.instructionResolutionChecks, device.instructionLocations, (device as Device & { instructionUnavailable?: unknown[] }).instructionUnavailable, device.disconnect, device.localSync?.enabled]))}"`;
     res.set({ ETag: etag, "Cache-Control": "private, no-cache" });
     if (req.headers["if-none-match"] === etag) { res.status(304).end(); return; }
     const skills = req
@@ -1823,6 +2134,13 @@ export async function createApp(
     const desired: DesiredState = {
       generation: req.workspace!.generation,
       skills,
+      instructions: (req.workspace!.instructions ?? []).filter(document =>
+        document.selected && document.enabled && document.revision && document.files.length &&
+        (device.instructionLocations ?? []).some(location => instructionEnabled(document, location, device.id)))
+        .map(document => ({ ...document, versions: [], draft: undefined,
+          targets: document.targets.filter(target => target.deviceId === device.id) })),
+      instructionResolutions: device.instructionResolutions ?? {},
+      instructionResolutionChecks: device.instructionResolutionChecks ?? {},
       sourceRequests: req.workspace!.sourceRequests ?? [],
       resolutions: device.resolutions ?? {},
       disconnect: device.disconnect,
@@ -1851,6 +2169,11 @@ export async function createApp(
           ...(agent.aliases ? { aliases: clone(agent.aliases) } : {}),
         }));
       }
+      if (req.body?.instructionLocations !== undefined)
+        device.instructionLocations = validateInstructionLocations(req.body.instructionLocations);
+      if (req.body?.instructionUnavailable !== undefined)
+        (device as Device & { instructionUnavailable?: Array<{ agent: string; reason: string }> }).instructionUnavailable =
+          validateInstructionUnavailable(req.body.instructionUnavailable);
       if (typeof req.body?.localSyncPath === "string" && req.body.localSyncPath.length <= 2048)
         device.localSync = { ...device.localSync, enabled: device.localSync?.enabled ?? false, path: req.body.localSyncPath };
       if (typeof req.body?.localSyncError === "string")
@@ -1884,6 +2207,45 @@ export async function createApp(
         );
         const resolutions = device.resolutions ?? {};
         for (const receipt of receipts) {
+          if (receipt.kind === "instructions") {
+            const key = instructionKey(receipt.skillId, receipt);
+            const action = device.instructionResolutions?.[key];
+            if (!action) continue;
+            const document = (req.workspace!.instructions ?? []).find(item => item.id === receipt.skillId);
+            const check = device.instructionResolutionChecks?.[key];
+            const localRevision = receipt.localFiles ? revision(receipt.localFiles) : undefined;
+            const reportedAction = (receipt as Receipt & { instructionResolution?: string }).instructionResolution;
+            const applied = reportedAction === action && (action === "replace"
+              ? receipt.status === "synchronized" && (!document || receipt.revision === document.revision)
+              : receipt.status === "conflicted" && receipt.localFiles !== undefined && (!check || check === localRevision));
+            if (!applied || receipt.status === "failed" || receipt.status === "offline") continue;
+            if (document && (action === "preserve" || action === "import")) {
+              const existing = document.targets.find(target => target.deviceId === device.id && sameDestination(target, receipt));
+              if (existing) existing.enabled = false;
+              else document.targets.push({ deviceId: device.id, agent: receipt.agent, profile: receipt.profile,
+                project: receipt.project, enabled: false });
+            }
+            if (action === "import") {
+              try {
+                validateInstructionFiles(receipt.localFiles);
+                const importedFiles = canonicalInstructionFiles(receipt.localFiles!);
+                req.workspace!.instructions!.push({
+                  id: id("instruction"), title: `${document?.title ?? "Instructions"} local copy`, filename: "AGENTS.md",
+                  scope: "global", selected: true, enabled: true,
+                  revision: "", files: [], draft: importedFiles, versions: [],
+                  targets: [{ deviceId: device.id, agent: receipt.agent, profile: receipt.profile,
+                    project: receipt.project, enabled: false }], updatedAt: iso(),
+                });
+              } catch (error: any) {
+                resolutionErrors.push({ skillId: receipt.skillId, agent: receipt.agent, message: error.message });
+                continue;
+              }
+            }
+            delete device.instructionResolutions?.[key];
+            delete device.instructionResolutionChecks?.[key];
+            bump(req.workspace!);
+            continue;
+          }
           const key = resolutionKey(
             receipt.skillId,
             receipt.agent,
@@ -2028,8 +2390,17 @@ export async function createApp(
               })
               .map((agent) => ({ skill, agent })),
           );
+        const expectedInstructions = (req.workspace!.instructions ?? []).flatMap(document =>
+          (device.instructionLocations ?? [])
+            .filter(location => instructionEnabled(document, location, device.id) && document.revision && document.files.length)
+            .map(location => ({ document, location })));
+        const activeInstructions = (req.workspace!.instructions ?? []).some(document =>
+          document.selected && document.enabled && document.revision && document.files.length);
+        const instructionCapabilityReported = device.instructionLocations !== undefined ||
+          (device as Device & { instructionUnavailable?: unknown[] }).instructionUnavailable !== undefined;
         const complete =
           req.body.generation === req.workspace!.generation &&
+          (!activeInstructions || instructionCapabilityReported) &&
           !receipts.some((receipt) => receipt.status !== "synchronized") &&
           expected.every(({ skill, agent }) =>
             receipts.some(
@@ -2046,9 +2417,13 @@ export async function createApp(
                   agent,
                 ) &&
                 receipt.revision === skill.revision &&
-                receipt.status === "synchronized",
+              receipt.status === "synchronized",
             ),
-          );
+          ) && expectedInstructions.every(({ document, location }) => receipts.some(receipt =>
+            receipt.kind === "instructions" && receipt.skillId === document.id &&
+            receipt.agent === location.agent && receipt.profile === location.profile &&
+            receipt.project === location.project && receipt.revision === document.revision &&
+            receipt.status === "synchronized"));
         if (complete) {
           device.lastSync = iso();
           device.appliedGeneration = req.body.generation;

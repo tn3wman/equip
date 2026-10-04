@@ -1,4 +1,5 @@
-import type { Device, Skill, SyncStatus } from "../shared/types";
+import type { Device, Instructions, Skill, SyncStatus } from "../shared/types";
+import { instructionDeployment } from "../shared/instructions";
 export function deployment(
   skill: Skill,
   devices: Device[],
@@ -57,6 +58,7 @@ export function deviceStatus(
   device: Device,
   skills: Skill[],
   generation?: number,
+  instructions: Instructions[] = [],
 ): SyncStatus {
   if (!device.online || device.disconnect) return "offline";
   const issue = device.receipts.find(
@@ -69,6 +71,11 @@ export function deviceStatus(
     (s) => s.selected && s.enabled && s.versions.length,
   );
   if (!device.agents.length) return "pending";
+  const publishedInstructions = instructions.filter(
+    (document) => document.selected && document.enabled && document.versions.length,
+  );
+  if (publishedInstructions.length && device.instructionLocations === undefined)
+    return "pending";
   if (
     published.some((s) => {
       const result = deployment(s, [device]);
@@ -76,5 +83,9 @@ export function deviceStatus(
     })
   )
     return "pending";
+  if (publishedInstructions.some((document) => {
+    const result = instructionDeployment(document, [device]);
+    return result.total > 0 && result.status !== "synchronized";
+  })) return "pending";
   return device.lastSync ? "synchronized" : "pending";
 }

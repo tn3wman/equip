@@ -91,6 +91,8 @@ export interface Agent {
   aliases?: Array<{ profile: string; path: string }>;
 }
 export interface Receipt {
+  kind?: "instructions";
+  instructionResolution?: "replace" | "preserve" | "import";
   skillId: string;
   agent: string;
   profile?: string;
@@ -114,6 +116,10 @@ export interface Device {
   appliedGeneration?: number;
   agents: Agent[];
   receipts: Receipt[];
+  instructionLocations?: InstructionLocation[];
+  instructionUnavailable?: Array<{agent: string; reason: string}>;
+  instructionResolutions?: Record<string, "replace" | "preserve" | "import">;
+  instructionResolutionChecks?: Record<string, string>;
   demo?: boolean;
   disconnect?: "retain" | "remove";
   disconnectedAt?: string;
@@ -145,6 +151,7 @@ export interface Workspace {
   email: string;
   demo: boolean;
   skills: Skill[];
+  instructions?: Instructions[];
   devices: Device[];
   activity: Activity[];
   generation: number;
@@ -154,11 +161,38 @@ export interface Workspace {
 export interface DesiredState {
   generation: number;
   skills: Skill[];
+  instructions?: Instructions[];
+  instructionResolutions?: Record<string, "replace" | "preserve" | "import">;
+  instructionResolutionChecks?: Record<string, string>;
   sourceRequests?: SourceRequest[];
   resolutions: Record<string, "replace" | "preserve" | "import">;
   disconnect?: "retain" | "remove";
   localSync?: boolean;
   localSkills?: Array<Pick<Skill, "id" | "name" | "revision" | "kind">>;
+}
+export type InstructionFilename = "CLAUDE.md" | "AGENTS.md";
+export interface Instructions {
+  id: string;
+  title: string;
+  filename: InstructionFilename;
+  scope: "global" | "project";
+  selected: boolean;
+  enabled: boolean;
+  revision: string;
+  files: SkillFile[];
+  draft?: SkillFile[];
+  versions: Version[];
+  targets: Target[];
+  updatedAt: string;
+}
+export interface InstructionLocation {
+  agent: string;
+  profile?: string;
+  project?: string;
+  filename: string;
+  path: string;
+  warning?: string;
+  localFiles?: SkillFile[];
 }
 export interface DeviceAuthorization {
   deviceCode: string;
