@@ -270,9 +270,10 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           }
           const alreadyManaged = previous && !previous.observed && samePointer && currentDesired;
           const entry: Entry = {...base,filename:doc.filename,revision:doc.revision,hash:desiredHash,pointer:current.pointer,originalBackup:previous?.originalBackup};
-          if (currentDesired && !previous && current.exists) entry.observed = true;
-          else if (currentDesired && previous?.observed && samePointer) entry.observed = true;
-          else if (!alreadyManaged) {
+          // Matching preexisting files can be adopted without choosing between
+          // versions. Back up their original file/link and converge on one store.
+          // Also migrate older workers' observed entries to managed links.
+          if (!alreadyManaged) {
             await mkdir(dirname(location.path),{recursive:true});
             if (current.exists) {
               const saved = await backup(location.path,home);

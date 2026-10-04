@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, lstat, readlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, lstat, readlink, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -8,8 +8,8 @@ import { skillRevision } from '../shared/library.ts';
 import { instructionKey } from '../shared/instructions.ts';
 import type { DesiredState, Instructions, InstructionLocation } from '../shared/types.ts';
 
-function doc(content='Original\n',filename:'AGENTS.md'|'CLAUDE.md'='AGENTS.md'):Instructions {
-  const files=[{path:filename,content,mode:0o644}];
+function doc(content='Original\n',filename:'AGENTS.md'|'CLAUDE.md'='AGENTS.md',mode=0o644):Instructions {
+  const files=[{path:filename,content,mode}];
   return {id:'instruction_test',title:'Instructions',filename,scope:'global',selected:true,enabled:true,revision:skillRevision(files),files,versions:[],targets:[],updatedAt:new Date().toISOString()};
 }
 const desired=(document:Instructions, resolutions:Record<string,'replace'|'preserve'|'import'>={}):DesiredState=>({generation:1,skills:[],resolutions:{},instructions:[document],instructionResolutions:resolutions});
@@ -36,6 +36,30 @@ test('two computers install identical instruction revisions, update, rollback, a
  await synchronizeInstructions(desired(v2),[b],join(root,'peer-state'));assert.equal(await readFile(b.path,'utf8'),'New\n');
  await synchronizeInstructions(desired(v1),[a],state);assert.equal(await readFile(a.path,'utf8'),'Original\n');
  const removed=await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(removed[0].status,'synchronized');assert.equal(await lstat(a.path).catch(()=>null),null);
+});
+
+test('matching preexisting instructions become a managed link and return on removal',async t=>{
+ const {state,a}=await fixture(t);const policy=doc('Original\n','AGENTS.md',0o640);await writeFile(a.path,'Original\n',{mode:0o640});
+ let result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.ok((await lstat(a.path)).isSymbolicLink());
+ const canonical=join(state,'instructions',policy.id,'AGENTS.md');assert.equal(await realpath(a.path),await realpath(canonical));const pointer=await readlink(a.path);
+ result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.ok((await lstat(a.path)).isSymbolicLink());assert.equal(await readlink(a.path),pointer);
+ await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.ok((await lstat(a.path)).isFile());assert.equal(await readFile(a.path,'utf8'),'Original\n');assert.equal((await stat(a.path)).mode&0o777,0o640);
+});
+
+test('an old observed instruction record is migrated to a managed link',async t=>{
+ const {state,a}=await fixture(t);const policy=doc();await writeFile(a.path,'Original\n');await mkdir(state,{recursive:true});const key=instructionKey(policy.id,a);
+ await writeFile(join(state,'instructions-ledger.json'),JSON.stringify({installs:{[key]:{skillId:policy.id,agent:a.agent,path:a.path,filename:a.filename,revision:policy.revision,hash:policy.revision,observed:true}},canonicals:{}}));
+ const result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.equal(result[0].managed,true);assert.ok((await lstat(a.path)).isSymbolicLink());
+ assert.equal(await realpath(a.path),await realpath(join(state,'instructions',policy.id,'AGENTS.md')));
+ await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.ok((await lstat(a.path)).isFile());assert.equal(await readFile(a.path,'utf8'),'Original\n');
+});
+
+test('matching external instruction links become managed links and return on removal',async t=>{
+ const {state,a,root}=await fixture(t);const external=join(root,'external.md');await writeFile(external,'Original\n',{mode:0o640});await symlink(external,a.path);const policy=doc('Original\n','AGENTS.md',0o640);
+ let result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.ok((await lstat(a.path)).isSymbolicLink());assert.notEqual(await readlink(a.path),external);
+ assert.equal(await realpath(a.path),await realpath(join(state,'instructions',policy.id,'AGENTS.md')));assert.equal(await readFile(external,'utf8'),'Original\n');assert.equal((await stat(external)).mode&0o777,0o640);
+ result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.notEqual(await readlink(a.path),external);
+ await synchronizeInstructions({...desired(policy),instructions:[]},[a],state);assert.equal(await readlink(a.path),external);assert.equal(await readFile(external,'utf8'),'Original\n');assert.equal((await stat(external)).mode&0o777,0o640);
 });
 
 test('unknown local versions remain intact; reviewed replace saves original and restores it on removal',async t=>{
