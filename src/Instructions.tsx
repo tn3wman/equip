@@ -2,11 +2,12 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AlertTriangle, Check, ChevronDown, Clock3, Download, FileDown, FileText, Monitor, Plus, Save, Send, Trash2, Upload } from "lucide-react";
-import type { Device, InstructionFilename, InstructionLocation, Instructions, Target, Workspace } from "../shared/types";
-import { instructionDeployment, instructionEnabled } from "../shared/instructions";
+import type { Device, InstructionFilename, InstructionLocation, Instructions, Receipt, Target, Workspace } from "../shared/types";
+import { instructionDeployment, instructionEnabled, instructionsAsSkill } from "../shared/instructions";
 import { reviewedFilesRevision } from "../shared/conflicts";
 import { api } from "./api";
 import { ago, Dialog, revision } from "./components";
+import SkillConflict from "./SkillConflict";
 
 type Props = { workspace: Workspace; refresh: () => Promise<void>; notify: (message: string) => void };
 type FullInstruction = Instructions;
@@ -30,6 +31,7 @@ export default function InstructionsPage({ workspace, refresh, notify }: Props) 
   const [error, setError] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [conflict, setConflict] = useState<{ device: Device; receipt: Receipt }>();
   const [importSelection, setImportSelection] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -208,13 +210,23 @@ export default function InstructionsPage({ workspace, refresh, notify }: Props) 
           return <div className="instruction-location" key={locationId(device.id, location)}>
             <label><input type="checkbox" checked={enabled} disabled={!document || Boolean(busy)} onChange={(event) => void toggleLocation(device, location, event.target.checked)} /><span><strong>{device.name}</strong><small>{[location.agent, location.profile, location.filename].filter(Boolean).join(" · ")}</small></span></label>
             <code title={location.path}>{location.path}</code>
-            <p className={applied ? "synchronized" : receipt?.status === "failed" || receipt?.status === "conflicted" ? receipt.status : !device.online ? "offline" : "pending"}>{applied ? <><Check size={13} /> Applied {ago(receipt!.timestamp)}</> : receipt?.status === "synchronized" ? "Waiting for the current revision" : receipt?.message || location.warning || (!device.online ? "Computer offline" : "Waiting for receipt")}</p>
+            <p className={applied ? "synchronized" : receipt?.status === "failed" || receipt?.status === "conflicted" ? receipt.status : !device.online ? "offline" : "pending"}>{!enabled ? "Excluded from global instructions" : applied ? <><Check size={13} /> Applied {ago(receipt!.timestamp)}</> : receipt?.status === "synchronized" ? "Waiting for the current revision" : receipt?.message || location.warning || (!device.online ? "Computer offline" : "Waiting for receipt")}</p>
+            {enabled && receipt?.status === "conflicted" && <button className="instruction-review" onClick={() => setConflict({ device, receipt })}>Review conflict</button>}
           </div>;
         })}
-        {unavailable.map(({ device, agent, reason }) => <div className="instruction-location unavailable" key={`${device.id}:${agent}`}><strong>{device.name}</strong><small>{agent} · unavailable</small><p><AlertTriangle size={13} />{reason}</p></div>)}
+        {!!unavailable.length && <details className="instruction-unavailable"><summary>{unavailable.length} unavailable integrations</summary>{unavailable.map(({ device, agent, reason }) => <div className="instruction-location unavailable" key={`${device.id}:${agent}`}><strong>{device.name}</strong><small>{agent} · unavailable</small><p><AlertTriangle size={13} />{reason}</p></div>)}</details>}
         {!locations.length && <p className="deployment-empty">{workspace.devices.some((device) => device.instructionLocations === undefined) ? "Connected computers need a newer Equip worker before instructions can sync." : "No compatible locations were found for this file and scope."}</p>}
       </aside>
     </div>
+    {conflict && <SkillConflict documentKind="instructions" skill={workspaceDocument ? instructionsAsSkill(workspaceDocument) : undefined}
+      device={workspace.devices.find(item => item.id === conflict.device.id) ?? conflict.device} receipt={conflict.receipt}
+      onClose={() => setConflict(undefined)} onResolve={async (action, expectedRevision) => {
+        await api(`/devices/${conflict.device.id}/instructions/resolve`, "POST", {
+          instructionId: conflict.receipt.skillId, agent: conflict.receipt.agent, profile: conflict.receipt.profile,
+          action, expectedRevision, expectedLocalRevision: conflict.receipt.localFiles ? await reviewedFilesRevision(conflict.receipt.localFiles) : undefined,
+        });
+        await refresh(); notify(action === "publish" ? "Local version published. Waiting for device receipts." : "Choice queued. Waiting for the computer receipt.");
+      }} />}
     {importOpen && <Dialog title="Import from a computer" onClose={() => setImportOpen(false)} wide><div className="instruction-import"><p>Review the complete detected instruction file, then save it as the shared global draft.</p>{error && <div className="notice error" role="alert"><AlertTriangle size={16} />{error}</div>}<div>{importLocations.map(({ device, location }) => { const id = locationId(device.id, location); return <label key={id} className={importSelection === id ? "selected" : ""}><input type="radio" name="computer-file" value={id} checked={importSelection === id} onChange={() => setImportSelection(id)} /><span><strong>{device.name} · {location.filename}</strong><code>{location.path}</code><pre>{location.localFiles?.[0]?.content}</pre></span></label>; })}{!importLocations.length && <p className="deployment-empty">No readable instruction files have been reported by connected computers.</p>}</div><footer><button className="button" onClick={() => setImportOpen(false)}>Cancel</button><button className="button primary" disabled={!importSelection || Boolean(busy)} onClick={() => void importComputer()}>Import draft</button></footer></div></Dialog>}
   </div>;
 }
