@@ -2168,8 +2168,8 @@ button.safety-badge:hover {
   z-index: 70;
   border-left: 1px solid #d9e4ce;
   box-shadow: -10px 0 50px #18350a17;
-  display: flex;
-  flex-direction: column;
+  display: block;
+  overflow-y: auto;
   animation: panel-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 @keyframes panel-in {
@@ -2183,6 +2183,10 @@ button.safety-badge:hover {
   }
 }
 .detail-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #fbfcf7;
   padding: 20px 27px;
   display: flex;
   align-items: center;
@@ -2251,9 +2255,7 @@ button.safety-badge:hover {
 }
 .detail-content {
   padding: 25px 30px;
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
+  overflow: visible;
   scroll-margin-top: 80px;
 }
 .detail-panel > .notice {
@@ -4075,21 +4077,6 @@ kbd {
 .detail-content:focus-visible {
   outline: 2px solid #719648;
   outline-offset: -3px;
-}
-@media (max-width: 700px) {
-  .detail-panel {
-    display: block;
-    overflow-y: auto;
-  }
-  .detail-topbar {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    background: #fbfcf7;
-  }
-  .detail-content {
-    overflow: visible;
-  }
 }
 .field,
 .dialog-body > p,
