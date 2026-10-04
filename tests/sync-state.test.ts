@@ -87,6 +87,22 @@ test("an exception excludes only its selected profile and offline status stays v
   );
 });
 
+test("a computer exclusion removes only the exact agent configuration", () => {
+  const profiles = {
+    ...device,
+    agents: [
+      ...device.agents,
+      { id: "codex", name: "Codex", path: "/work", profile: "work" },
+    ],
+    excludedAgents: [{ agent: "codex", profile: "work" }],
+  };
+  assert.deepEqual(deployment(skill, [profiles]), {
+    status: "synchronized",
+    complete: 1,
+    total: 1,
+  });
+});
+
 test("excluded destinations stay synchronized after confirmed removal", () => {
   const excluded = {
     ...skill,
@@ -238,4 +254,29 @@ test("published instructions keep older workers pending until locations are repo
     receipts: [...device.receipts, { ...receipt, kind: "instructions" as const, skillId: "instructions", revision: "instruction-r1" }],
   };
   assert.equal(deviceStatus(capable, [skill], 2, [instructions]), "synchronized");
+});
+
+test("stale and unsupported instruction failures do not mark skill sync failed", () => {
+  const staleInstructionFailure = {
+    ...device,
+    instructionLocations: [],
+    instructionUnavailable: [{ agent: "windsurf", reason: "The published instructions exceed its native limit." }],
+    receipts: [...device.receipts, {
+      ...receipt,
+      kind: "instructions" as const,
+      skillId: "old-instructions",
+      agent: "windsurf",
+      status: "failed" as const,
+      message: "Native limit",
+    }],
+  };
+  assert.equal(deviceStatus(staleInstructionFailure, [skill], 2, []), "synchronized");
+});
+
+test("a current enabled skill failure still marks the device failed", () => {
+  const failed = {
+    ...device,
+    receipts: [{ ...receipt, status: "failed" as const }],
+  };
+  assert.equal(deviceStatus(failed, [skill], 2), "failed");
 });

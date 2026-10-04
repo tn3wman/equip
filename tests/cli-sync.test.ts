@@ -1157,6 +1157,41 @@ test("an unchanged revision leaves the installed directory in place", async () =
   assert.equal(after.mtimeMs, before.mtimeMs);
 });
 
+test("an excluded destination retains its installed revision, catches up when re-enabled, and removes on disconnect", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-excluded-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = { id: "codex", path: join(root, "agent") };
+  const home = join(root, "state");
+  await synchronize(desired([skill("one")]), [target], home);
+  const excluded = { ...desired([skill("two", "r2")]), generation: 2,
+    excludedAgents: [{ agent: "codex" }] };
+  assert.deepEqual(await synchronize(excluded, [target], home), []);
+  assert.equal(await readFile(join(target.path, "demo/SKILL.md"), "utf8"), "one");
+  const retained = await realpath(join(target.path,"demo"));
+  assert.match(retained,/retained\/skills\/s1\//);
+  assert.deepEqual(await synchronize(excluded, [target], home), []);
+  const caughtUp = await synchronize({ ...desired([skill("two", "r2")]), generation: 3 }, [target], home);
+  assert.equal(caughtUp[0].status, "synchronized", JSON.stringify(caughtUp[0]));
+  assert.equal(await readFile(join(target.path, "demo/SKILL.md"), "utf8"), "two");
+  assert.equal(await lstat(retained).catch(()=>null),null);
+  await synchronize({ generation: 4, skills: [], resolutions: {} }, [target], home);
+  assert.equal(await lstat(join(target.path, "demo")).catch(() => null), null);
+});
+
+test("an excluded destination stops following the canonical folder when another agent updates", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-mixed-exclusion-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state");
+  const targets = [{ id: "codex", path: join(root, "codex") }, { id: "opencode", path: join(root, "opencode") }, { id: "claude-code", path: join(root, "claude") }];
+  await synchronize(desired([skill("one")]), targets, home);
+  const next = { ...desired([skill("two", "r2")]), generation: 2, excludedAgents: [{ agent: "codex" },{agent:"opencode"}] };
+  await synchronize(next, targets, home);
+  assert.equal(await readFile(join(targets[0].path, "demo/SKILL.md"), "utf8"), "one");
+  assert.equal(await readFile(join(targets[1].path, "demo/SKILL.md"), "utf8"), "one");
+  assert.equal(await realpath(join(targets[0].path,"demo")),await realpath(join(targets[1].path,"demo")));
+  assert.equal(await readFile(join(targets[2].path, "demo/SKILL.md"), "utf8"), "two");
+});
+
 test("shared agent directories remain managed, survive one exclusion, and remove their store after all exclusions", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "equip-shared-ownership-"));
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -37,6 +37,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   GitFork as Github,
+  GitBranch,
   WifiOff,
   AlertTriangle,
   Monitor,
@@ -47,6 +48,7 @@ import {
   Loader2,
   FileText,
 } from "lucide-react";
+import AccountSettings from "./AccountSettings";
 import { api } from "./api";
 import {
   Logo,
@@ -74,6 +76,7 @@ import SkillConflict from "./SkillConflict";
 import SkillSyncReview from "./SkillSyncReview";
 import { reviewedFilesRevision } from "../shared/conflicts";
 import { instructionsAsSkill } from "../shared/instructions";
+import { findWorkflowOverlap, skillSourceKey, workflowCollections } from "../shared/workflows";
 const lazyReloadKey = "equip:stale-chunk-reload";
 function lazyWithReload<T extends ComponentType<any>>(
   load: () => Promise<{ default: T }>,
@@ -98,7 +101,9 @@ function lazyWithReload<T extends ComponentType<any>>(
 }
 const SkillDetail = lazyWithReload(() => import("./SkillDetail"));
 const Editor = lazyWithReload(() => import("./Editor"));
+const ChangesPage = lazyWithReload(() => import("./Changes"));
 const InstructionsPage = lazyWithReload(() => import("./Instructions"));
+import { pendingChangeCount } from "../shared/changes";
 import { conflictDevices, deployment, deviceStatus } from "./sync-state";
 
 const pages = [
@@ -106,6 +111,7 @@ const pages = [
   "instructions",
   "discover",
   "devices",
+  "changes",
   "activity",
   "settings",
 ] as const;
@@ -119,6 +125,7 @@ export default function App() {
   const [authLinkError, setAuthLinkError] = useState("");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Skill>();
+  const [historyRequested,setHistoryRequested] = useState(false);
   const [edit, setEdit] = useState<Skill>();
   const [connect, setConnect] = useState(false);
   const [auth, setAuth] = useState(false);
@@ -361,6 +368,7 @@ export default function App() {
             { id: "instructions", label: "Instructions", icon: FileText },
             { id: "discover", label: "Discover", icon: Compass },
             { id: "devices", label: "Computers", icon: Laptop },
+            { id: "changes", label: "Changes", icon: GitBranch },
             { id: "activity", label: "Activity", icon: ActivityIcon },
           ].map(({ id, label, icon: Icon }) => (
             <button
@@ -374,6 +382,8 @@ export default function App() {
                 <span className="nav-count">{selectedSkills.length}</span>
               ) : id === "instructions" ? (
                 <span className="nav-count">{workspace.instructions?.filter((item) => item.selected).length ?? 0}</span>
+              ) : id === "changes" ? (
+                pendingChangeCount(workspace) ? <span className="nav-count">{pendingChangeCount(workspace)}</span> : null
               ) : id === "devices" ? (
                 <span className="nav-dot" />
               ) : null}
@@ -523,6 +533,7 @@ export default function App() {
               run={run}
             />
           )}
+          {page === "changes" && <Suspense fallback={<div className="catalog-loading"><Loader2 className="spin" size={20}/>Opening changes…</div>}><ChangesPage workspace={workspace} refresh={refresh} notify={notify} open={skill=>{setHistoryRequested(true);setSelected(skill);}} instructions={()=>navigate("instructions")}/></Suspense>}
           {page === "activity" && <Activity workspace={workspace} />}
           {page === "settings" && (
             <Settings
@@ -602,7 +613,8 @@ export default function App() {
               workspace.skills.find((s) => s.id === selected.id) || selected
             }
             workspace={workspace}
-            onClose={() => setSelected(undefined)}
+            initialTab={historyRequested ? "history" : "instructions"}
+            onClose={() => {setSelected(undefined);setHistoryRequested(false);}}
             onEdit={startEditor}
             onChange={async () => {
               await refresh();
@@ -1138,6 +1150,7 @@ function Discover({
   notify: (message: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [workflow, setWorkflow] = useState<string>();
   const [view, setView] = useState<DiscoveryView>("all-time");
   const [catalog, setCatalog] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1180,14 +1193,13 @@ function Discover({
     };
   }, [search, view, page]);
   useEffect(() => { setCatalogPage(0); setCatalog([]); }, [search, view]);
-  const sourceKey = (skill: Pick<Skill, "source" | "name">) => {
-    let source = skill.source.trim().toLowerCase().replace(/\.git$/, "").replace(/^git\+/, "");
-    source = source.replace(/^https?:\/\/(www\.)?github\.com\//, "").replace(/^git@github\.com:/, "");
-    source = source.split("@")[0].replace(/^\/+|\/+$/g, "");
-    return `${source}:${skill.name.trim().toLowerCase()}`;
-  };
-  const installed = new Map(workspace.skills.filter((skill) => skill.selected).map((skill) => [sourceKey(skill), skill]));
-  const openResolved = (skill: Skill) => open(installed.get(sourceKey(skill)) || skill);
+  const selectedSkills = workspace.skills.filter((skill) => skill.selected);
+  const installed = new Map(selectedSkills.map((skill) => [skillSourceKey(skill), skill]));
+  const activeWorkflow = workflowCollections.find(item => item.id === workflow);
+  const visibleCatalog = activeWorkflow
+    ? catalog.filter(skill => !installed.has(skillSourceKey(skill)))
+    : catalog;
+  const openResolved = (skill: Skill) => open(installed.get(skillSourceKey(skill)) || skill);
   return (
     <div className="page">
       <div className="page-heading">
@@ -1195,7 +1207,7 @@ function Discover({
           <h1>
             Discover skills<span className="heading-dot">.</span>
           </h1>
-          <p>Good instructions make great agents. Find your next advantage.</p>
+          <p>Start with the work you want an agent to handle.</p>
         </div>
         <button className="button" onClick={() => setImporting(true)}>
           <Github size={16} />
@@ -1203,35 +1215,30 @@ function Discover({
           <Plus size={15} />
         </button>
       </div>
-      <div className="discovery-feature">
-        <div>
-          <span className="feature-label">
-            <Compass size={14} />
-            THE OPEN SKILLS ECOSYSTEM
-          </span>
-          <h2>Borrow a little expertise.</h2>
-          <p>
-            Practical skills, built by the community.
-            <br />
-            Ready for the agents you already use.
-          </p>
-          <a href="https://skills.sh" target="_blank" rel="noreferrer">
-            Explore the ecosystem <ArrowUpRight size={15} />
-          </a>
+      <div className="workflow-guide" role="region" aria-label="Browse by workflow">
+        <div className="workflow-guide-intro">
+          <Compass size={19} />
+          <div>
+            <h2>What are you trying to do?</h2>
+            <p>Each choice searches the live skills.sh ecosystem. Collections do not contain a fixed or sponsored skill list.</p>
+          </div>
         </div>
-        <div className="feature-art" aria-hidden="true">
-          <div className="art-back">
-            <CodeIcon />
-          </div>
-          <div className="art-middle">
-            <Layers size={42} strokeWidth={1.4} />
-          </div>
-          <div className="art-front">
-            <Sparkles size={43} strokeWidth={1.35} />
-            <span>SKILL.md</span>
-          </div>
-          <span className="art-orbit one" />
-          <span className="art-orbit two" />
+        <div className="workflow-choices">
+          {workflowCollections.map(item => (
+            <button
+              key={item.id}
+              className={workflow === item.id ? "active" : ""}
+              aria-pressed={workflow === item.id}
+              onClick={() => {
+                setWorkflow(item.id);
+                setQuery(item.query);
+                setCatalogPage(0);
+              }}
+            >
+              <strong>{item.label}</strong>
+              <span>{item.purpose}</span>
+            </button>
+          ))}
         </div>
       </div>
       <div className="discover-tools">
@@ -1240,8 +1247,8 @@ function Discover({
           <input
             id="skill-search"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search skills, workflows, or authors…"
+            onChange={(e) => { setQuery(e.target.value); setWorkflow(undefined); }}
+            placeholder="Search the skills.sh ecosystem"
             aria-label="Search community skills"
           />
           <kbd>⌘ K</kbd>
@@ -1271,6 +1278,16 @@ function Discover({
           {loadError}
         </div>
       )}
+      <div className="discovery-evidence">
+        <span><SafetyBadge safety={undefined} /> Safety reports describe the current upstream source. They do not verify the exact revision Equip will pin.</span>
+        <span><Terminal size={14} /> Runtime requirements appear in skill details. Inspect them before adding a skill.</span>
+      </div>
+      {activeWorkflow && !loading && (
+        <div className="workflow-results-heading">
+          <div><span>Live search</span><h2>{activeWorkflow.label}</h2></div>
+          <p>{activeWorkflow.purpose}. Skills already selected in your library are omitted here.</p>
+        </div>
+      )}
       {loading && page === 0 ? (
         <div className="catalog-loading">
           <Loader2 className="spin" size={20} />
@@ -1278,8 +1295,9 @@ function Discover({
         </div>
       ) : (
         <div className="discover-grid">
-          {catalog.map((skill) => {
-            const installedSkill = installed.get(sourceKey(skill));
+          {visibleCatalog.map((skill) => {
+            const installedSkill = installed.get(skillSourceKey(skill));
+            const overlap = findWorkflowOverlap(skill, selectedSkills);
             return <article className="discover-skill" key={skill.catalogId || skill.id}>
               <div className="discover-skill-top">
                 <SkillIcon skill={skill} />
@@ -1297,6 +1315,10 @@ function Discover({
                 {skill.description ||
                   "Inspect the source instructions and bundled files before adding this skill."}
               </p>
+              {overlap && <button className="workflow-overlap" onClick={() => open(overlap)}>
+                Similar workflow to selected skill <strong>{overlap.title}</strong>. Compare their instructions before adding both.
+              </button>}
+              {!!skill.requirements.length && <span className="requirement-hint"><Terminal size={12} /> Requires local setup. Inspect details.</span>}
               <div className="discover-skill-bottom">
                 <span>
                   <Github size={12} />
@@ -1316,10 +1338,10 @@ function Discover({
         </div>
       )}
       {hasMore && <div className="load-more"><button className="button" disabled={loading} onClick={() => setCatalogPage((value) => value + 1)}>{loading ? <Loader2 className="spin" size={15} /> : null}Load more</button></div>}
-      {!loading && !catalog.length && (
+      {!loading && !visibleCatalog.length && (
         <Empty
-          title="No skills found"
-          description="Try a broader search, or add a repository directly."
+          title={activeWorkflow && catalog.length ? "You already selected these results" : "No skills found"}
+          description={activeWorkflow && catalog.length ? "Try another workflow or search the ecosystem directly." : "Try a broader search, or add a repository directly."}
         />
       )}
       {importing && (
@@ -1456,6 +1478,10 @@ function Devices({
   const [disconnect, setDisconnect] = useState<Device>();
   const [conflict, setConflict] = useState<{ device: Device; receipt: Receipt }>();
   const [showAllReceipts, setShowAllReceipts] = useState<Record<string, boolean>>({});
+  const [receiptQuery,setReceiptQuery]=useState<Record<string,string>>({});
+  const [receiptStatus,setReceiptStatus]=useState<Record<string,string>>({});
+  const [receiptLimit,setReceiptLimit]=useState<Record<string,number>>({});
+  const [agentLimit,setAgentLimit]=useState<Record<string,number>>({});
   const [mode, setMode] = useState<"retain" | "remove">("retain");
   const devices = workspace.devices.filter((d) => !d.disconnectedAt);
   return (
@@ -1496,7 +1522,16 @@ function Devices({
       <div className="device-list">
         {devices.map((device) => {
           const conflicts = device.receipts.filter((receipt) => receipt.status === "conflicted");
-          const visibleReceipts = conflicts.length && !showAllReceipts[device.id] ? conflicts : device.receipts;
+          const receiptPool = conflicts.length && !showAllReceipts[device.id] ? conflicts : device.receipts;
+          const query=(receiptQuery[device.id] ?? "").trim().toLowerCase();
+          const selectedStatus=receiptStatus[device.id] ?? "all";
+          const filteredReceipts=receiptPool.filter(receipt=>{
+            const item=receipt.kind==="instructions" ? workspace.instructions?.find(candidate=>candidate.id===receipt.skillId) : workspace.skills.find(candidate=>candidate.id===receipt.skillId);
+            return (selectedStatus==="all" || receipt.status===selectedStatus) && (!query || `${item?.title ?? receipt.skillId} ${receipt.agent} ${receipt.path ?? ""} ${receipt.message ?? ""}`.toLowerCase().includes(query));
+          });
+          const visibleReceipts=filteredReceipts.slice(0,receiptLimit[device.id] ?? 25);
+          const skillReceipts=device.receipts.filter(receipt=>receipt.kind!=="instructions");
+          const instructionReceipts=device.receipts.filter(receipt=>receipt.kind==="instructions");
           const status = deviceStatus(
             device,
             workspace.skills,
@@ -1508,6 +1543,23 @@ function Devices({
             (count, agent) => count + (agent.aliases?.length || 1),
             0,
           );
+          const agentGroups = [...new Map(device.agents.map(agent => [agent.id, {
+            id: agent.id,
+            name: agent.name,
+            agents: device.agents.filter(candidate => candidate.id === agent.id),
+          }])).values()];
+          const agentEntries=agentGroups.flatMap(group=>group.agents.map(agent=>({group,agent})));
+          const excluded = (agent: Device["agents"][number]) =>
+            (device.excludedAgents ?? []).some(item => item.agent === agent.id &&
+              item.profile === agent.profile && item.project === agent.project);
+          const setAgentIncluded = (agent: Device["agents"][number], included: boolean) => {
+            const shared=device.agents.filter(candidate=>candidate.path===agent.path);
+            const matches=(item:{agent:string;profile?:string;project?:string})=>shared.some(candidate=>item.agent===candidate.id&&item.profile===candidate.profile&&item.project===candidate.project);
+            const remaining = (device.excludedAgents ?? []).filter(item => !matches(item));
+            const excludedAgents = included ? remaining : [...remaining, ...shared.map(candidate=>({agent:candidate.id,...(candidate.profile?{profile:candidate.profile}:{}),...(candidate.project?{project:candidate.project}:{})}))];
+            return run(() => api(`/devices/${device.id}/agents`, "PATCH", { excludedAgents }),
+              included ? `Shared skill folder enabled on ${device.name}.` : `Shared skill folder excluded on ${device.name}.`);
+          };
           return (
             <section className="device-section" key={device.id}>
               <div className="device-section-header">
@@ -1569,17 +1621,17 @@ function Devices({
                 </button>
               </div>
               <div className="device-agent-strip">
-                {device.agents.map((agent, index) => (
-                  <span key={`${agent.id}-${index}`}>
-                    <span className="agent-glyph">{agent.name.charAt(0)}</span>
-                    {agent.name}
+                {agentGroups.slice(0,4).map((group) => (
+                  <span key={group.id}>
+                    <span className="agent-glyph">{group.name.charAt(0)}</span>
+                    {group.name}
                     <small>
-                      {agent.profile ? `${agent.profile} · ` : ""}
-                      {agent.aliases?.length || 1}{" "}
-                      {(agent.aliases?.length || 1) === 1 ? "configuration" : "configurations"}
+                      {group.agents.reduce((count, agent) => count + (agent.aliases?.length || 1), 0)}{" "}
+                      {group.agents.reduce((count, agent) => count + (agent.aliases?.length || 1), 0) === 1 ? "configuration" : "configurations"}
                     </small>
                   </span>
                 ))}
+                {agentGroups.length>4 && <span>+{agentGroups.length-4} more agent types</span>}
                 <button
                   className="text-link"
                   onClick={() =>
@@ -1614,26 +1666,38 @@ function Devices({
                     {device.localSync?.error && <p className="error-text">Local publication needs attention: {device.localSync.error}</p>}
                     <p className="muted-copy">You can also publish a folder with <code>equip local add /path/to/skill</code>. Equip preserves preexisting folders and flags conflicting copies.</p>
                   </div>
-                  <h3>Detected locations</h3>
-                  {device.agents.map((agent, index) => (
-                    <div className="agent-location-group" key={index}>
-                      <div className="agent-location">
-                        <strong>{agent.name}</strong>
-                        <code>{agent.path}</code>
-                        <span>
-                          {agent.project ? "Project: " + agent.project : "Global"}
-                          {" · "}{(agent.aliases?.length ?? 0) > 1 ? "Shared skill folder" : agent.profile || "default"}
-                        </span>
-                      </div>
-                      {(agent.aliases?.length ?? 0) > 1 && agent.aliases?.map((alias) => (
-                        <div className="agent-location alias" key={`${alias.profile}:${alias.path}`}>
-                          <strong>{alias.profile}</strong>
-                          <code>{alias.path}</code>
-                          <span>Same physical skill root</span>
+                  <h3>Detected agents and skill folders</h3>
+                  <div className="device-sync-summaries">
+                    <div><strong>Skill sync</strong><span>{skillReceipts.length ? `${skillReceipts.filter(receipt=>receipt.status==="synchronized").length} synchronized · ${skillReceipts.filter(receipt=>receipt.status==="conflicted").length} conflicts` : "Waiting for installation receipts"}</span></div>
+                    <div><strong>Native instructions</strong><span>{device.instructionUnavailable?.length ? `${device.instructionUnavailable.length} unavailable` : instructionReceipts.length ? `${instructionReceipts.filter(receipt=>receipt.status==="synchronized").length} synchronized` : "No instruction receipts yet"}</span></div>
+                  </div>
+                  {!!device.instructionUnavailable?.length && <div className="instruction-limit-list"><strong>Instructions unavailable for these configurations</strong>{device.instructionUnavailable.map((item,index)=><div key={`${item.agent}:${item.profile}:${item.project}:${index}`}><span>{item.agent}{item.profile ? ` · ${item.profile}` : ""}{item.project ? ` · ${item.project}` : ""}</span><p>{item.reason}</p></div>)}</div>}
+                  {agentEntries.slice(0,agentLimit[device.id] ?? 12).map(({group,agent}, index) => (
+                    <div className="agent-location-group" key={`${group.id}:${agent.path}:${agent.profile ?? ""}:${agent.project ?? ""}`}>
+                      <strong>{group.name}</strong>
+                        <div className="agent-location" key={`${agent.path}:${agent.profile ?? ""}:${index}`}>
+                          <label>
+                            <input type="checkbox" checked={!excluded(agent)} disabled={workspace.demo || Boolean(device.disconnect)} onChange={event => void setAgentIncluded(agent, event.target.checked)} />
+                            <strong>{agent.profile || (agent.project ? "Project" : "Default")}</strong>
+                          </label>
+                          <code>{agent.path}</code>
+                          <span>
+                            {agent.detection === "configuration" ? "Configuration detected" : "Installation detected"}
+                            {agent.detectionPath ? ` at ${agent.detectionPath}` : ""}
+                            {" · "}{(agent.aliases?.length ?? 0) > 1 ? "Shared physical skill folder" : agent.project ? `Project: ${agent.project}` : "Global skills"}
+                            {excluded(agent) ? " · Excluded from sync" : ""}
+                          </span>
+                          {(agent.aliases?.length ?? 0) > 1 && agent.aliases?.map(alias => (
+                            <div className="agent-location alias" key={`${alias.profile}:${alias.path}`}>
+                              <strong>{alias.profile}</strong>
+                              <code>{alias.path}</code>
+                              <span>Uses the same physical skill folder</span>
+                            </div>
+                          ))}
                         </div>
-                      ))}
                     </div>
                   ))}
+                  {agentEntries.length>(agentLimit[device.id] ?? 12) && <button className="text-link" onClick={()=>setAgentLimit(current=>({...current,[device.id]:(current[device.id] ?? 12)+24}))}>Show more configurations · {agentEntries.length-(agentLimit[device.id] ?? 12)} remaining</button>}
                   <div className="receipt-heading">
                     <h3>{conflicts.length && !showAllReceipts[device.id] ? "Conflicts" : "Installation receipts"}</h3>
                     {conflicts.length > 0 && (
@@ -1641,6 +1705,10 @@ function Devices({
                         {showAllReceipts[device.id] ? "Show conflicts" : `All installations (${device.receipts.length})`}
                       </button>
                     )}
+                  </div>
+                  <div className="receipt-controls">
+                    <label><Search size={14}/><input type="search" value={receiptQuery[device.id] ?? ""} placeholder="Search receipts" onChange={event=>{setReceiptQuery(current=>({...current,[device.id]:event.target.value}));setReceiptLimit(current=>({...current,[device.id]:25}));}}/></label>
+                    <select aria-label="Filter receipt status" value={selectedStatus} onChange={event=>{setReceiptStatus(current=>({...current,[device.id]:event.target.value}));setReceiptLimit(current=>({...current,[device.id]:25}));}}><option value="all">All statuses</option><option value="synchronized">Synchronized</option><option value="conflicted">Conflicted</option><option value="failed">Failed</option><option value="pending">Pending</option><option value="offline">Offline</option></select>
                   </div>
                   {device.receipts.length ? (
                     <div className="receipt-table">
@@ -1673,6 +1741,7 @@ function Devices({
                           )}
                         </div>
                       ))}
+                      {!visibleReceipts.length && <p className="muted-copy">No receipts match this search and status.</p>}
                     </div>
                   ) : (
                     <p className="muted-copy">
@@ -1680,6 +1749,7 @@ function Devices({
                       installation.
                     </p>
                   )}
+                  {visibleReceipts.length<filteredReceipts.length && <button className="button small receipt-more" onClick={()=>setReceiptLimit(current=>({...current,[device.id]:(current[device.id] ?? 25)+25}))}>Show 25 more · {filteredReceipts.length-visibleReceipts.length} remaining</button>}
                   <div className="device-expanded-footer">
                     <span>
                       {device.demo
@@ -1800,7 +1870,7 @@ function Devices({
           device={workspace.devices.find(device => device.id === conflict.device.id) || conflict.device}
           receipt={conflict.receipt}
           onClose={() => setConflict(undefined)}
-          onResolve={async (action, expectedRevision) => {
+          onResolve={async (action, expectedRevision, mergedFiles) => {
             let accepted = false;
             let resolutionError: unknown;
             const expectedLocalRevision = conflict.receipt.localFiles ? await reviewedFilesRevision(conflict.receipt.localFiles) : undefined;
@@ -1813,6 +1883,7 @@ function Devices({
                     profile: conflict.receipt.profile,
                     project: conflict.receipt.project,
                     action,
+                    mergedFiles,
                     expectedRevision,
                     expectedLocalRevision,
                   });
@@ -1933,6 +2004,7 @@ function Settings({
           </button>
         </div>
       </section>
+      <AccountSettings workspace={workspace} />
       <section className="settings-section">
         <h2>Installation defaults</h2>
         <div className="settings-row">

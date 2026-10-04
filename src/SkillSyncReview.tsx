@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Check, GitBranch, Loader2 } from "lucide-react";
-import type { Device, Receipt, Skill, Workspace } from "../shared/types";
+import type { Device, Receipt, Skill, SkillFile, Workspace } from "../shared/types";
 import { reviewedFilesRevision } from "../shared/conflicts";
 import { api } from "./api";
 import { Dialog, Status, revision } from "./components";
@@ -21,11 +21,11 @@ export default function SkillSyncReview({ skill, workspace, onClose, onChange, n
   const [error, setError] = useState("");
   const locations = conflictInstallations(skill, workspace.devices);
   const state = deployment(skill, workspace.devices);
-  const resolve = async (location: { device: Device; receipt: Receipt }, action: "replace" | "preserve" | "import" | "publish", expectedRevision = skill.revision) => {
+  const resolve = async (location: { device: Device; receipt: Receipt }, action: "replace" | "preserve" | "import" | "publish" | "merge", expectedRevision = skill.revision, mergedFiles?: SkillFile[]) => {
     const { device, receipt } = location;
     await api(`/devices/${device.id}/resolve`, "POST", {
       skillId: skill.id, agent: receipt.agent, profile: receipt.profile, project: receipt.project,
-      action, expectedRevision,
+      action, expectedRevision, mergedFiles,
       expectedLocalRevision: receipt.localFiles ? await reviewedFilesRevision(receipt.localFiles) : undefined,
     });
   };
@@ -49,8 +49,8 @@ export default function SkillSyncReview({ skill, workspace, onClose, onChange, n
     device={workspace.devices.find(device => device.id === review.device.id) || review.device}
     receipt={review.receipt}
     onClose={() => setReview(undefined)}
-    onResolve={async (action, expectedRevision) => {
-      await resolve(review, action, expectedRevision);
+    onResolve={async (action, expectedRevision, mergedFiles) => {
+      await resolve(review, action, expectedRevision, mergedFiles);
       await onChange();
       notify(action === "publish" ? "Local version published. Computers will confirm installation." : "Choice queued. Waiting for this computer to confirm it.");
     }}

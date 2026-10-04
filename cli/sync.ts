@@ -16,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileHashes, sameInstalledFileHashes } from "./file-state.ts";
+import { portableFilesRevision } from "./file-state.ts";
 import type {
   DesiredState,
   Receipt,
@@ -32,6 +33,8 @@ export interface AgentTarget {
   project?: string;
   deviceId?: string;
   aliases?: Array<{ profile: string; path: string }>;
+  detection?: "installation" | "configuration";
+  detectionPath?: string;
 }
 interface LedgerEntry {
   skillId: string;
@@ -46,6 +49,17 @@ interface LedgerEntry {
   transactionId?: string;
   copied?: true;
   localOwned?: true;
+  retainedFromCanonical?: string;
+}
+
+function excludedDestination(
+  desired: DesiredState,
+  destination: { id?: string; agent?: string; profile?: string; project?: string },
+) {
+  const agent = destination.id ?? destination.agent;
+  return (desired.excludedAgents ?? []).some(excluded =>
+    excluded.agent === agent && excluded.profile === destination.profile &&
+    excluded.project === destination.project);
 }
 interface Ledger {
   generation: number;
@@ -234,7 +248,7 @@ async function prepareCanonical(
     const current = await snapshot(path);
     if (!differs(current.hashes, hashes)) return { path, hashes };
     const baselines = entries
-      .filter((entry) => entry.canonicalPath === path || entry.observed)
+      .filter((entry) => entry.canonicalPath === path || entry.retainedFromCanonical === path || entry.observed)
       .map((entry) => entry.files);
     if (
       (!baselines.length ||
@@ -561,11 +575,17 @@ async function install(
             revision: skill.revision,
             files: canonical.hashes,
             canonicalPath: canonical.path,
+            retainedFromCanonical: undefined,
             transactionId,
           },
           oldPath,
           receipt: { ...base, status: "synchronized" },
         };
+      }
+      if (resolve(previous.canonicalPath) !== resolve(canonical.path)) {
+        const stage = `${destination}.equip-stage-${randomUUID()}`;
+        await createManagedLink(canonical.path, stage);
+        await rename(stage, destination);
       }
       return {
         entry: {
@@ -573,6 +593,7 @@ async function install(
           revision: skill.revision,
           files: canonical.hashes,
           canonicalPath: canonical.path,
+          retainedFromCanonical: undefined,
           transactionId: canonical.transactionId ?? previous.transactionId,
         },
         receipt: { ...base, status: "synchronized" },
@@ -765,16 +786,52 @@ export async function synchronize(
       generation: ledger.generation,
       installs: { ...ledger.installs },
     };
+    // Retained destinations share one immutable snapshot for each old revision.
+    for (const [key, entry] of Object.entries(ledger.installs)) {
+      if (!excludedDestination(desired, entry) || !entry.canonicalPath || entry.copied || entry.retainedFromCanonical) continue;
+      if (!await pointsTo(entry.path, entry.canonicalPath)) continue;
+      const current = await snapshot(entry.canonicalPath);
+      const retained = join(home,"retained","skills",entry.skillId,portableFilesRevision(current.files));
+      if (!await lstat(retained).catch(() => null)) {
+        const retainedStage = `${retained}.equip-stage-${randomUUID()}`;
+        await mkdir(dirname(retained),{recursive:true});
+        try {
+          await cp(entry.canonicalPath,retainedStage,{recursive:true,preserveTimestamps:true});
+          if (differs((await snapshot(retainedStage)).hashes,current.hashes) ||
+              differs((await snapshot(entry.canonicalPath)).hashes,current.hashes))
+            throw new Error("Local files changed while excluding this destination; they were preserved");
+          await rename(retainedStage,retained);
+        } finally { await rm(retainedStage,{recursive:true,force:true}); }
+      }
+      const transactionId = randomUUID();
+      const stage = `${entry.path}.equip-retained-${transactionId}`;
+      try { await createManagedLink(retained,stage); }
+      catch (error) { await rm(stage,{recursive:true,force:true}); throw error; }
+      if (process.platform === "win32") {
+        const old = `${entry.path}.equip-old-${transactionId}`;
+        await saveJsonAtomic(join(home,"transaction.json"),{destination:entry.path,stage,oldPath:old,hadOld:true,
+          revision:entry.revision,transactionId,skillId:entry.skillId,expectedFiles:entry.files} satisfies Journal);
+        await rename(entry.path,old);await rename(stage,entry.path);
+      } else await rename(stage,entry.path);
+      ledger.installs[key] = {...entry,canonicalPath:retained,retainedFromCanonical:entry.canonicalPath,transactionId,copied:undefined};
+      next.installs[key] = ledger.installs[key];
+      await saveJsonAtomic(join(home,"ledger.json"),next);
+      if (process.platform === "win32") await recover(home,archive);
+    }
     const receipts: Receipt[] = [];
     const canonicals = new Map<string, Promise<CanonicalState>>();
     const canonicalSnapshots = new Map<
       string,
       Promise<{ files: SkillFile[]; hashes: Record<string, string> }>
     >();
-    for (const target of targets)
+    for (const target of targets) {
+      if (excludedDestination(desired, target)) continue;
       for (const skill of desired.skills.filter(
         (s) => s.enabled && enabledFor(s, target),
       )) {
+        const destination = join(target.path, skill.name);
+        if (Object.values(ledger.installs).some(entry => entry.skillId === skill.id &&
+          entry.path === destination && excludedDestination(desired, entry))) continue;
         const key = keyFor(skill, target);
         try {
           let canonical = canonicals.get(skill.id);
@@ -792,7 +849,6 @@ export async function synchronize(
             );
             canonicals.set(skill.id, canonical);
           }
-          const destination = join(target.path, skill.name);
           const shared = Object.values(next.installs).find(entry =>
             entry.skillId === skill.id && entry.path === destination && entry.canonicalPath && !entry.observed);
           const previous = ledger.installs[key];
@@ -851,6 +907,7 @@ export async function synchronize(
           });
         }
       }
+    }
     await recover(home, archive);
     const wanted = new Set(
       targets.flatMap((t) =>
@@ -867,6 +924,7 @@ export async function synchronize(
     const canonicalGcCandidates = new Set<string>();
     for (const [key, old] of Object.entries(ledger.installs))
       if (!wanted.has(key)) {
+        if (excludedDestination(desired, old)) continue;
         // Several upstream agents can intentionally use the same directory.
         // Release this destination rule without deleting another agent's link.
         if (Object.entries(next.installs).some(([otherKey, entry]) => otherKey !== key && wanted.has(otherKey) && entry.path === old.path)) {
@@ -1019,6 +1077,12 @@ export async function synchronize(
       )
         await rm(path, { recursive: true, force: true });
     }
+    const retainedRoot = join(home,"retained","skills");
+    for (const skillDir of await readdir(retainedRoot,{withFileTypes:true}).catch(()=>[])) if (skillDir.isDirectory())
+      for (const snapshotDir of await readdir(join(retainedRoot,skillDir.name),{withFileTypes:true}).catch(()=>[])) if (snapshotDir.isDirectory()) {
+        const path=join(retainedRoot,skillDir.name,snapshotDir.name);
+        if (!referenced.has(await identity(path))) await rm(path,{recursive:true,force:true});
+      }
     return receipts;
   } finally {
     await lock.close();

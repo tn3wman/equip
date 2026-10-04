@@ -46,7 +46,7 @@ test("device authorization bounds unauthenticated database writes", async () => 
     const limited = await authorize({ name: "Device 31", os: "linux", arch: "x64" });
     assert.equal(limited.status, 429);
     assert.deepEqual(await limited.json(), {
-      error: "Too many device authorization requests. Try again shortly.",
+      error: "Too many attempts. Try again in a few minutes.",
     });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));

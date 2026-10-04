@@ -8,6 +8,8 @@ export interface CompatibleAgent {
   projectPath: string;
   profile?: string;
   aliases?: Array<{ profile: string; path: string }>;
+  detection?: "installation" | "configuration";
+  detectionPath?: string;
 }
 
 export function retainedConfiguredTargets(
@@ -58,6 +60,8 @@ export function selectAgentTargets(
         path: resolve(agent.globalPath),
         profile: profile ?? agent.profile,
         ...(agent.aliases ? { aliases: agent.aliases } : {}),
+        ...(agent.detection ? { detection: agent.detection } : {}),
+        ...(agent.detectionPath ? { detectionPath: agent.detectionPath } : {}),
       },
     ];
   });

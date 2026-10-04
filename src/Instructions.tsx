@@ -220,10 +220,10 @@ export default function InstructionsPage({ workspace, refresh, notify }: Props) 
     </div>
     {conflict && <SkillConflict documentKind="instructions" skill={workspaceDocument ? instructionsAsSkill(workspaceDocument) : undefined}
       device={workspace.devices.find(item => item.id === conflict.device.id) ?? conflict.device} receipt={conflict.receipt}
-      onClose={() => setConflict(undefined)} onResolve={async (action, expectedRevision) => {
+      onClose={() => setConflict(undefined)} onResolve={async (action, expectedRevision, mergedFiles) => {
         await api(`/devices/${conflict.device.id}/instructions/resolve`, "POST", {
           instructionId: conflict.receipt.skillId, agent: conflict.receipt.agent, profile: conflict.receipt.profile,
-          action, expectedRevision, expectedLocalRevision: conflict.receipt.localFiles ? await reviewedFilesRevision(conflict.receipt.localFiles) : undefined,
+          action, expectedRevision, mergedFiles, expectedLocalRevision: conflict.receipt.localFiles ? await reviewedFilesRevision(conflict.receipt.localFiles) : undefined,
         });
         await refresh(); notify(action === "publish" ? "Local version published. Waiting for device receipts." : "Choice queued. Waiting for the computer receipt.");
       }} />}

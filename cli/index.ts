@@ -21,13 +21,14 @@ import { flushReceiptOutbox, queueReceiptBatch } from "./outbox.ts";
 import { synchronize, type AgentTarget } from "./sync.ts";
 import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
 import { discoverAgentProfiles } from "./profiles.ts";
-import { replaceExecutable } from "./update.ts";
+import { promoteDirectoryWithRollback, replaceExecutable, runNpmCommand, verifyArtifact, verifyPackageIntegrity, verifyReleaseManifest, verifyReleaseUpgrade } from "./update.ts";
+import { CLI_RELEASE_VERSION, type SignedReleaseManifest } from "../shared/release.ts";
 import { libraryImport } from "./library.ts";
 import { localSkill, syncLocalSkills } from "./local.ts";
 import { getDesired } from "./desired.ts";
 import { consolidate } from "./consolidate.ts";
 import type { RecoveryArchive } from "./recovery.ts";
-import { discoverInstructionLocations, synchronizeInstructions, syncLocalInstructions } from "./instructions.ts";
+import { discoverInstructionLocations, supportedInstructionLocations, synchronizeInstructions, syncLocalInstructions } from "./instructions.ts";
 
 const exec = promisify(execFile);
 const args = process.argv.slice(2);
@@ -166,6 +167,29 @@ function uniqueTargets(targets: AgentTarget[]) {
     ).values(),
   ];
 }
+function includedTargets(targets: AgentTarget[], desired: DesiredState) {
+  return targets.filter(target => !(desired.excludedAgents ?? []).some(excluded =>
+    excluded.agent === target.id && excluded.profile === target.profile &&
+    excluded.project === target.project));
+}
+function locationsForTargets(locations: Awaited<ReturnType<typeof discoverInstructionLocations>>, targets: AgentTarget[]) {
+  return locations.filter(location => targets.some(target =>
+    target.id === location.agent && target.project === location.project &&
+    (target.profile === location.profile || target.aliases?.some(alias => alias.profile === location.profile))));
+}
+function withRetainedInstructionDestinations(
+  desired: DesiredState,
+  unavailable: Array<{agent:string;profile?:string;project?:string}>,
+): DesiredState {
+  if (!unavailable.length) return desired;
+  const excludedAgents = [...(desired.excludedAgents ?? [])];
+  for (const destination of unavailable) {
+    if (!excludedAgents.some(excluded => excluded.agent === destination.agent &&
+      excluded.profile === destination.profile && excluded.project === destination.project))
+      excludedAgents.push({agent:destination.agent,profile:destination.profile,project:destination.project});
+  }
+  return {...desired,excludedAgents};
+}
 async function stopService(s: State) {
   if (!s.service) return;
   const removal = await serviceRemoval(
@@ -189,47 +213,39 @@ async function stopService(s: State) {
   delete s.service;
 }
 class Disconnected extends Error {}
-async function installSkillsRuntime(version: string) {
-  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version))
-    throw new Error(`Invalid skills version in update manifest: ${version}`);
+async function stageSkillsRuntime(manifest: SignedReleaseManifest) {
+  const version = manifest.skillsVersion;
   const runtime = process.env.EQUIP_SKILLS_ROOT
     ? resolve(process.env.EQUIP_SKILLS_ROOT, "../..")
     : join(equipHome, "runtime");
   await mkdir(runtime, { recursive: true });
-  const args = [
-    "install",
-    "--no-audit",
-    "--no-fund",
-    "--no-save",
-    "--prefix",
-    runtime,
-    `skills@${version}`,
-  ];
-  const npmCli = process.env.EQUIP_NPM_CLI || process.env.npm_execpath;
-  if (npmCli) {
-    await exec(process.execPath, [npmCli, ...args], { timeout: 180_000 });
-    return;
-  }
-  const executable =
-    platform() === "win32"
-      ? join(dirname(process.execPath), "npm.cmd")
-      : join(dirname(process.execPath), "npm");
-  const present = await readFile(executable)
-    .then(() => true)
-    .catch(() => false);
+  const stage = join(runtime, `.skills-${randomUUID()}.stage`);
+  const npm = process.env.EQUIP_NPM_CLI || process.env.npm_execpath ||
+    (platform() === "win32" ? join(dirname(process.execPath), "npm.cmd") : join(dirname(process.execPath), "npm"));
+  const present = await readFile(npm).then(() => true).catch(() => false);
   if (!present)
-    throw new Error(
-      "A skills runtime update is available, but this installation has no npm. Re-run the Equip installer to update its managed runtime.",
-    );
-  if (platform() === "win32") {
-    const comspec = process.env.ComSpec || "cmd.exe";
-    const quote = (value: string) => `"${value.replace(/"/g, '""')}"`;
-    await exec(
-      comspec,
-      ["/d", "/s", "/c", [quote(executable), ...args.map(quote)].join(" ")],
-      { timeout: 180_000 },
-    );
-  } else await exec(executable, args, { timeout: 180_000 });
+    throw new Error("A skills runtime update is available, but this installation has no npm. Re-run the Equip installer to update its managed runtime.");
+  await mkdir(stage, { recursive: true });
+  try {
+    const packed = await runNpmCommand(npm, ["pack", `skills@${version}`, "--pack-destination", stage, "--json"]);
+    const records = JSON.parse(packed.stdout) as Array<{ filename?: unknown }>;
+    const filename = records.length === 1 && typeof records[0]?.filename === "string" ? records[0].filename : "";
+    if (!filename || basename(filename) !== filename)
+      throw new Error("npm returned an invalid Skills package filename.");
+    const tarball = join(stage, filename);
+    verifyPackageIntegrity(await readFile(tarball), manifest.skillsIntegrity);
+    await runNpmCommand(npm, [
+      "install", "--no-audit", "--no-fund", "--no-save", "--ignore-scripts",
+      "--prefix", stage, tarball,
+    ]);
+    const installed = JSON.parse(await readFile(join(stage, "node_modules", "skills", "package.json"), "utf8")) as { version?: unknown };
+    if (installed.version !== version)
+      throw new Error("The installed skills runtime version does not match the signed release.");
+    return { runtime, stage };
+  } catch (error) {
+    await rm(stage, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 async function maybeUpdate(s: State) {
   if (
@@ -238,35 +254,49 @@ async function maybeUpdate(s: State) {
   )
     return false;
   const base = s.server || server;
+  if (new URL(base).protocol !== "https:") return false;
   const response = await fetch(`${base}/cli/manifest`, {
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) return false;
-  const manifest = (await response.json()) as {
-    version: string;
-    sha256: string;
-    skillsVersion: string;
-    url: string;
-  };
+  const manifest = verifyReleaseManifest(await response.json(), base);
   s.lastUpdateCheck = new Date().toISOString();
   const compatibility = await getCompatibility(agentHome);
-  let changed = false;
-  if (manifest.skillsVersion !== compatibility.version) {
-    await installSkillsRuntime(manifest.skillsVersion);
-    changed = true;
-  }
   const executable = resolve(process.argv[1]);
   const current = await readFile(executable);
-  if (createHash("sha256").update(current).digest("hex") !== manifest.sha256) {
-    const artifact = await fetch(new URL(manifest.url, base), {
+  const artifactChanged = createHash("sha256").update(current).digest("hex") !== manifest.sha256;
+  verifyReleaseUpgrade(manifest, CLI_RELEASE_VERSION, compatibility.version, artifactChanged);
+  let changed = false;
+  let nextExecutable: Buffer | undefined;
+  if (artifactChanged) {
+    const artifact = await fetch(manifest.url, {
       signal: AbortSignal.timeout(60_000),
     });
     if (!artifact.ok)
       throw new Error(`CLI update download failed: ${artifact.status}`);
     const data = Buffer.from(await artifact.arrayBuffer());
-    if (createHash("sha256").update(data).digest("hex") !== manifest.sha256)
-      throw new Error("CLI update hash mismatch");
-    await replaceExecutable(executable, data);
+    verifyArtifact(data, manifest.sha256);
+    nextExecutable = data;
+  }
+  const stagedSkills = manifest.skillsVersion !== compatibility.version
+    ? await stageSkillsRuntime(manifest)
+    : undefined;
+  const replaceCli = async () => {
+    if (nextExecutable) await replaceExecutable(executable, nextExecutable);
+  };
+  if (stagedSkills) {
+    try {
+      await promoteDirectoryWithRollback(
+        join(stagedSkills.runtime, "node_modules"),
+        join(stagedSkills.stage, "node_modules"),
+        replaceCli,
+      );
+    } finally {
+      await rm(stagedSkills.stage, { recursive: true, force: true }).catch(() => {});
+    }
+    changed = true;
+  } else if (nextExecutable) {
+    await replaceCli();
     changed = true;
   }
   await saveWorkerFields(s, { lastUpdateCheck: s.lastUpdateCheck });
@@ -320,7 +350,6 @@ async function applyState(s: State) {
         ...configuredTargets,
       ]);
   const targets = selected.map((t) => ({ ...t, deviceId: s.deviceId }));
-  const instructionLocations = await discoverInstructionLocations(targets, {home:agentHome, autoDetect:s.autoDetect});
   const base = s.server || server;
   const archive: RecoveryArchive = async payload => {
     const result = await request<{archived:boolean}>("/api/device/recovery", {
@@ -332,7 +361,16 @@ async function applyState(s: State) {
   // Remove state written by releases that treated a folder as a live authority.
   await rm(join(equipHome, "library-link.json"), { force: true });
   let desiredBeforeLocal = await getDesired(equipHome, base, s.token);
-  const local = await syncLocalSkills(equipHome, targets, desiredBeforeLocal, payload => request("/api/device/local", {
+  let activeTargets = includedTargets(targets, desiredBeforeLocal);
+  const allInstructionLocations = await discoverInstructionLocations(targets, {home:agentHome, autoDetect:s.autoDetect});
+  let detectedInstructionLocations = locationsForTargets(allInstructionLocations, activeTargets);
+  const instructionSupport = supportedInstructionLocations(
+    detectedInstructionLocations,
+    desiredBeforeLocal.instructions,
+    s.deviceId,
+  );
+  const instructionLocations = instructionSupport.locations;
+  const local = await syncLocalSkills(equipHome, activeTargets, desiredBeforeLocal, payload => request("/api/device/local", {
     method: "POST", body: JSON.stringify(payload),
   }, s.token, base));
   if (local.changed) desiredBeforeLocal = await getDesired(equipHome, base, s.token);
@@ -351,7 +389,10 @@ async function applyState(s: State) {
         localSyncPath: join(equipHome, "skills"),
         localSyncError: [...local.errors,...localInstructions.errors].join("\n"),
         instructionLocations,
-        instructionUnavailable: targets.filter(t => !t.project && !instructionLocations.some(l => l.agent === t.id)).map(t => ({agent:t.id,reason:"No verified global instruction integration is available for this agent. Its skills continue to synchronize."})),
+        instructionUnavailable: [
+          ...instructionSupport.unavailable,
+          ...targets.filter(t => !t.project && !allInstructionLocations.some(l => l.agent === t.id)).map(t => ({agent:t.id,profile:t.profile,reason:"No verified global instruction integration is available for this agent. Its skills continue to synchronize."})),
+        ],
         agents: targets.map((t) => ({
           id: t.id,
           name: t.name ?? t.id,
@@ -359,6 +400,8 @@ async function applyState(s: State) {
           profile: t.profile,
           project: t.project,
           aliases: t.aliases,
+          detection: t.detection,
+          detectionPath: t.detectionPath,
         })),
       }),
     },
@@ -399,6 +442,10 @@ async function applyState(s: State) {
     }
     desired = await getDesired(equipHome, base, s.token);
   }
+  activeTargets = includedTargets(targets, desired);
+  detectedInstructionLocations = locationsForTargets(allInstructionLocations, activeTargets);
+  const currentInstructionSupport = supportedInstructionLocations(detectedInstructionLocations, desired.instructions, s.deviceId);
+  const activeInstructionLocations = currentInstructionSupport.locations;
   if (desired.disconnect) {
     const receipts =
       desired.disconnect === "remove"
@@ -410,7 +457,7 @@ async function applyState(s: State) {
           )
         : [];
     if (desired.disconnect === "remove") receipts.push(...await synchronizeInstructions(
-      {generation:desired.generation,skills:[],resolutions:{},instructions:[]},instructionLocations,equipHome,s.deviceId,archive));
+      {generation:desired.generation,skills:[],resolutions:{},instructions:[]},allInstructionLocations,equipHome,s.deviceId,archive));
     await postReceipts(s, base, desired.generation, receipts);
     if (receipts.some(receipt => receipt.status !== 'synchronized')) {
       await saveWorkerFields(s,{lastError:'Disconnect removal is waiting for local conflicts to be resolved.'});
@@ -427,7 +474,9 @@ async function applyState(s: State) {
     throw new Disconnected(`Disconnected (${desired.disconnect})`);
   }
   const receipts = await synchronize(desired, targets, equipHome,archive);
-  receipts.push(...await synchronizeInstructions(desired,instructionLocations,equipHome,s.deviceId,archive));
+  receipts.push(...await synchronizeInstructions(
+    withRetainedInstructionDestinations(desired,currentInstructionSupport.unavailable),
+    allInstructionLocations,equipHome,s.deviceId,archive));
   await postReceipts(s, base, desired.generation, receipts);
   const migration = await consolidate(equipHome,agentHome ?? homedir(),desired,archive);
   if (command === "tidy") console.log(JSON.stringify(migration,null,2));

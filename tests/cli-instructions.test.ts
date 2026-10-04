@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile, lstat, r
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { discoverInstructionLocations, syncLocalInstructions, synchronizeInstructions } from '../cli/instructions.ts';
+import { discoverInstructionLocations, supportedInstructionLocations, syncLocalInstructions, synchronizeInstructions } from '../cli/instructions.ts';
 import { skillRevision } from '../shared/library.ts';
 import { instructionKey } from '../shared/instructions.ts';
 import type { DesiredState, Instructions, InstructionLocation } from '../shared/types.ts';
@@ -167,6 +167,47 @@ test('one shared global revision is mirrored into every supported native filenam
  assert.equal(receipts.length,9);assert.ok(receipts.every(r=>r.status==='synchronized'&&r.revision===policy.revision));
  for(const location of locations) assert.equal(await readFile(location.path,'utf8'),'One global policy\n');
  assert.equal(await readFile(join(project,'AGENTS.md'),'utf8'),'Project-specific context\n');
+});
+
+test('native instruction limits report an unavailable destination without a failed receipt', () => {
+ const windsurf:InstructionLocation={agent:'windsurf',filename:'global_rules.md',path:'/windsurf/memories/global_rules.md'};
+ const codex:InstructionLocation={agent:'codex',filename:'AGENTS.md',path:'/codex/AGENTS.md'};
+ const oversized={...doc(),title:'Team rules',files:[{path:'AGENTS.md',content:'x'.repeat(6001)}],versions:[{revision:'r1'}]} as unknown as Instructions;
+ const result=supportedInstructionLocations([windsurf,codex],[oversized]);
+ assert.deepEqual(result.locations,[codex]);
+ assert.equal(result.unavailable.length,1);
+ assert.equal(result.unavailable[0].agent,'windsurf');
+ assert.match(result.unavailable[0].reason,/6,000 characters/);
+ assert.match(result.unavailable[0].reason,/Skills continue to synchronize/);
+});
+
+test('native instruction limits use published desired files when version history is stripped', () => {
+ const windsurf:InstructionLocation={agent:'windsurf',filename:'global_rules.md',path:'/windsurf/memories/global_rules.md'};
+ const oversized={...doc(),title:'Team rules',files:[{path:'AGENTS.md',content:'x'.repeat(6001)}],versions:[]} as Instructions;
+ const result=supportedInstructionLocations([windsurf],[oversized]);
+ assert.deepEqual(result.locations,[]);
+ assert.equal(result.unavailable[0]?.agent,'windsurf');
+ assert.match(result.unavailable[0]?.reason ?? '',/6,001 characters/);
+});
+
+test('excluded instructions retain their installed revision, catch up when re-enabled, and remove on disconnect',async t=>{
+ const {state,a}=await fixture(t);const first=doc('First\n');await synchronizeInstructions(desired(first),[a],state);
+ const second=doc('Second\n');const retained={...desired(second),generation:2,excludedAgents:[{agent:a.agent}]};
+ assert.deepEqual(await synchronizeInstructions(retained,[a],state),[]);
+ assert.equal(await readFile(a.path,'utf8'),'First\n');
+ const retainedPath=await realpath(a.path);assert.match(retainedPath,/retained\/instructions\/instruction_test\//);
+ const caughtUp=await synchronizeInstructions({...desired(second),generation:3},[a],state);
+ assert.equal(caughtUp[0].status,'synchronized');assert.equal(await readFile(a.path,'utf8'),'Second\n');
+ assert.equal(await lstat(retainedPath).catch(()=>null),null);
+ await synchronizeInstructions({generation:4,skills:[],resolutions:{},instructions:[]},[a],state);
+ assert.equal(await lstat(a.path).catch(()=>null),null);
+});
+
+test('excluded instructions stop following the canonical file when another agent updates',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,agent:'claude-code',path:join(root,'claude/CLAUDE.md'),filename:'CLAUDE.md' as const};await mkdir(join(root,'claude'));
+ const first=doc('First\n');await synchronizeInstructions(desired(first),[a,b],state);
+ const second=doc('Second\n');await synchronizeInstructions({...desired(second),generation:2,excludedAgents:[{agent:a.agent}]},[a,b],state);
+ assert.equal(await readFile(a.path,'utf8'),'First\n');assert.equal(await readFile(b.path,'utf8'),'Second\n');
 });
 
 test('shared native instruction locations retain the file until the last agent is removed',async t=>{

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { Pool, type PoolClient } from "pg";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export type RunResult = { changes: number };
 export interface Store {
@@ -9,7 +10,7 @@ export interface Store {
   get<T = any>(sql: string, ...values: unknown[]): Promise<T | undefined>;
   all<T = any>(sql: string, ...values: unknown[]): Promise<T[]>;
   run(sql: string, ...values: unknown[]): Promise<RunResult>;
-  transaction<T>(work: (store: Store) => Promise<T>): Promise<T>;
+  transaction<T>(work: (store: Store) => Promise<T>, options?: { readOnly?: boolean }): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -18,6 +19,10 @@ const schema = [
   "CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, account_id TEXT, demo INTEGER NOT NULL DEFAULT 0, expires_at BIGINT NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
   "CREATE TABLE IF NOT EXISTS device_authorizations (device_code_hash TEXT PRIMARY KEY, user_code TEXT NOT NULL UNIQUE, account_id TEXT, name TEXT NOT NULL, os TEXT NOT NULL, arch TEXT NOT NULL, status TEXT NOT NULL, expires_at BIGINT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS device_tokens (token_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL, device_id TEXT NOT NULL, revoked_at BIGINT, created_at BIGINT NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
+  "CREATE TABLE IF NOT EXISTS auth_rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at BIGINT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS email_authorizations (token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT NOT NULL, expires_at BIGINT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS skill_bundles (account_id TEXT NOT NULL, hash TEXT NOT NULL, files TEXT NOT NULL, PRIMARY KEY(account_id,hash), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
+  "CREATE TABLE IF NOT EXISTS workspace_devices (account_id TEXT NOT NULL, device_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account_id,device_id), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
 ];
 
 class SQLiteStore implements Store {
@@ -55,9 +60,17 @@ class SQLiteStore implements Store {
       return { changes: result.changes };
     });
   }
-  async transaction<T>(work: (store: Store) => Promise<T>) {
+  async transaction<T>(work: (store: Store) => Promise<T>, options: { readOnly?: boolean } = {}) {
     return this.serialized(async () => {
-      this.database.exec("BEGIN IMMEDIATE");
+      const deadline = Date.now() + 30_000;
+      for (;;) {
+        try { this.database.exec(options.readOnly ? "BEGIN" : "BEGIN IMMEDIATE"); break; }
+        catch (error: any) {
+          if (error.code !== "SQLITE_BUSY" || Date.now() >= deadline) throw error;
+          // Yield so another application's asynchronous transaction can finish.
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      }
       try {
         const result = await work(new SQLiteStore(this.database, true));
         this.database.exec("COMMIT");
@@ -97,10 +110,10 @@ class PostgresStore implements Store {
     const result = await this.query(sql, values);
     return { changes: result.rowCount ?? 0 };
   }
-  async transaction<T>(work: (store: Store) => Promise<T>) {
+  async transaction<T>(work: (store: Store) => Promise<T>, options: { readOnly?: boolean } = {}) {
     const client = await this.pool.connect();
     try {
-      await client.query("BEGIN");
+      await client.query(options.readOnly ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : "BEGIN");
       const result = await work(new PostgresStore(this.pool, client));
       await client.query("COMMIT");
       return result;
@@ -121,6 +134,7 @@ async function initialize(store: Store) {
   await store.run(
     "CREATE UNIQUE INDEX IF NOT EXISTS accounts_email_lower_unique ON accounts(LOWER(email))",
   );
+  await store.run("CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry ON auth_rate_limits(expires_at)");
   if (store.dialect === "postgres") {
     await store.run(
       "CREATE TABLE IF NOT EXISTS storage_migrations (name TEXT PRIMARY KEY, completed_at TEXT NOT NULL)",
@@ -131,6 +145,10 @@ async function initialize(store: Store) {
       "device_authorizations",
       "device_tokens",
       "storage_migrations",
+      "auth_rate_limits",
+      "email_authorizations",
+      "skill_bundles",
+      "workspace_devices",
     ])
       await store.run(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
   }
@@ -274,8 +292,31 @@ export async function openStore(options: {
   const database = new Database(path.join(options.dataDir, "equip.sqlite"));
   database.pragma("journal_mode = WAL");
   database.pragma("foreign_keys = ON");
+  database.pragma("busy_timeout = 0");
   const store = new SQLiteStore(database);
   await initialize(store);
   await backfillDisconnectedDevices(store);
   return store;
+}
+
+/** Every query inside an account operation uses the same database transaction. */
+export function transactionalStore(store: Store): Store {
+  const context = new AsyncLocalStorage<Store>();
+  return {
+    dialect: store.dialect,
+    get: (sql, ...values) => (context.getStore() ?? store).get(sql, ...values),
+    all: (sql, ...values) => (context.getStore() ?? store).all(sql, ...values),
+    run: (sql, ...values) => (context.getStore() ?? store).run(sql, ...values),
+    transaction: (work, options) => context.getStore()
+      ? work(context.getStore()!)
+      : store.transaction(transaction => context.run(transaction, () => work(transaction)), options),
+    close: () => store.close(),
+  };
+}
+
+export async function lockAccount(store: Store, accountId: string) {
+  return store.get<{workspace: string}>(
+    `SELECT workspace FROM accounts WHERE id=?${store.dialect === "postgres" ? " FOR UPDATE" : ""}`,
+    accountId,
+  );
 }

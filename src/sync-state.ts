@@ -1,5 +1,8 @@
 import type { Device, Instructions, Receipt, Skill, SyncStatus } from "../shared/types";
 import { instructionDeployment } from "../shared/instructions";
+const agentExcluded = (device: Device, agent: Device["agents"][number]) =>
+  (device.excludedAgents ?? []).some(item => item.agent === agent.id &&
+    item.profile === agent.profile && item.project === agent.project);
 export function deployment(
   skill: Skill,
   devices: Device[],
@@ -10,6 +13,7 @@ export function deployment(
       device,
       agents: device.agents.filter(
         (agent) =>
+          !agentExcluded(device, agent) &&
           !skill.targets.some(
             (t) =>
               t.deviceId === device.id &&
@@ -61,7 +65,7 @@ export function conflictDevices(skill: Skill, devices: Device[]): Device[] {
 export function conflictInstallations(skill: Skill, devices: Device[]): { device: Device; receipt: Receipt }[] {
   if (!skill.selected || !skill.enabled || !skill.versions.length) return [];
   return devices.filter(device => !device.disconnect && !device.disconnectedAt).flatMap(device =>
-    device.agents.filter(agent => !skill.targets.some(target =>
+    device.agents.filter(agent => !agentExcluded(device, agent) && !skill.targets.some(target =>
       target.deviceId === device.id && target.agent === agent.id &&
       (!target.profile || target.profile === agent.profile) &&
       (!target.project || target.project === agent.project) && !target.enabled)).flatMap(agent =>
@@ -77,10 +81,6 @@ export function deviceStatus(
   instructions: Instructions[] = [],
 ): SyncStatus {
   if (!device.online || device.disconnect) return "offline";
-  const issue = device.receipts.find(
-    (r) => r.status === "conflicted" || r.status === "failed",
-  );
-  if (issue) return issue.status;
   if (generation !== undefined && device.appliedGeneration !== generation)
     return "pending";
   const published = skills.filter(
@@ -92,15 +92,16 @@ export function deviceStatus(
   );
   if (publishedInstructions.length && device.instructionLocations === undefined)
     return "pending";
-  if (
-    published.some((s) => {
-      const result = deployment(s, [device]);
-      return result.total > 0 && result.status !== "synchronized";
-    })
-  )
+  const skillDeployments = published.map(skill => deployment(skill, [device]));
+  const instructionDeployments = publishedInstructions.map(document =>
+    instructionDeployment(document, [device]));
+  const issue = [...skillDeployments, ...instructionDeployments].find(result =>
+    result.total > 0 && (result.status === "conflicted" || result.status === "failed"));
+  if (issue) return issue.status;
+  if (skillDeployments.some(result =>
+    result.total > 0 && result.status !== "synchronized"))
     return "pending";
-  if (publishedInstructions.some((document) => {
-    const result = instructionDeployment(document, [device]);
+  if (instructionDeployments.some((result) => {
     return result.total > 0 && result.status !== "synchronized";
   })) return "pending";
   return device.lastSync ? "synchronized" : "pending";

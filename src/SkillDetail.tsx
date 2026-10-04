@@ -43,6 +43,7 @@ export default function SkillDetail({
   onEdit,
   onChange,
   notify,
+  initialTab = "instructions",
 }: {
   skill: Skill;
   workspace: Workspace;
@@ -50,6 +51,7 @@ export default function SkillDetail({
   onEdit: (s: Skill) => void;
   onChange: () => Promise<void>;
   notify: (m: string) => void;
+  initialTab?: string;
 }) {
   const panel = useRef<HTMLElement>(null);
   const contentPanel = useRef<HTMLDivElement>(null);
@@ -57,7 +59,8 @@ export default function SkillDetail({
   const reviewRequested = useRef(false);
   const close = useRef(onClose);
   close.current = onClose;
-  const [tab, setTab] = useState("instructions");
+  const [tab, setTab] = useState(initialTab);
+  const [previewVersion,setPreviewVersion] = useState<Skill["versions"][number]>();
   const [file, setFile] = useState("SKILL.md");
   const [actual, setActual] = useState<Skill>();
   const [loading, setLoading] = useState(false);
@@ -80,7 +83,7 @@ export default function SkillDetail({
   const data = actual || skill;
   const hasUpdate = Boolean(skill.upstreamCheckedAt && skill.upstreamRevision && skill.upstreamRevision !== skill.revision);
   const flagged = safety?.status === "warn" || safety?.status === "fail";
-  const files = data.files.length ? data.files : data.draft || [];
+  const files = previewVersion?.files ?? (data.files.length ? data.files : data.draft || []);
   const activeFile = files.find((f) => f.path === file) || files[0];
   const revealReports = () => {
     const content = contentPanel.current;
@@ -145,7 +148,7 @@ export default function SkillDetail({
     };
   }, []);
   useEffect(() => {
-    if (!installed) return;
+    if (!installed && !workspace.retiredSkills?.some(item => item.id === skill.id)) return;
     let disposed = false;
     setLoading(true);
     setError("");
@@ -395,7 +398,7 @@ export default function SkillDetail({
           </div>
         )}
         {installed && skill.revision && <div className="detail-actions"><a className="button small" href={`/api/skills/${skill.id}/export?revision=${encodeURIComponent(skill.revision)}`} download><ArrowDownToLine size={14} /> Download ZIP {revision(skill.revision)}</a></div>}
-        {!!conflicts.length && <div className="detail-conflict-notice"><AlertTriangle size={18} /><div><strong>Local copies differ from Equip</strong><p>{conflicts.length} installation{conflicts.length === 1 ? " has" : "s have"} different files. Back them up and use Equip's selected version.</p><button className="text-link" onClick={() => setSyncReviewOpen(true)}>Resolve conflict <ChevronRight size={14} /></button></div></div>}
+        {!!conflicts.length && <div className="detail-conflict-notice"><AlertTriangle size={18} /><div><strong>Local copies differ from Equip</strong><p>{conflicts.length} installation{conflicts.length === 1 ? " has" : "s have"} different files. Review each copy before choosing the version to keep. Equip saves replaced files in recovery history.</p><button className="text-link" onClick={() => setSyncReviewOpen(true)}>Resolve conflict <ChevronRight size={14} /></button></div></div>}
         {installed && loading && <div className="catalog-loading" role="status"><Loader2 className="spin" size={16} /> Loading skill files…</div>}
         <div
           className="tabs detail-tabs"
@@ -600,6 +603,7 @@ export default function SkillDetail({
               </div>
             </>
           )}
+          {previewVersion && tab !== "history" && <div className="notice"><span>Viewing saved revision {revision(previewVersion.revision)}. The selected revision stays unchanged.</span><button className="text-link" onClick={()=>setPreviewVersion(undefined)}>View selected files</button></div>}
           {tab === "history" && (
             <>
               {skill.kind === "third-party" && (
@@ -643,7 +647,7 @@ export default function SkillDetail({
                   Check for updates
                 </button>
               )}
-              <h3 className="detail-section-title">Published versions</h3>
+              <h3 className="detail-section-title">Version history</h3>
               {skill.draft && (
                 <div className="draft-note">
                   <Pencil size={15} />
@@ -651,15 +655,16 @@ export default function SkillDetail({
                   published version.
                 </div>
               )}
-              {skill.versions.map((v) => (
+              {data.versions.map((v) => (
                 <div className="version-row" key={v.id}>
                   <span className="version-dot" />
                   <div>
-                    <strong>{v.message}</strong>
+                    <strong><span className={`version-kind ${/^Recovered from /i.test(v.message) ? "recovered" : "published"}`}>{/^Recovered from /i.test(v.message) ? "Recovered" : "Published"}</span>{v.message}</strong>
                     <span>
                       <code>{revision(v.revision)}</code> · {ago(v.createdAt)}
                     </span>
                   </div>
+                  <button className="button small" disabled={!v.files.length} onClick={()=>{setPreviewVersion(v);setTab("instructions");setFile("SKILL.md");}}>Inspect files</button>
                   <a className="button small" href={`/api/skills/${skill.id}/export?revision=${encodeURIComponent(v.revision)}`}><ArrowDownToLine size={13} />Download</a>
                   {v.revision === skill.revision ? (
                     <span className="custom-tag">Selected</span>
@@ -677,7 +682,7 @@ export default function SkillDetail({
                   )}
                 </div>
               ))}
-              {!skill.versions.length && (
+              {!data.versions.length && (
                 <p className="muted-copy">
                   Publish your draft to create the first version.
                 </p>

@@ -1,0 +1,30 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-release:
+    name: Native release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build:cli
+      - name: Test native install, update, and device authorization
+        run: npx tsx --test tests/platform-runtime.test.ts tests/cli-update-security.test.ts tests/cli-live.test.ts

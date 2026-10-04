@@ -66,6 +66,7 @@ export interface Skill {
   autoUpdate: boolean;
   revision: string;
   upstreamRevision?: string;
+  proposal?: { revision: string; files: SkillFile[]; checkedAt: string };
   upstreamCheckedAt?: string;
   versions: Version[];
   files: SkillFile[];
@@ -89,6 +90,8 @@ export interface Agent {
   profile?: string;
   project?: string;
   aliases?: Array<{ profile: string; path: string }>;
+  detection?: "installation" | "configuration";
+  detectionPath?: string;
 }
 export interface Receipt {
   kind?: "instructions";
@@ -117,7 +120,8 @@ export interface Device {
   agents: Agent[];
   receipts: Receipt[];
   instructionLocations?: InstructionLocation[];
-  instructionUnavailable?: Array<{agent: string; reason: string}>;
+  instructionUnavailable?: Array<{agent: string; profile?: string; project?: string; reason: string}>;
+  excludedAgents?: Array<{agent: string; profile?: string; project?: string}>;
   instructionResolutions?: Record<string, "replace" | "preserve" | "import">;
   instructionResolutionChecks?: Record<string, string>;
   demo?: boolean;
@@ -155,6 +159,9 @@ export interface Workspace {
   devices: Device[];
   activity: Activity[];
   generation: number;
+  reviewedChanges?: string[];
+  retiredSkills?: Skill[];
+  retiredInstructions?: Instructions[];
   sourceRequests?: SourceRequest[];
   compatibility?: { version: string; count: number; checkedAt: string };
 }
@@ -169,6 +176,7 @@ export interface DesiredState {
   disconnect?: "retain" | "remove";
   localSync?: boolean;
   localSkills?: Array<Pick<Skill, "id" | "name" | "revision" | "kind">>;
+  excludedAgents?: Array<{agent: string; profile?: string; project?: string}>;
 }
 export type InstructionFilename = "CLAUDE.md" | "AGENTS.md";
 export interface Instructions {

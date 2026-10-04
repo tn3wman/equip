@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, cp, lstat, mkdir, open, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve } from 'node:path';
 import type { DesiredState, InstructionFilename, InstructionLocation, Instructions, Receipt, SkillFile } from '../shared/types.ts';
 import { skillRevision } from '../shared/library.ts';
@@ -14,6 +14,14 @@ interface Entry { skillId: string; agent: string; profile?: string; project?: st
 interface Canonical { path: string; hash: string; portableHash?: string; revision: string; transaction?: string }
 interface Ledger { installs: Record<string, Entry>; canonicals: Record<string, Canonical> }
 interface Transaction { path: string; stage: string; old: string; hadOld: boolean; id: string; key: string; skillId: string; filename: InstructionFilename; expectedHash: string; canonical?: boolean }
+function excludedDestination(
+  desired: DesiredState,
+  destination: { agent: string; profile?: string; project?: string },
+) {
+  return (desired.excludedAgents ?? []).some(excluded =>
+    excluded.agent === destination.agent && excluded.profile === destination.profile &&
+    excluded.project === destination.project);
+}
 const ledgerPath = (home: string) => join(home, 'instructions-ledger.json');
 async function json<T>(path: string, fallback: T): Promise<T> {
   return readFile(path, 'utf8').then(s => JSON.parse(s) as T).catch(e => { if (e.code === 'ENOENT') return fallback; throw e; });
@@ -94,6 +102,39 @@ export async function discoverInstructionLocations(targets: AgentTarget[], optio
     if (warnings.length) location.warning = warnings.join(' ');
   }
   return unique;
+}
+
+export interface InstructionUnavailable {
+  agent: string;
+  profile?: string;
+  project?: string;
+  reason: string;
+}
+
+/** Removes native destinations that cannot represent the current published instructions. */
+export function supportedInstructionLocations(
+  locations: InstructionLocation[],
+  documents: Instructions[] = [],
+  deviceId?: string,
+): { locations: InstructionLocation[]; unavailable: InstructionUnavailable[] } {
+  const active = documents.filter(document =>
+    document.selected && document.enabled && Boolean(document.revision) &&
+    document.files.length > 0 && document.scope === 'global');
+  const unavailable: InstructionUnavailable[] = [];
+  const supported = locations.filter(location => {
+    if (location.agent !== 'windsurf') return true;
+    const oversized = active.find(document =>
+      instructionEnabled(document, location, deviceId) && document.files[0]?.content.length > 6000);
+    if (!oversized) return true;
+    unavailable.push({
+      agent: location.agent,
+      profile: location.profile,
+      project: location.project,
+      reason: `Windsurf global rules support up to 6,000 characters. "${oversized.title}" has ${oversized.files[0].content.length.toLocaleString()} characters. Skills continue to synchronize.`,
+    });
+    return false;
+  });
+  return { locations: supported, unavailable };
 }
 
 async function archiveFiles(archive:RecoveryArchive|undefined, skillId:string, files:SkillFile[], path:string) {
@@ -191,6 +232,29 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
     await lock.writeFile(JSON.stringify({pid:process.pid}));
     const ledger = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
     await recover(home,ledger,archive);
+    // Retained destinations share one immutable snapshot for each old revision.
+    for (const [key,entry] of Object.entries(ledger.installs)) {
+      if (!excludedDestination(desired,entry) || !entry.pointer) continue;
+      const current = await snapshot(entry.path,entry.filename);
+      if (!current.exists) continue;
+      const retained = join(home,'retained','instructions',entry.skillId,portableFilesRevision(current.files),entry.filename);
+      if (!await lstat(retained).catch(()=>null)) {
+        const retainedStage = retained+'.equip-stage-'+randomUUID();await mkdir(dirname(retained),{recursive:true});
+        await writeFile(retainedStage,current.files[0].content,{mode:current.files[0].mode ?? 0o644});
+        await rename(retainedStage,retained).catch(async error=>{await rm(retainedStage,{force:true});if(!await lstat(retained).catch(()=>null))throw error;});
+      }
+      const stage = entry.path+'.equip-retained-'+randomUUID();
+      try {await symlink(process.platform==='win32'?retained:relative(await realpath(dirname(entry.path)),await realpath(retained)),stage,'file');}
+      catch (error) {
+        if (!['EPERM','EACCES','ENOTSUP','EINVAL'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+        await cp(retained,stage);
+      }
+      const stagedPointer=(await lstat(stage)).isSymbolicLink()?await readlink(stage):undefined;
+      const retainedEntry={...entry,pointer:stagedPointer,hash:current.hash,portableHash:current.portableHash};
+      if (process.platform==='win32' || !stagedPointer)
+        await replaceFile(home,ledger,key,entry.path,stage,retainedEntry,entry.filename,entry.skillId,archive);
+      else {await rename(stage,entry.path);ledger.installs[key]=retainedEntry;await atomicJson(ledgerPath(home),ledger);}
+    }
     const receipts: Receipt[] = [];
     const wanted = new Set<string>();
     const selectedPaths = new Map<string,string>();
@@ -201,7 +265,10 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           doc.files.length !== 1 || doc.files[0].path !== doc.filename || doc.files[0].encoding ||
           Buffer.byteLength(doc.files[0].content) > limit || doc.files[0].content.includes('\0'))
         throw new Error('Invalid instruction document in desired state');
-      const targets = locations.filter(l => instructionEnabled(doc,l,deviceId));
+      const targets = locations.filter(l =>
+        !excludedDestination(desired, l) && instructionEnabled(doc,l,deviceId) &&
+        !Object.values(ledger.installs).some(entry => entry.skillId === doc.id &&
+          entry.path === l.path && excludedDestination(desired,entry)));
       if (!targets.length) continue;
       const canonicalPath = join(home,'instructions',doc.id,doc.filename);
       const desiredHash = skillRevision(doc.files);
@@ -256,7 +323,6 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         try {
           if (selectedPaths.has(location.path) && selectedPaths.get(location.path) !== doc.id) throw new Error('Two instruction documents select the same file. Disable one or change its destinations.');
           selectedPaths.set(location.path,doc.id);
-          if (location.agent === 'windsurf' && doc.files[0].content.length > 6000) throw new Error('Windsurf global rules are limited to 6,000 characters. The previous file was preserved.');
           const current = await snapshot(location.path,doc.filename);
           let action = desired.instructionResolutions?.[key];
           const checked = desired.instructionResolutionChecks?.[key];
@@ -307,6 +373,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
     }
     for (const [key,entry] of Object.entries(ledger.installs)) {
       if (wanted.has(key)) continue;
+      if (excludedDestination(desired, entry)) continue;
       const base = {kind:'instructions' as const,skillId:entry.skillId,agent:entry.agent,profile:entry.profile,project:entry.project,path:entry.path,revision:entry.revision,timestamp:new Date().toISOString()};
       try {
         if (Object.entries(ledger.installs).some(([k,e]) => k !== key && wanted.has(k) && e.path === entry.path)) {delete ledger.installs[key];continue;}
@@ -329,6 +396,15 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
       } catch (error) {receipts.push({...base,status:'failed',message:(error as Error).message});}
     }
     await atomicJson(ledgerPath(home),ledger);
+    const retainedRoot=join(home,'retained','instructions');
+    const referenced=new Set(await Promise.all(Object.values(ledger.installs).map(entry=>realpath(entry.path).catch(()=>''))));
+    for(const documentDir of await readdir(retainedRoot,{withFileTypes:true}).catch(()=>[])) if(documentDir.isDirectory())
+      for(const snapshotDir of await readdir(join(retainedRoot,documentDir.name),{withFileTypes:true}).catch(()=>[])) if(snapshotDir.isDirectory()) {
+        const path=join(retainedRoot,documentDir.name,snapshotDir.name);
+        const files=await readdir(path).catch(()=>[]);
+        const used=(await Promise.all(files.map(file=>realpath(join(path,file)).catch(()=>'')))).some(file=>referenced.has(file));
+        if(!used)await rm(path,{recursive:true,force:true});
+      }
     return receipts;
   } finally {await lock.close();await rm(lockPath,{force:true});}
 }

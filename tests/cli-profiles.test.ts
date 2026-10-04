@@ -73,6 +73,10 @@ test("profile discovery finds conventional and suffixed agent homes", async () =
       profile.globalPath.includes(".claude_nova.lock"),
     ),
   );
+  const defaultCodex = profiles.find(profile =>
+    profile.id === "codex" && profile.profile === undefined);
+  assert.equal(defaultCodex?.detection, "configuration");
+  assert.equal(defaultCodex?.detectionPath, join(home, ".codex"));
 });
 
 test("linked skill roots stay one physical target with every configuration alias", async () => {
@@ -139,6 +143,8 @@ test("profile discovery preserves non-profile upstream path overrides", async ()
     profiles.find((profile) => profile.id === "mistral-vibe")?.globalPath,
     join(vibe, "skills"),
   );
+  assert.equal(profiles.find((profile) => profile.id === "opencode")?.detection, "configuration");
+  assert.equal(profiles.find((profile) => profile.id === "opencode")?.detectionPath, join(xdg, "opencode/skills"));
 });
 
 test("enabled T3 provider homes outside conventional prefixes are discovered", async () => {

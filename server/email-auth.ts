@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { Express, Request, Response } from 'express';
 import type { Store } from './storage.ts';
 import type { Workspace } from '../shared/types.ts';
+import { PersistentRateLimiter, rateLimitKey } from './rate-limit.ts';
 
 const hash = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 const generic = { ok: true };
@@ -35,26 +36,22 @@ export async function registerEmailAuth(app: Express, options: {
   const {store} = options;
   await store.run('CREATE TABLE IF NOT EXISTS email_authorizations (token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT NOT NULL, expires_at BIGINT NOT NULL)');
   if (store.dialect === 'postgres') await store.run('ALTER TABLE email_authorizations ENABLE ROW LEVEL SECURITY');
-  const attempts = new Map<string, {count: number; until: number}>();
-  const emailCooldown = new Map<string, number>();
-  const allow = (key: string, limit: number) => {
-    const now = Date.now();
-    if (attempts.size > 2000) for (const [key, item] of attempts) if (item.until <= now) attempts.delete(key);
-    const previous = attempts.get(key);
-    const item = previous && previous.until > now ? previous : {count:0,until:now+10*60_000};
-    item.count++; attempts.set(key,item);
-    return item.count <= limit;
-  };
+  const limiter = new PersistentRateLimiter(store);
+  await limiter.cleanup();
   app.post('/api/auth/email', async (req, res, next) => {
     try {
-      if (!allow(`request:${req.ip}`,10)) return res.status(429).json({error:'Too many sign-in requests. Try again in a few minutes.'});
+      const addressLimit = await limiter.consume(rateLimitKey('email-request-ip',req.ip ?? ''),10,10*60_000);
+      if (!addressLimit.allowed) {
+        res.set('Retry-After',String(addressLimit.retryAfterSeconds));
+        return res.status(429).json({error:'Too many sign-in requests. Try again in a few minutes.'});
+      }
       const email = String(req.body?.email ?? '').trim().toLowerCase();
       if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({error:'Enter a valid email address.'});
       if (options.registrationEmail && options.registrationEmail !== email) return res.json(generic);
       const now = Date.now();
-      for (const [key, until] of emailCooldown) if (until <= now) emailCooldown.delete(key);
-      if ((emailCooldown.get(hash(email)) ?? 0) > now) return res.json(generic);
-      emailCooldown.set(hash(email),now+60_000);
+      const emailKey = rateLimitKey('email-request-address',email);
+      const emailLimit = await limiter.consume(emailKey,1,60_000,now);
+      if (!emailLimit.allowed) return res.json(generic);
       const token = crypto.randomBytes(32).toString('base64url');
       const name = String(req.body?.name ?? '').trim().slice(0,120) || email.split('@')[0];
       const url = new URL('/signin', options.publicOrigin(req));
@@ -70,7 +67,7 @@ export async function registerEmailAuth(app: Express, options: {
       try { await (options.send ?? sendSignInEmail)({email,url:url.toString()}); }
       catch {
         await store.run('DELETE FROM email_authorizations WHERE token_hash=?',hash(token));
-        emailCooldown.delete(hash(email));
+        await limiter.reset(emailKey);
         return res.status(502).json({error:'Could not send the sign-in email. Please try again shortly.'});
       }
       res.json(generic);
@@ -78,7 +75,11 @@ export async function registerEmailAuth(app: Express, options: {
   });
   app.post('/api/auth/email/consume', async (req,res,next) => {
     try {
-      if (!allow(`consume:${req.ip}`,60)) return res.status(429).json({error:'Too many attempts. Try again in a few minutes.'});
+      const consumeLimit = await limiter.consume(rateLimitKey('email-consume-ip',req.ip ?? ''),60,10*60_000);
+      if (!consumeLimit.allowed) {
+        res.set('Retry-After',String(consumeLimit.retryAfterSeconds));
+        return res.status(429).json({error:'Too many attempts. Try again in a few minutes.'});
+      }
       const token = String(req.body?.token ?? '');
       if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return res.status(400).json({error:'This sign-in link is invalid. Request a fresh link.'});
       const account = await store.transaction(async transaction => {

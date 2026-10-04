@@ -175,7 +175,11 @@ export async function discoverAgentProfiles(
   const specializedIds = new Set<string>(profileAgents.map((agent) => agent.id));
   const result: DetectedAgentProfile[] = detected.filter(
     (agent) => !specializedIds.has(agent.id),
-  );
+  ).map(agent => ({
+    ...agent,
+    detection: "configuration" as const,
+    detectionPath: agent.globalPath,
+  }));
 
   for (const specification of profileAgents) {
     const inherited = baselineOverrides[specification.variable];
@@ -224,6 +228,8 @@ export async function discoverAgentProfiles(
       }
       const target: DetectedAgentProfile = {
         ...agent,
+        detection: "configuration",
+        detectionPath: root,
         profile:
           canonical === canonicalDefault
             ? undefined

@@ -35,7 +35,7 @@ import {
 } from "./config.ts";
 import { powershellInstaller, shellInstaller } from "./installers.ts";
 import { buildSkillDraft } from "./skill-draft.ts";
-import { openStore, type Store } from "./storage.ts";
+import { openStore, transactionalStore, lockAccount, type Store } from "./storage.ts";
 import { registerEmailAuth, type SendSignIn } from "./email-auth.ts";
 import {
   canonicalFiles,
@@ -43,6 +43,12 @@ import {
   skillRevision,
   type LibrarySnapshotSkill,
 } from "../shared/library.ts";
+
+import { readWorkspace, writeWorkspace, migrateWorkspaces } from "./workspace-store.ts";
+import { PersistentRateLimiter, rateLimitKey } from "./rate-limit.ts";
+import { hasMergeMarkers } from "../shared/merge.ts";
+import { registerAccountRoutes } from "./account.ts";
+import { createReleaseManifest, npmPackageIntegrity } from "./release.ts";
 
 const scrypt = promisify(crypto.scrypt);
 const SESSION_COOKIE = "equip_session";
@@ -214,11 +220,7 @@ async function saveWorkspace(
   accountId: string,
   workspace: Workspace,
 ) {
-  await db.run(
-    "UPDATE accounts SET workspace = ? WHERE id = ?",
-    JSON.stringify(workspace),
-    accountId,
-  );
+  await writeWorkspace(db, accountId, workspace);
 }
 
 function parseWorkspace(value: string): Workspace {
@@ -359,7 +361,8 @@ function validateInstructionUnavailable(value: unknown) {
     if (!raw || typeof raw.agent !== "string" || !raw.agent || raw.agent.length > 120 ||
         typeof raw.reason !== "string" || !raw.reason || raw.reason.length > 1000)
       throw httpError(400, "An unavailable instruction adapter has invalid fields.");
-    return { agent: raw.agent, reason: raw.reason };
+    if ((raw.profile !== undefined && (typeof raw.profile !== "string" || raw.profile.length > 200)) || (raw.project !== undefined && (typeof raw.project !== "string" || raw.project.length > 2048))) throw httpError(400, "Invalid instruction configuration.");
+    return { agent: raw.agent, reason: raw.reason, ...(raw.profile ? {profile:raw.profile} : {}), ...(raw.project ? {project:raw.project} : {}) };
   });
 }
 
@@ -390,6 +393,8 @@ function validateAgents(agents: unknown): asserts agents is Device["agents"] {
       throw httpError(400, "An agent has an invalid profile.");
     if (agent.project !== undefined && !valid(agent.project, 2048))
       throw httpError(400, "An agent has an invalid project.");
+    if (agent.detection !== undefined && !["installation", "configuration"].includes(agent.detection)) throw httpError(400, "Invalid agent detection evidence.");
+    if (agent.detectionPath !== undefined && !valid(agent.detectionPath, 2048)) throw httpError(400, "Invalid agent detection path.");
     if (agent.aliases !== undefined) {
       if (!Array.isArray(agent.aliases) || agent.aliases.length > 50)
         throw httpError(400, "Agent aliases must be an array of at most 50 aliases.");
@@ -606,37 +611,28 @@ export async function createApp(
       );
     configuredPublicUrl = parsed.origin;
   }
+  const emailAuthEnabled =
+    options.emailAuthEnabled ?? Boolean(options.sendSignIn || process.env.EQUIP_RESEND_API_KEY);
+  if (emailAuthEnabled && process.env.NODE_ENV === "production" && !configuredPublicUrl) throw new Error("Hosted email authentication requires a configured public origin.");
   const dataDir = options.dataDir ?? runtimeConfig().dataDir;
-  const db = await openStore({
+  const db = transactionalStore(await openStore({
     dataDir,
     databaseUrl: options.databaseUrl ?? process.env.EQUIP_DATABASE_URL,
     databaseCa: options.databaseCa ?? process.env.EQUIP_DATABASE_CA,
-  });
-  const emailAuthEnabled =
-    options.emailAuthEnabled ?? Boolean(options.sendSignIn || process.env.EQUIP_RESEND_API_KEY);
-  const accountLocks = new Map<string, Promise<void>>();
-  const deviceAuthorizationAttempts = new Map<
-    string,
-    { count: number; until: number }
-  >();
-  const runAccountLocked = async <T>(
-    accountId: string,
-    work: () => Promise<T> | T,
-  ): Promise<T> => {
-    const previous = accountLocks.get(accountId) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
+  }));
+  await migrateWorkspaces(db);
+  const runAccountLocked = async <T>(accountId: string, work: () => Promise<T> | T): Promise<T> =>
+    db.transaction(async transaction => {
+      if (!(await lockAccount(transaction, accountId))) throw httpError(401, "authentication_required");
+      return work();
     });
-    const tail = previous.then(() => gate);
-    accountLocks.set(accountId, tail);
-    await previous;
-    try {
-      return await work();
-    } finally {
-      release();
-      if (accountLocks.get(accountId) === tail) accountLocks.delete(accountId);
-    }
+  const limiter = new PersistentRateLimiter(db);
+  const limitAuth = async (req: Request, res: Response, namespace: string, limit: number, window = 10 * 60_000) => {
+    const result = await limiter.consume(rateLimitKey(namespace, req.ip ?? "unknown"), limit, window);
+    if (result.allowed) return true;
+    res.set("Retry-After", String(result.retryAfterSeconds));
+    res.status(429).json({error: "Too many attempts. Try again in a few minutes."});
+    return false;
   };
   const app = express();
   app.disable("x-powered-by");
@@ -702,7 +698,7 @@ export async function createApp(
         );
         if (account) {
           req.accountId = session.account_id;
-          req.workspace = parseWorkspace(account.workspace);
+          req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, account.workspace, req.path === "/api/workspace" && req.query.view === "dashboard"));
           return next();
         }
       }
@@ -726,10 +722,18 @@ export async function createApp(
       );
   };
 
+  registerAccountRoutes(app, {
+    store: db, auth: auth(false), runAccountLocked,
+    loadWorkspace: async accountId => {
+      const row = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", accountId);
+      return row ? parseWorkspace(await readWorkspace(db, accountId, row.workspace)) : undefined;
+    },
+  });
   await registerEmailAuth(app, {store: db, registrationEmail, publicOrigin, createSession, emptyWorkspace, enabled: emailAuthEnabled, send: options.sendSignIn});
 
   app.post("/api/auth/register", async (req, res, next) => {
     try {
+      if (!(await limitAuth(req, res, req.path.endsWith("register") ? "password-register" : "password-login", req.path.endsWith("register") ? 10 : 30))) return;
       if (emailAuthEnabled)
         throw httpError(403, "Use your email sign-in link to continue.");
       const { name, email, password } = req.body ?? {};
@@ -739,7 +743,7 @@ export async function createApp(
         typeof email !== "string" ||
         !email.includes("@") ||
         typeof password !== "string" ||
-        password.length < 8
+        password.length < 8 || password.length > 1024 || email.length > 254 || name.length > 120
       )
         throw httpError(
           400,
@@ -782,8 +786,14 @@ export async function createApp(
   });
   app.post("/api/auth/login", async (req, res, next) => {
     try {
+      if (!(await limitAuth(req, res, req.path.endsWith("register") ? "password-register" : "password-login", req.path.endsWith("register") ? 10 : 30))) return;
       if (emailAuthEnabled)
         throw httpError(403, "Use your email sign-in link to continue.");
+      const loginEmail = String(req.body?.email ?? "").trim().toLowerCase();
+      const loginPassword = String(req.body?.password ?? "");
+      if (loginEmail.length > 254 || loginPassword.length > 1024) throw httpError(401, "Email or password is incorrect.");
+      const addressLimit = await limiter.consume(rateLimitKey("password-login-email",loginEmail), 15, 10*60_000);
+      if (!addressLimit.allowed) {res.set("Retry-After",String(addressLimit.retryAfterSeconds)); return res.status(429).json({error:"Too many attempts. Try again in a few minutes."});}
       const account = await db.get<any>(
         "SELECT * FROM accounts WHERE email=?",
         String(req.body?.email ?? "").trim().toLowerCase(),
@@ -797,7 +807,7 @@ export async function createApp(
       )
         throw httpError(401, "Email or password is incorrect.");
       await createSession(res, account.id);
-      res.json(parseWorkspace(account.workspace));
+      res.json(parseWorkspace(await readWorkspace(db, account.id, account.workspace)));
     } catch (error) {
       next(error);
     }
@@ -823,13 +833,13 @@ export async function createApp(
     });
     // The dashboard uses history metadata; rollback reads immutable files on the server.
     if (req.query.view === "dashboard")
-      for (const skill of workspace.skills) {
+      for (const skill of [...workspace.skills, ...(workspace.retiredSkills ?? [])]) {
         skill.files = [];
         skill.draft = undefined;
         skill.versions = skill.versions.map(version => ({ ...version, files: [] }));
       }
     if (req.query.view === "dashboard")
-      for (const document of workspace.instructions ?? []) {
+      for (const document of [...(workspace.instructions ?? []), ...(workspace.retiredInstructions ?? [])]) {
         document.draft = undefined;
         document.versions = document.versions.map(version => ({ ...version, files: [] }));
       }
@@ -876,49 +886,38 @@ export async function createApp(
     },
   );
 
-  const lockedWorkspace = async (
-    req: AuthedRequest,
-    res: Response,
-    next: NextFunction,
-  ) => {
-    const accountId = req.accountId!;
-    const previous = accountLocks.get(accountId) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.then(() => gate);
-    accountLocks.set(accountId, tail);
-    await previous;
-    const row = await db.get<any>(
-      "SELECT workspace FROM accounts WHERE id=?",
-      accountId,
-    );
-    if (row) req.workspace = parseWorkspace(row.workspace);
-    const done = () => {
-      release();
-      if (accountLocks.get(accountId) === tail) accountLocks.delete(accountId);
-    };
-    res.once("finish", done);
-    res.once("close", done);
-    next();
-  };
-  const mutate = (
-    handler: (req: AuthedRequest) => unknown | Promise<unknown>,
-  ) => [
-    auth(false),
-    lockedWorkspace,
+  const workspaceHandler = (handler: (req: AuthedRequest, res: Response, next: NextFunction) => unknown | Promise<unknown>, readOnly = false) =>
     async (req: AuthedRequest, res: Response, next: NextFunction) => {
+      let body: unknown;
+      let responseQueued = false;
+      let failure: unknown;
+      const json = res.json;
+      // Publish the response only after the transaction commits. A disconnected
+      // client never releases an in-progress database write.
+      res.json = ((value: unknown) => { body = value; responseQueued = true; return res; }) as typeof res.json;
       try {
         writable(req);
-        const value: any = await handler(req);
-        await persist(req);
-        if (value?.__status) res.status(value.__status).json(value.body);
-        else res.json(value);
-      } catch (error) {
-        next(error);
-      }
-    },
+        const operation = async () => {
+          const row = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
+          req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, row!.workspace, ["/api/device/heartbeat", "/api/device/receipts", "/api/device/desired"].includes(req.path), true));
+          await handler(req, res, error => { failure = error ?? new Error("Unexpected middleware continuation."); });
+          if (failure) throw failure;
+        };
+        if (readOnly) await db.transaction(operation, { readOnly: true });
+        else await runAccountLocked(req.accountId!, operation);
+        res.json = json;
+        if (responseQueued && !res.destroyed) res.json(body);
+      } catch (error) { res.json = json; next(error); }
+    };
+  const mutate = (handler: (req: AuthedRequest) => unknown | Promise<unknown>) => [
+    auth(false),
+    workspaceHandler(async (req, res) => {
+      writable(req);
+      const value: any = await handler(req);
+      await persist(req);
+      if (value?.__status) res.status(value.__status).json(value.body);
+      else res.json(value);
+    }),
   ];
   const queueSource = (
     workspace: Workspace,
@@ -978,7 +977,7 @@ export async function createApp(
   };
 
   app.get("/api/instructions/:id", auth(true), (req: AuthedRequest, res, next) => {
-    try { res.json(findInstructions(req)); } catch (error) { next(error); }
+    try { res.json((req.workspace!.instructions ?? []).find(item => item.id === req.params.id) ?? req.workspace!.retiredInstructions?.find(item => item.id === req.params.id) ?? findInstructions(req)); } catch (error) { next(error); }
   });
   app.post("/api/instructions", ...mutate((req) => {
     const { title, filename, scope, files } = req.body ?? {};
@@ -1060,6 +1059,8 @@ export async function createApp(
   app.delete("/api/instructions/:id", ...mutate((req) => {
     const index = req.workspace!.instructions!.findIndex(item => item.id === req.params.id);
     if (index < 0) throw httpError(404, "Instructions not found.");
+    req.workspace!.retiredInstructions ??= [];
+    req.workspace!.retiredInstructions.push({...req.workspace!.instructions![index],selected:false,enabled:false});
     req.workspace!.instructions!.splice(index, 1);
     for (const device of req.workspace!.devices) {
       device.instructionResolutions = Object.fromEntries(Object.entries(device.instructionResolutions ?? {})
@@ -1098,11 +1099,11 @@ export async function createApp(
     return document;
   }));
   app.get("/api/skills/:id", auth(true), (req: AuthedRequest, res, next) => {
-    try { res.json(findSkill(req)); } catch (error) { next(error); }
+    try { res.json(req.workspace!.skills.find(item => item.id === req.params.id) ?? req.workspace!.retiredSkills?.find(item => item.id === req.params.id) ?? findSkill(req)); } catch (error) { next(error); }
   });
   app.get("/api/skills/:id/export", auth(true), async (req: AuthedRequest, res, next) => {
     try {
-      const skill = findSkill(req);
+      const skill = req.workspace!.skills.find(item => item.id === req.params.id) ?? req.workspace!.retiredSkills?.find(item => item.id === req.params.id) ?? findSkill(req);
       const version = typeof req.query.revision === "string" ? skill.versions.find(v => v.revision === req.query.revision) : undefined;
       if (req.query.revision && !version) throw httpError(404, "Revision not found.");
       const files = version?.files ?? skill.files;
@@ -1234,6 +1235,8 @@ export async function createApp(
     "/api/skills/:id",
     ...mutate((req) => {
       const skill = findSkill(req);
+      if (req.body?.targets !== undefined) validateInstructionTargets(req.body.targets);
+      for (const key of ["enabled", "autoUpdate"] as const) if (req.body?.[key] !== undefined && typeof req.body[key] !== "boolean") throw httpError(400, `${key} must be a boolean.`);
       for (const key of [
         "enabled",
         "autoUpdate",
@@ -1287,6 +1290,7 @@ export async function createApp(
         : (resolved.revision && resolved.revision !== skill.revision
             ? resolved.revision
             : revision(resolved.files));
+      skill.proposal = same ? undefined : {revision:skill.upstreamRevision!,files:clone(resolved.files),checkedAt:iso()};
       skill.upstreamCheckedAt = iso();
       skill.updatedAt = iso();
       if (refreshDesired) bump(req.workspace!);
@@ -1310,6 +1314,8 @@ export async function createApp(
       skill.description = metadata.description;
       skill.files = files;
       skill.revision = rev;
+      skill.proposal = undefined;
+      skill.upstreamRevision = undefined;
       skill.draft = undefined;
       skill.updatedAt = iso();
       skill.versions.unshift({
@@ -1343,6 +1349,7 @@ export async function createApp(
       skill.upstreamCheckedAt = iso();
       skill.upstreamRevision =
         same ? undefined : nextRevision;
+      skill.proposal = same ? undefined : { revision:nextRevision, files:clone(resolved.files), checkedAt:iso() };
       return skill;
     }),
   );
@@ -1352,9 +1359,11 @@ export async function createApp(
       const skill = findSkill(req);
       if (skill.kind !== "third-party")
         throw httpError(400, "Custom skills have no upstream source.");
+      if (req.body?.expectedRevision !== undefined && req.body.expectedRevision !== skill.revision) throw httpError(409, "The deployed revision changed. Review the update again.");
+      if (req.body?.expectedUpstreamRevision !== undefined && (!skill.proposal || req.body.expectedUpstreamRevision !== skill.proposal.revision)) throw httpError(409, "The proposed revision changed. Review the update again.");
       await reviewSafety(skill.source, skill.name, req.body?.auditAcknowledged);
       let resolved: any;
-      try { resolved = await resolveSource(skill.source, skill.name); }
+      try { resolved = req.body?.expectedUpstreamRevision ? { ...skill, files:clone(skill.proposal!.files), revision:skill.proposal!.revision } : await resolveSource(skill.source, skill.name); }
       catch (error: any) {
         const queued = queueSource(req.workspace!, skill.source, skill.name, "install", skill.id, error?.message ?? "Source unavailable on server.");
         const request = req.workspace!.sourceRequests!.find(item => item.id === queued.body.id);
@@ -1365,6 +1374,7 @@ export async function createApp(
       if (canonicalFiles(resolved.files) === canonicalFiles(skill.files)) {
         skill.upstreamCheckedAt = iso();
         skill.upstreamRevision = undefined;
+      skill.proposal = undefined;
         return skill;
       }
       const safety = await reviewSafety(skill.source, metadata.name, req.body?.auditAcknowledged);
@@ -1380,6 +1390,7 @@ export async function createApp(
       skill.files = clone(resolved.files);
       skill.revision = resolved.revision && resolved.revision !== skill.revision ? resolved.revision : revision(resolved.files);
       skill.upstreamRevision = undefined;
+      skill.proposal = undefined;
       skill.upstreamCheckedAt = iso();
       skill.updatedAt = iso();
       skill.versions.unshift({
@@ -1396,7 +1407,7 @@ export async function createApp(
   app.post(
     "/api/skills/:id/rollback",
     ...mutate((req) => {
-      const skill = findSkill(req);
+      const skill = req.workspace!.skills.find(item=>item.id===req.params.id) ?? req.workspace!.retiredSkills?.find(item=>item.id===req.params.id) ?? findSkill(req);
       const version = skill.versions.find((v) => v.id === req.body?.versionId);
       if (!version) throw httpError(404, "Version not found.");
       const metadata = validateFiles(
@@ -1409,11 +1420,17 @@ export async function createApp(
         )
       )
         throw httpError(409, "A skill with this name already exists.");
+      if (!req.workspace!.skills.some(item=>item.id===skill.id)) {
+        req.workspace!.retiredSkills = req.workspace!.retiredSkills?.filter(item=>item.id!==skill.id);
+        skill.selected=true;skill.enabled=true;skill.autoUpdate=false;
+        req.workspace!.skills.push(skill);
+      }
       skill.name = metadata.name;
       skill.description = metadata.description;
       skill.files = clone(version.files);
       skill.revision = version.revision;
       skill.upstreamRevision = undefined;
+      skill.proposal = undefined;
       skill.upstreamCheckedAt = undefined;
       skill.updatedAt = iso();
       skill.versions.unshift({
@@ -1434,6 +1451,8 @@ export async function createApp(
         (s) => s.id === req.params.id,
       );
       if (index < 0) throw httpError(404, "Skill not found.");
+      req.workspace!.retiredSkills ??= [];
+      req.workspace!.retiredSkills.push({...req.workspace!.skills[index], selected:false, enabled:false});
       req.workspace!.skills.splice(index, 1);
       bump(req.workspace!);
       return { ok: true };
@@ -1497,7 +1516,7 @@ export async function createApp(
       const device = req.workspace!.devices.find(item => item.id === req.params.id && !item.disconnectedAt);
       if (!device) throw httpError(404, "Device not found.");
       const { instructionId, agent, profile, project, action, expectedRevision, expectedLocalRevision } = req.body ?? {};
-      if (!["replace", "preserve", "import", "publish"].includes(action))
+      if (!["replace", "preserve", "import", "publish", "merge"].includes(action))
         throw httpError(400, "Invalid instruction resolution.");
       const document = (req.workspace!.instructions ?? []).find(item => item.id === instructionId);
       const receipt = device.receipts.find(item => item.kind === "instructions" && item.skillId === instructionId &&
@@ -1511,28 +1530,37 @@ export async function createApp(
       if (expectedLocalRevision !== undefined && (!receipt.localFiles || expectedLocalRevision !== revision(receipt.localFiles)))
         throw httpError(409, "The device instructions changed. Review them again.");
       const key = instructionKey(instructionId, { agent, profile, project });
-      if (action === "publish") {
+      if (action === "publish" || action === "merge") {
         if (!document) throw httpError(404, "Instructions not found.");
         if (typeof expectedRevision !== "string" || typeof expectedLocalRevision !== "string")
           throw httpError(400, "Publishing a conflict requires the reviewed Equip and local revisions.");
         if (receipt?.status !== "conflicted" || !receipt.localFiles?.length)
           throw httpError(409, "A current conflicted instruction file is required.");
-        validateInstructionFiles(receipt.localFiles);
-        const files = canonicalInstructionFiles(receipt.localFiles);
+        const candidate = action === "merge" ? req.body.mergedFiles : receipt.localFiles;
+        validateInstructionFiles(candidate);
+        const files = canonicalInstructionFiles(candidate);
+        if (action === "merge" && files.some(file => hasMergeMarkers(file.content))) throw httpError(400, "Resolve merge markers before publishing.");
         const rev = revision(files);
         if (!sameFiles(document.files, files)) {
           document.files = files;
           document.revision = rev;
           document.updatedAt = iso();
           document.versions.unshift({ id: id("version"), revision: rev, createdAt: iso(),
-            message: `Published local conflict from ${device.name}`, files: clone(files) });
+            message: `${action === "merge" ? "Merged local changes" : "Published local conflict"} from ${device.name}`, files: clone(files) });
           bump(req.workspace!);
           activity(req.workspace!, { type: "publish", title: `${document.title} published from ${device.name}`,
             description: `Revision ${rev} is ready for connected devices.`, status: "pending",
             deviceId: device.id, skillId: document.id });
         }
-        delete device.instructionResolutions?.[key];
-        delete device.instructionResolutionChecks?.[key];
+        if (action === "merge") {
+          device.instructionResolutions ??= {}; device.instructionResolutionChecks ??= {};
+          device.instructionResolutions[key] = "replace";
+          device.instructionResolutionChecks[key] = expectedLocalRevision;
+          bump(req.workspace!);
+        } else {
+          delete device.instructionResolutions?.[key];
+          delete device.instructionResolutionChecks?.[key];
+        }
         return device;
       }
       if (action === "import") {
@@ -1597,7 +1625,7 @@ export async function createApp(
         expectedRevision,
         expectedLocalRevision,
       } = req.body ?? {};
-      if (!["preserve", "replace", "import", "publish"].includes(action))
+      if (!["preserve", "replace", "import", "publish", "merge"].includes(action))
         throw httpError(400, "Invalid resolution.");
       const original = req.workspace!.skills.find((skill) => skill.id === skillId);
       const receipt = device.receipts.find(
@@ -1616,14 +1644,15 @@ export async function createApp(
         !receipt?.localFiles || expectedLocalRevision !== revision(receipt.localFiles)
       ))
         throw httpError(409, "The device conflict changed. Review the conflict again.");
-      if (action === "publish") {
+      if (action === "publish" || action === "merge") {
         if (typeof expectedRevision !== "string" || typeof expectedLocalRevision !== "string")
           throw httpError(400, "Publishing a conflict requires the reviewed Equip and local revisions.");
         if (!original) throw httpError(404, "Skill not found.");
         if (receipt?.status !== "conflicted" || !receipt.localFiles?.length)
           throw httpError(409, "A current conflicted local skill is required.");
-        const files = clone(receipt.localFiles);
+        const files = clone(action === "merge" ? req.body.mergedFiles : receipt.localFiles);
         const metadata = validateFiles(files, 16_384);
+        if (action === "merge" && files.some((file:SkillFile) => file.encoding !== "base64" && hasMergeMarkers(file.content))) throw httpError(400, "Resolve merge markers before publishing.");
         if (metadata.name !== original.name)
           throw httpError(409, "A renamed local skill must be imported as a separate draft.");
         const rev = revision(files);
@@ -1646,10 +1675,11 @@ export async function createApp(
             id: id("version"),
             revision: rev,
             createdAt: iso(),
-            message: `Published local conflict from ${device.name}`,
+            message: `${action === "merge" ? "Merged local changes" : "Published local conflict"} from ${device.name}`,
             files: clone(files),
           });
           original.upstreamRevision = undefined;
+          original.proposal = undefined;
           original.upstreamCheckedAt = undefined;
           bump(req.workspace!);
           activity(req.workspace!, {
@@ -1662,7 +1692,8 @@ export async function createApp(
           });
         }
         device.resolutions ??= {};
-        delete device.resolutions[resolutionKey(skillId, agent, profile, project)];
+        if (action === "merge") {device.resolutions[resolutionKey(skillId, agent, profile, project)] = "replace"; bump(req.workspace!);}
+        else delete device.resolutions[resolutionKey(skillId, agent, profile, project)];
         delete device.resolutions[`${skillId}:${agent}`];
         return device;
       }
@@ -1677,6 +1708,23 @@ export async function createApp(
       return device;
     }),
   );
+  app.patch("/api/devices/:id/agents", ...mutate(req => {
+    const device = req.workspace!.devices.find(item => item.id === req.params.id && !item.disconnectedAt);
+    if (!device) throw httpError(404, "Computer not found.");
+    const targets = validateInstructionTargets((req.body?.excludedAgents ?? []).map((item: any) => ({...item, deviceId:device.id, enabled:false})));
+    if (targets.some(target => !device.agents.some(agent => agent.id === target.agent && agent.profile === target.profile && agent.project === target.project))) throw httpError(400, "The excluded configuration was not detected on this computer.");
+    device.excludedAgents = targets.map(({agent,profile,project}) => ({agent,profile,project}));
+    bump(req.workspace!);
+    return device;
+  }));
+  app.post("/api/changes/reviewed", ...mutate(req => {
+    const key = req.body?.key;
+    if (typeof key !== "string" || key.length > 300 || !key.startsWith("recovery:")) throw httpError(400, "Invalid change identifier.");
+    const exists = [...req.workspace!.skills, ...(req.workspace!.instructions ?? []), ...(req.workspace!.retiredSkills ?? []), ...(req.workspace!.retiredInstructions ?? [])].some(item => item.versions.some(version => key === `recovery:${item.id}:${version.id}` && version.message.startsWith("Recovered from ")));
+    if (!exists) throw httpError(404, "Recovered version not found.");
+    req.workspace!.reviewedChanges = [...new Set([...(req.workspace!.reviewedChanges ?? []), key])].slice(-10000);
+    return {ok:true};
+  }));
   app.get("/api/compatibility", async (_req, res, next) => {
     try {
       res.json(await (await upstream()).getCompatibility());
@@ -1701,22 +1749,7 @@ export async function createApp(
       )
         throw httpError(400, "name, os, and arch are required.");
       const now = Date.now();
-      const key = req.ip || "unknown";
-      const attempts = deviceAuthorizationAttempts.get(key);
-      const allowance =
-        attempts && attempts.until > now
-          ? attempts
-          : { count: 0, until: now + 10 * 60_000 };
-      allowance.count += 1;
-      deviceAuthorizationAttempts.set(key, allowance);
-      if (deviceAuthorizationAttempts.size > 2_000)
-        for (const [address, item] of deviceAuthorizationAttempts)
-          if (item.until <= now) deviceAuthorizationAttempts.delete(address);
-      if (allowance.count > 30)
-        throw httpError(
-          429,
-          "Too many device authorization requests. Try again shortly.",
-        );
+      if (!(await limitAuth(req, res, "device-authorize", 30))) return;
       const deviceCode = crypto.randomBytes(32).toString("base64url");
       const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
       const part = () =>
@@ -1752,6 +1785,7 @@ export async function createApp(
     }
   });
   app.get("/api/device/authorization", async (req, res) => {
+    if (!(await limitAuth(req, res, "device-code", 60))) return;
     const row = await db.get<any>(
       "SELECT name,os,user_code,expires_at,status FROM device_authorizations WHERE user_code=?",
       String(req.query.code ?? "").toUpperCase(),
@@ -1771,6 +1805,7 @@ export async function createApp(
     async (req: AuthedRequest, res, next) => {
       try {
         writable(req);
+        if (!(await limitAuth(req, res, "device-approve", 30))) return;
         const code = String(req.body?.userCode ?? "").toUpperCase();
         const row = await db.get<any>(
           "SELECT * FROM device_authorizations WHERE user_code=?",
@@ -1795,6 +1830,7 @@ export async function createApp(
     },
   );
   app.post("/api/device/token", async (req, res) => {
+    if (!(await limitAuth(req, res, "device-token", 360))) return;
     const codeHash = digest(String(req.body?.deviceCode ?? ""));
     const row = await db.get<any>(
       "SELECT * FROM device_authorizations WHERE device_code_hash=?",
@@ -1830,7 +1866,7 @@ export async function createApp(
             "SELECT workspace FROM accounts WHERE id=?",
             row.account_id,
           );
-          const workspace: Workspace = parseWorkspace(account.workspace);
+          const workspace: Workspace = parseWorkspace(await readWorkspace(db, row.account_id, account.workspace));
           workspace.devices.push({
             id: deviceId,
             name: row.name,
@@ -1871,7 +1907,7 @@ export async function createApp(
     if (!account) return res.status(401).json({ error: "invalid_token" });
     req.accountId = row.account_id;
     req.deviceId = row.device_id;
-    req.workspace = parseWorkspace(account.workspace);
+    req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, account.workspace, true));
     next();
   };
   const deviceIdentityAuth = async (
@@ -1894,8 +1930,7 @@ export async function createApp(
   app.post(
     "/api/device/instructions/local",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res, next) => {
+    workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const device = req.workspace!.devices.find(item => item.id === req.deviceId)!;
         if (!device.localSync?.enabled) throw httpError(403, "Local publishing is disabled for this device.");
@@ -1920,7 +1955,7 @@ export async function createApp(
         await saveWorkspace(db, req.accountId!, req.workspace!);
         res.json(document);
       } catch (error) { next(error); }
-    },
+    }),
   );
   app.post(
     "/api/device/recovery",
@@ -1939,13 +1974,13 @@ export async function createApp(
         const result = await runAccountLocked(req.accountId!, async () => {
           const row = await db.get<any>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
           if (!row) throw httpError(401, "invalid_token");
-          const workspace = parseWorkspace(row.workspace);
+          const workspace = parseWorkspace(await readWorkspace(db, req.accountId!, row.workspace));
           const device = workspace.devices.find(item => item.id === req.deviceId);
           if (!device) throw httpError(401, "invalid_token");
           const isInstructions = req.body.kind === "instructions";
           const item = isInstructions
-            ? (workspace.instructions ?? []).find(document => document.id === req.body.skillId)
-            : workspace.skills.find(skill => skill.id === req.body.skillId);
+            ? [...(workspace.instructions ?? []), ...(workspace.retiredInstructions ?? [])].find(document => document.id === req.body.skillId)
+            : [...workspace.skills, ...(workspace.retiredSkills ?? [])].find(skill => skill.id === req.body.skillId);
           if (!item)
             throw httpError(404, isInstructions ? "Instructions not found." : "Skill not found.");
 
@@ -1981,8 +2016,7 @@ export async function createApp(
   app.post(
     "/api/device/local",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res, next) => {
+    workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const workspace = req.workspace!;
         const device = workspace.devices.find(d => d.id === req.deviceId)!;
@@ -2028,13 +2062,12 @@ export async function createApp(
         await saveWorkspace(db, req.accountId!, workspace);
         res.json({ id: skill.id, revision: skill.revision, generation: workspace.generation, changed });
       } catch (error) { next(error); }
-    },
+    }),
   );
   app.post(
     "/api/device/library",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res, next) => {
+    workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         if (req.body?.expectedRevision !== undefined)
           throw httpError(409, "Libraries are imported once. Equip manages their revisions; automatic source publishing is disabled.");
@@ -2073,25 +2106,23 @@ export async function createApp(
       } catch (error) {
         next(error);
       }
-    },
+    }),
   );
   app.post(
     "/api/device/library/unlink",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res, next) => {
+    workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         res.json({ ok: true, unlinked: false });
       } catch (error) {
         next(error);
       }
-    },
+    }),
   );
   app.post(
     "/api/device/source",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res, next) => {
+    workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const requestId = String(req.body?.requestId ?? "");
         const requests = req.workspace!.sourceRequests ?? [];
@@ -2227,13 +2258,15 @@ export async function createApp(
       } catch (error) {
         next(error);
       }
-    },
+    }),
   );
-  app.get("/api/device/desired", deviceAuth, (req: AuthedRequest, res) => {
+  app.get("/api/device/desired", deviceIdentityAuth, workspaceHandler(async (req: AuthedRequest, res) => {
     const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
-    const etag = `"${digest(JSON.stringify([req.accountId, device.id, req.workspace!.generation, req.workspace!.sourceRequests, device.resolutions, device.instructionResolutions, device.instructionResolutionChecks, device.instructionLocations, (device as Device & { instructionUnavailable?: unknown[] }).instructionUnavailable, device.disconnect, device.localSync?.enabled]))}"`;
+    const etag = `"${digest(JSON.stringify([req.accountId, device.id, req.workspace!.generation, req.workspace!.sourceRequests, device.resolutions, device.instructionResolutions, device.instructionResolutionChecks, device.instructionLocations, (device as Device & { instructionUnavailable?: unknown[] }).instructionUnavailable, device.disconnect, device.excludedAgents, device.localSync?.enabled]))}"`;
     res.set({ ETag: etag, "Cache-Control": "private, no-cache" });
     if (req.headers["if-none-match"] === etag) { res.status(304).end(); return; }
+    const account = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
+    req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, account!.workspace));
     const skills = req
       .workspace!.skills.filter(
         (s) => s.selected && s.enabled && s.revision && s.files.length,
@@ -2249,7 +2282,7 @@ export async function createApp(
       skills,
       instructions: (req.workspace!.instructions ?? []).filter(document =>
         document.selected && document.enabled && document.revision && document.files.length &&
-        (device.instructionLocations ?? []).some(location => instructionEnabled(document, location, device.id)))
+        (!(device.instructionLocations?.length) || device.instructionLocations.some(location => instructionEnabled(document, location, device.id)) || (device.instructionUnavailable ?? []).some(location => instructionEnabled(document, location, device.id))))
         .map(document => ({ ...document, versions: [], draft: undefined,
           targets: document.targets.filter(target => target.deviceId === device.id) })),
       instructionResolutions: device.instructionResolutions ?? {},
@@ -2257,16 +2290,16 @@ export async function createApp(
       sourceRequests: req.workspace!.sourceRequests ?? [],
       resolutions: device.resolutions ?? {},
       disconnect: device.disconnect,
+      excludedAgents: device.excludedAgents ?? [],
       localSync: device.localSync?.enabled ?? false,
       localSkills: req.workspace!.skills.map(({id,name,revision,kind}) => ({id,name,revision,kind})),
     };
     res.json(desired);
-  });
+  }, true));
   app.post(
     "/api/device/heartbeat",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res) => {
+    workspaceHandler(async (req: AuthedRequest, res) => {
       const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
       device.name = String(req.body?.name ?? device.name);
       device.os = String(req.body?.os ?? device.os);
@@ -2280,6 +2313,8 @@ export async function createApp(
           ...(agent.profile ? { profile: agent.profile } : {}),
           ...(agent.project ? { project: agent.project } : {}),
           ...(agent.aliases ? { aliases: clone(agent.aliases) } : {}),
+          ...(agent.detection ? {detection:agent.detection} : {}),
+          ...(agent.detectionPath ? {detectionPath:agent.detectionPath} : {}),
         }));
       }
       if (req.body?.instructionLocations !== undefined)
@@ -2295,13 +2330,12 @@ export async function createApp(
       device.online = true;
       await saveWorkspace(db, req.accountId!, req.workspace!);
       res.json({ ok: true });
-    },
+    }),
   );
   app.post(
     "/api/device/receipts",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res, next) => {
+    workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const device = req.workspace!.devices.find(
           (d) => d.id === req.deviceId,
@@ -2501,8 +2535,7 @@ export async function createApp(
             (skill) =>
               skill.selected &&
               skill.enabled &&
-              skill.revision &&
-              skill.files.length,
+              skill.revision,
           )
           .flatMap((skill) =>
             device.agents
@@ -2512,13 +2545,15 @@ export async function createApp(
                     target.deviceId === device.id &&
                     sameDestination(target, agent),
                 );
-                return override?.enabled !== false;
+                return override?.enabled !== false && !device.excludedAgents?.some(excluded =>
+                  excluded.agent === agent.id && excluded.profile === agent.profile && excluded.project === agent.project);
               })
               .map((agent) => ({ skill, agent })),
           );
         const expectedInstructions = (req.workspace!.instructions ?? []).flatMap(document =>
           (device.instructionLocations ?? [])
-            .filter(location => instructionEnabled(document, location, device.id) && document.revision && document.files.length)
+            .filter(location => instructionEnabled(document, location, device.id) && document.revision && document.files.length &&
+              !device.excludedAgents?.some(excluded => excluded.agent === location.agent && excluded.profile === location.profile && excluded.project === location.project))
             .map(location => ({ document, location })));
         const activeInstructions = (req.workspace!.instructions ?? []).some(document =>
           document.selected && document.enabled && document.revision && document.files.length);
@@ -2580,13 +2615,12 @@ export async function createApp(
       } catch (error) {
         next(error);
       }
-    },
+    }),
   );
   app.post(
     "/api/device/disconnected",
     deviceAuth,
-    lockedWorkspace,
-    async (req: AuthedRequest, res) => {
+    workspaceHandler(async (req: AuthedRequest, res) => {
       const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
       device.online = false;
       device.disconnect = req.body?.mode === "remove" ? "remove" : "retain";
@@ -2599,7 +2633,7 @@ export async function createApp(
         req.deviceId,
       );
       res.json({ ok: true });
-    },
+    }),
   );
 
   app.get("/cli/equip.cjs", (_req, res) => {
@@ -2610,19 +2644,14 @@ export async function createApp(
         .json({ error: "CLI artifact has not been built." });
     res.type("application/octet-stream").sendFile(artifact);
   });
-  app.get("/cli/manifest", async (_req, res, next) => {
+  app.get("/cli/manifest", async (req, res, next) => {
     try {
       const artifact = path.resolve("dist/equip.cjs");
       if (!fs.existsSync(artifact))
         throw httpError(404, "CLI artifact has not been built.");
       const compatibility = await (await upstream()).getCompatibility();
-      res.json({
-        version: "1.0.0",
-        node: ">=22.20.0",
-        skillsVersion: compatibility.version,
-        sha256: digest(fs.readFileSync(artifact)),
-        url: "/cli/equip.cjs",
-      });
+      const skillsIntegrity = await npmPackageIntegrity("skills", compatibility.version);
+      res.json(await createReleaseManifest({artifact, origin:publicOrigin(req), skillsVersion:compatibility.version, skillsIntegrity}));
     } catch (error) {
       next(error);
     }
@@ -2681,6 +2710,7 @@ export async function createApp(
     if (updating) return;
     updating = true;
     try {
+      await limiter.cleanup();
       const accounts = await db.all<{ id: string; workspace: string }>(
         "SELECT id,workspace FROM accounts",
       );
@@ -2690,7 +2720,7 @@ export async function createApp(
             "SELECT workspace FROM accounts WHERE id=?",
             account.id,
           );
-          const workspace: Workspace = parseWorkspace(fresh.workspace);
+          const workspace: Workspace = parseWorkspace(await readWorkspace(db, account.id, fresh.workspace));
           let changed = false;
           for (const skill of workspace.skills.filter(
             (skill) => skill.kind === "third-party" && skill.autoUpdate,
@@ -2707,6 +2737,7 @@ export async function createApp(
               skill.upstreamCheckedAt = iso();
               skill.upstreamRevision =
                 same ? undefined : nextRevision;
+              skill.proposal = same ? undefined : {revision:nextRevision,files:clone(resolved.files),checkedAt:iso()};
               if (same) {
                 changed = true;
                 continue;
@@ -2732,6 +2763,7 @@ export async function createApp(
               skill.files = clone(resolved.files);
               skill.revision = nextRevision;
               skill.upstreamRevision = undefined;
+              skill.proposal = undefined;
               skill.updatedAt = iso();
               skill.versions.unshift({
                 id: id("version"),

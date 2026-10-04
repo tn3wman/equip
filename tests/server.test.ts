@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { after, before, test } from "node:test";
+import { after, before, beforeEach, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { createApp } from "../server/app.ts";
 import { demoCatalog } from "../server/catalog.ts";
 import { librarySnapshotRevision } from "../shared/library.ts";
 import type { LibrarySnapshotSkill } from "../shared/library.ts";
 import { unzipSync } from "fflate";
+import { readWorkspace } from "../server/workspace-store.ts";
 import type { Store } from "../server/storage.ts";
 import { getDesired } from "../cli/desired.ts";
 import { readFile, stat } from "node:fs/promises";
@@ -46,6 +47,7 @@ before(async () => {
   };
 });
 after(async () => shutdown());
+beforeEach(async () => { await store.run("DELETE FROM auth_rate_limits"); });
 
 async function call(route: string, options: RequestInit = {}, cookie?: string) {
   const headers = new Headers(options.headers);
@@ -479,7 +481,7 @@ test("legacy source ownership migrates without losing skills, history, or select
   const device = await connectDevice(cookie, "Legacy source device");
   await call("/api/device/library", { method: "POST", headers: device.headers, body: JSON.stringify(libraryBody([novaSkill("legacy-owned")])) });
   const row = (await store.get<any>("SELECT id,workspace FROM accounts WHERE email=?", email))!;
-  const legacy = JSON.parse(row.workspace);
+  const legacy = JSON.parse(await readWorkspace(store, row.id, row.workspace));
   const oldGeneration = legacy.generation;
   legacy.librarySource = { id: "nova", name: "Nova", deviceId: device.deviceId, revision: "legacy", skillCount: 1 };
   legacy.skills[0].librarySourceId = "nova";
@@ -1082,4 +1084,53 @@ test("private sources resolve once on a connected device without exposing creden
       .revision,
     "private-r1",
   );
+});
+
+test("receipts require every enabled agent and native limits do not remove desired instructions", async () => {
+  const cookie = await register("receipt-exclusions@example.com");
+  const device = await connectDevice(cookie, "Excluded profile computer");
+  const skill = await post("/api/skills", {name:"receipt-tool",title:"Receipt tool",description:"Receipt test",files:novaSkill("receipt-tool").files},cookie);
+  const published = await post(`/api/skills/${skill.body.id}/publish`,{},cookie);
+  const document = await post("/api/instructions",{title:"Global",filename:"AGENTS.md",scope:"global",files:[{path:"AGENTS.md",content:"Central instructions"}]},cookie);
+  await post(`/api/instructions/${document.body.id}/publish`,{},cookie);
+  const devicePost = (route:string,body:unknown) => call(route,{method:"POST",headers:device.headers,body:JSON.stringify(body)});
+  await devicePost("/api/device/heartbeat",{agents:[
+    {id:"codex",name:"Codex",path:"/tmp/codex"},{id:"claude-code",name:"Claude Code",path:"/tmp/claude"},
+  ],instructionLocations:[],instructionUnavailable:[{agent:"windsurf",reason:"Global rules exceed the native character limit."}]});
+  let desired = await call("/api/device/desired",{headers:device.headers});
+  assert.equal(desired.body.instructions.length,1);
+  await devicePost("/api/device/receipts",{generation:desired.body.generation,receipts:[{
+    skillId:skill.body.id,agent:"codex",revision:published.body.revision,status:"synchronized",timestamp:new Date().toISOString(),
+  }]});
+  let workspace = (await call("/api/workspace",{},cookie)).body;
+  assert.notEqual(workspace.devices[0].appliedGeneration,workspace.generation,"A missing enabled agent must not be acknowledged.");
+  const exclusion = await call(`/api/devices/${device.deviceId}/agents`,{method:"PATCH",body:JSON.stringify({excludedAgents:[{agent:"claude-code"}]})},cookie);
+  assert.equal(exclusion.response.status,200);
+  desired = await call("/api/device/desired",{headers:device.headers});
+  await devicePost("/api/device/receipts",{generation:desired.body.generation,receipts:[{
+    skillId:skill.body.id,agent:"codex",revision:published.body.revision,status:"synchronized",timestamp:new Date().toISOString(),
+  }]});
+  workspace = (await call("/api/workspace",{},cookie)).body;
+  assert.equal(workspace.devices[0].appliedGeneration,workspace.generation);
+  assert.equal((await call("/api/device/desired",{headers:device.headers})).body.instructions.length,1,"Native limits must not oscillate desired instructions.");
+});
+
+test("removed skills retain recovery files and can restore an explicitly selected revision",async()=>{
+  const cookie=await register("removed-recovery@example.com");
+  const device=await connectDevice(cookie,"Recovery computer");
+  const created=await post("/api/skills",{name:"recoverable",title:"Recoverable",description:"Test",files:novaSkill("recoverable").files},cookie);
+  await post(`/api/skills/${created.body.id}/publish`,{},cookie);
+  assert.equal((await call(`/api/skills/${created.body.id}`,{method:"DELETE"},cookie)).response.status,200);
+  const local=novaSkill("recoverable","Locally changed").files;
+  const recovered=await call("/api/device/recovery",{method:"POST",headers:device.headers,body:JSON.stringify({skillId:created.body.id,files:local,path:"/tmp/recoverable"})});
+  assert.equal(recovered.response.status,200,JSON.stringify(recovered.body));
+  const history=(await call(`/api/skills/${created.body.id}`,{},cookie)).body;
+  const recoveredVersion=history.versions.find((version:any)=>version.message.startsWith("Recovered from "));
+  assert.deepEqual(recoveredVersion.files,local);
+  const restored=await post(`/api/skills/${created.body.id}/rollback`,{versionId:recoveredVersion.id},cookie);
+  assert.equal(restored.response.status,200,JSON.stringify(restored.body));
+  assert.deepEqual(restored.body.files,local);
+  const workspace=(await call("/api/workspace",{},cookie)).body;
+  assert.equal(workspace.skills.some((s:any)=>s.id===created.body.id&&s.selected&&s.enabled),true);
+  assert.equal(workspace.retiredSkills.some((s:any)=>s.id===created.body.id),false);
 });

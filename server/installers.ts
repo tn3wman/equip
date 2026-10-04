@@ -1,7 +1,9 @@
 const NODE_VERSION = "22.20.0";
 
-export function shellInstaller(origin: string, skillsVersion: string) {
+export function shellInstaller(origin: string, _skillsVersion: string) {
   return `#!/bin/sh
+# The first install trusts this HTTPS origin and its artifact hash. The installed
+# CLI pins Equip's release key and requires signed manifests for later updates.
 set -eu
 install_root="${"$"}{EQUIP_INSTALL_ROOT:-${"$"}HOME/.equip}"
 runtime="${"$"}install_root/runtime"
@@ -41,12 +43,19 @@ fi
 
 mkdir -p "${"$"}runtime" "${"$"}bin_dir"
 curl -fsSL "${origin}/cli/manifest" -o "${"$"}runtime/manifest.json"
+"${"$"}node_bin" -e "const fs=require('fs');const m=JSON.parse(fs.readFileSync(process.argv[1]));const o=new URL(process.argv[2]);if(m.origin!==o.origin||new URL(m.url).origin!==o.origin||new URL(m.url).pathname!=='/cli/equip.cjs'){console.error('Equip release origin mismatch.');process.exit(1)}" "${"$"}runtime/manifest.json" "${origin}"
 curl -fsSL "${origin}/cli/equip.cjs" -o "${"$"}runtime/equip.cjs.download"
 "${"$"}node_bin" -e "const fs=require('fs'),c=require('crypto');const m=JSON.parse(fs.readFileSync(process.argv[1]));const actual=c.createHash('sha256').update(fs.readFileSync(process.argv[2])).digest('hex');if(actual!==m.sha256){console.error('Equip CLI checksum mismatch.');process.exit(1)}" "${"$"}runtime/manifest.json" "${"$"}runtime/equip.cjs.download"
 mv "${"$"}runtime/equip.cjs.download" "${"$"}runtime/equip.cjs"
 if [ "${"$"}node_bin" = "${"$"}node_dir/bin/node" ]; then npm_cli="${"$"}node_dir/lib/node_modules/npm/bin/npm-cli.js"; else npm_cli="${"$"}(command -v npm)"; fi
-if [ -f "${"$"}npm_cli" ]; then "${"$"}node_bin" "${"$"}npm_cli" install --silent --no-audit --no-fund --omit=dev --prefix "${"$"}runtime" "skills@${skillsVersion}";
-else "${"$"}npm_cli" install --silent --no-audit --no-fund --omit=dev --prefix "${"$"}runtime" "skills@${skillsVersion}"; fi
+skills_version="${"$"}("${"$"}node_bin" -p "JSON.parse(require('fs').readFileSync(process.argv[1])).skillsVersion" "${"$"}runtime/manifest.json")"
+expected_integrity="${"$"}("${"$"}node_bin" -p "JSON.parse(require('fs').readFileSync(process.argv[1])).skillsIntegrity" "${"$"}runtime/manifest.json")"
+if [ -f "${"$"}npm_cli" ]; then registry_integrity="${"$"}("${"$"}node_bin" "${"$"}npm_cli" view "skills@${"$"}skills_version" dist.integrity --json | tr -d '\"')";
+else registry_integrity="${"$"}("${"$"}npm_cli" view "skills@${"$"}skills_version" dist.integrity --json | tr -d '\"')"; fi
+[ "${"$"}registry_integrity" = "${"$"}expected_integrity" ] || { printf 'Skills package integrity does not match the release manifest.\n' >&2; exit 1; }
+if [ -f "${"$"}npm_cli" ]; then "${"$"}node_bin" "${"$"}npm_cli" install --silent --no-audit --no-fund --omit=dev --prefix "${"$"}runtime" "skills@${"$"}skills_version";
+else "${"$"}npm_cli" install --silent --no-audit --no-fund --omit=dev --prefix "${"$"}runtime" "skills@${"$"}skills_version"; fi
+"${"$"}node_bin" -e "const p=require(process.argv[1]);if(p.version!==process.argv[2])throw Error('Installed skills version mismatch.')" "${"$"}runtime/node_modules/skills/package.json" "${"$"}skills_version"
 cat > "${"$"}runtime/write-launcher.cjs" <<'EQUIP_LAUNCHER'
 const fs = require('fs');
 const q = value => "'" + value.replaceAll("'", "'\\\\''") + "'";
@@ -75,8 +84,10 @@ if [ "${"$"}{EQUIP_HEADLESS:-0}" = 1 ] || ! (: < /dev/tty) 2>/dev/null; then "${
 `;
 }
 
-export function powershellInstaller(origin: string, skillsVersion: string) {
-  return `$ErrorActionPreference = 'Stop'
+export function powershellInstaller(origin: string, _skillsVersion: string) {
+  return `# The first install trusts this HTTPS origin and its artifact hash. The installed
+# CLI pins Equip's release key and requires signed manifests for later updates.
+$ErrorActionPreference = 'Stop'
 $installRoot = if ($env:EQUIP_INSTALL_ROOT) { $env:EQUIP_INSTALL_ROOT } else { Join-Path $HOME '.equip' }
 $runtime = Join-Path $installRoot 'runtime'
 $nodeDir = Join-Path $installRoot 'node'
@@ -103,12 +114,19 @@ New-Item -ItemType Directory -Force -Path $runtime,$binDir | Out-Null
 Invoke-WebRequest '${origin}/cli/manifest' -OutFile (Join-Path $runtime 'manifest.json')
 Invoke-WebRequest '${origin}/cli/equip.cjs' -OutFile (Join-Path $runtime 'equip.cjs.download')
 $manifest = Get-Content (Join-Path $runtime 'manifest.json') | ConvertFrom-Json
+if ($manifest.origin -ne '${origin}' -or ([Uri]$manifest.url).GetLeftPart([UriPartial]::Authority) -ne '${origin}' -or ([Uri]$manifest.url).AbsolutePath -ne '/cli/equip.cjs') { throw 'Equip release origin mismatch.' }
 $cliHash = (Get-FileHash (Join-Path $runtime 'equip.cjs.download') -Algorithm SHA256).Hash.ToLower()
 if ($cliHash -ne $manifest.sha256.ToLower()) { throw 'Equip CLI checksum mismatch.' }
 Move-Item (Join-Path $runtime 'equip.cjs.download') (Join-Path $runtime 'equip.cjs') -Force
 $npmCli = if (Test-Path (Join-Path $nodeDir 'node_modules/npm/bin/npm-cli.js')) { Join-Path $nodeDir 'node_modules/npm/bin/npm-cli.js' } else { (Get-Command npm).Source }
-if ($npmCli.EndsWith('.js')) { & $nodePath $npmCli install --silent --no-audit --no-fund --omit=dev --prefix $runtime 'skills@${skillsVersion}' } else { & $npmCli install --silent --no-audit --no-fund --omit=dev --prefix $runtime 'skills@${skillsVersion}' }
+$skillsVersion = $manifest.skillsVersion
+$expectedIntegrity = $manifest.skillsIntegrity
+$registryIntegrity = if ($npmCli.EndsWith('.js')) { & $nodePath $npmCli view "skills@$skillsVersion" dist.integrity --json } else { & $npmCli view "skills@$skillsVersion" dist.integrity --json }
+if (($registryIntegrity | ConvertFrom-Json) -ne $expectedIntegrity) { throw 'Skills package integrity does not match the release manifest.' }
+if ($npmCli.EndsWith('.js')) { & $nodePath $npmCli install --silent --no-audit --no-fund --omit=dev --prefix $runtime "skills@$skillsVersion" } else { & $npmCli install --silent --no-audit --no-fund --omit=dev --prefix $runtime "skills@$skillsVersion" }
 if ($LASTEXITCODE -ne 0) { throw "npm failed with exit code $LASTEXITCODE" }
+$installedSkills = Get-Content (Join-Path $runtime 'node_modules/skills/package.json') | ConvertFrom-Json
+if ($installedSkills.version -ne $skillsVersion) { throw 'Installed skills version mismatch.' }
 $newline = [Environment]::NewLine
 $launcherPath = Join-Path $binDir 'equip.cmd'
 $launcher = '@echo off' + $newline + 'set "EQUIP_SERVER=${origin}"' + $newline + 'set "EQUIP_HOME=' + $installRoot + '\\state"' + $newline + 'set "EQUIP_SKILLS_ROOT=' + $runtime + '\\node_modules\\skills"' + $newline + 'set "EQUIP_NPM_CLI=' + $npmCli + '"' + $newline + '"' + $nodePath + '" "' + $runtime + '\\equip.cjs" %*'

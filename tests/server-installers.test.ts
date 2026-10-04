@@ -19,6 +19,9 @@ test("shell installer is valid and keeps isolated runs out of PATH and profile f
     assert.match(content, /EQUIP_NO_PROFILE/);
     assert.match(content, /cli\/manifest/);
     assert.match(content, /CLI checksum mismatch/);
+    assert.match(content, /first install trusts this HTTPS origin/);
+    assert.match(content, /skillsIntegrity/);
+    assert.match(content, /registry_integrity/);
     assert.match(content, /export EQUIP_NPM_CLI/);
     assert.match(content, /write-launcher\.cjs/);
     assert.doesNotMatch(content, /ln -sf/);
@@ -32,6 +35,9 @@ test("PowerShell installer verifies Node and CLI archives and bakes runtime path
   const content = powershellInstaller("http://127.0.0.1:4310", "1.7.0");
   assert.match(content, /Get-FileHash/);
   assert.match(content, /manifest\.json/);
+  assert.match(content, /first install trusts this HTTPS origin/);
+  assert.match(content, /skillsIntegrity/);
+  assert.match(content, /registryIntegrity/);
   assert.match(content, /EQUIP_NPM_CLI/);
   assert.match(content, /SetEnvironmentVariable\('Path'/);
   assert.match(content, /EQUIP_NO_PROFILE/);

@@ -3,7 +3,7 @@ import type { Device, InstructionLocation, Instructions, Skill } from './types.t
 export const instructionKey = (id: string, location: Pick<InstructionLocation, 'agent' | 'profile' | 'project'>) =>
   [id, location.agent, location.profile ?? '', location.project ?? ''].join(':');
 
-export function instructionEnabled(document: Instructions, location: InstructionLocation, deviceId?: string) {
+export function instructionEnabled(document: Instructions, location: Pick<InstructionLocation, "agent" | "profile" | "project">, deviceId?: string) {
   if (!document.selected || !document.enabled ||
       (document.scope === 'project') !== Boolean(location.project)) return false;
   const matches = document.targets.filter(t => (!deviceId || t.deviceId === deviceId) &&
