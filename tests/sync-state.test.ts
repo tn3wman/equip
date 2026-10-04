@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { conflictDevices, deployment, deviceStatus } from "../src/sync-state.ts";
+import { conflictDevices, conflictInstallations, deployment, deviceStatus } from "../src/sync-state.ts";
 import type { Device, Instructions, Skill } from "../shared/types.ts";
 const skill = {
   id: "skill",
@@ -199,6 +199,24 @@ test("conflict origins ignore disconnecting and disconnected computers", () => {
     ]),
     [],
   );
+});
+
+test("bulk Equip replacement selects each enabled conflict, including offline computers", () => {
+  const offline = {
+    ...device,
+    online: false,
+    agents: [...device.agents, { id: "codex", name: "Codex", path: "/work", profile: "work" }],
+    receipts: [
+      { ...receipt, status: "conflicted" as const },
+      { ...receipt, profile: "work", status: "conflicted" as const },
+      { ...receipt, kind: "instructions" as const, status: "conflicted" as const },
+      { ...receipt, agent: "unknown", status: "conflicted" as const },
+    ],
+  };
+  assert.deepEqual(conflictInstallations(skill, [offline]).map(({ receipt }) => receipt.profile), [undefined, "work"]);
+  assert.equal(conflictDevices(skill, [offline]).length, 1);
+  assert.deepEqual(conflictInstallations({ ...skill, targets: [{ deviceId: device.id, agent: "codex", profile: "work", enabled: false }] }, [offline]).map(({ receipt }) => receipt.profile), [undefined]);
+  assert.deepEqual(conflictInstallations({ ...skill, enabled: false }, [offline]), []);
 });
 
 test("published instructions keep older workers pending until locations are reported", () => {

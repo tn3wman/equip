@@ -15,7 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { fileHashes, sameFileHashes } from "./file-state.ts";
+import { fileHashes, sameInstalledFileHashes } from "./file-state.ts";
 import type {
   DesiredState,
   Receipt,
@@ -153,7 +153,7 @@ function differs(
   current: Record<string, string>,
   owned?: Record<string, string>,
 ) {
-  return !sameFileHashes(current, owned);
+  return !sameInstalledFileHashes(current, owned);
 }
 async function writeFiles(root: string, files: SkillFile[]) {
   for (const file of files) {
@@ -431,6 +431,7 @@ async function install(
   const rootInfo = await lstat(destination).catch(() => null);
   const desired = desiredHashes(skill.files);
   let migratingObserved = false;
+  let replacingChangedPointer = false;
   if (previous?.observed) {
     const pointer = await realpath(destination).catch(() => undefined);
     // Another agent can share the same physical skill root. If this pass
@@ -440,130 +441,140 @@ async function install(
       const { observed: _observed, ...managed } = previous;
       return { entry: { ...managed, canonicalPath: canonical.path, revision: skill.revision, files: desired }, receipt: { ...base, status: "synchronized" } };
     }
-    if (!pointer || pointer !== previous.canonicalPath)
-      return {
-        entry: previous,
-        receipt: {
-          ...base,
-          revision: previous.revision,
-          status: "conflicted",
-          managed: false,
-          message: "Observed installation pointer changed and was preserved",
-          localFiles: [],
-        },
-      };
-    const current = await snapshot(pointer);
-    const matchesDesired = !differs(current.hashes, desired);
-    const matchesBaseline = !differs(current.hashes, previous.files);
-    if (matchesDesired)
-      return {
-        entry: { ...previous, revision: skill.revision, files: desired },
-        receipt: {
-          ...base,
-          status: "synchronized",
-          managed: false,
-          message: "Existing installation matches; original folder or link retained",
-        },
-      };
-    if (action === "import" || action === "preserve")
-      return {
-        release: true,
-        receipt: {
-          ...base,
-          revision: previous.revision,
-          status: "conflicted",
-          managed: false,
-          message:
-            action === "import"
-              ? "Imported local files and released observation"
-              : "Preserved local files and released observation",
-          localFiles: current.files,
-        },
-      };
-    if (!matchesBaseline && action !== "replace")
-      return {
-        entry: previous,
-        receipt: {
-          ...base,
-          revision: previous.revision,
-          status: "conflicted",
-          managed: false,
-          message: "Observed installation changed locally and was preserved",
-          localFiles: current.files,
-        },
-      };
-    const backup = join(
-      home,
-      "backups",
-      `${Date.now()}-${skill.name}-observed-${randomUUID()}`,
-    );
-    await cp(pointer, backup, {
-      recursive: true,
-      dereference: false,
-      preserveTimestamps: true,
-    });
-    // Replace only the installation, never the repository or external source
-    // behind a preexisting link. The original files remain in place or backup.
-    migratingObserved = true;
+    if (!pointer || pointer !== previous.canonicalPath) {
+      if (action !== "replace")
+        return {
+          entry: previous,
+          receipt: {
+            ...base,
+            revision: previous.revision,
+            status: "conflicted",
+            managed: false,
+            message: "Observed installation pointer changed and was preserved",
+            localFiles: [],
+          },
+        };
+      replacingChangedPointer = true;
+    }
+    if (!replacingChangedPointer) {
+      const current = await snapshot(pointer!);
+      const matchesDesired = !differs(current.hashes, desired);
+      const matchesBaseline = !differs(current.hashes, previous.files);
+      if (matchesDesired)
+        return {
+          entry: { ...previous, revision: skill.revision, files: desired },
+          receipt: {
+            ...base,
+            status: "synchronized",
+            managed: false,
+            message: "Existing installation matches; original folder or link retained",
+          },
+        };
+      if (action === "import" || action === "preserve")
+        return {
+          release: true,
+          receipt: {
+            ...base,
+            revision: previous.revision,
+            status: "conflicted",
+            managed: false,
+            message:
+              action === "import"
+                ? "Imported local files and released observation"
+                : "Preserved local files and released observation",
+            localFiles: current.files,
+          },
+        };
+      if (!matchesBaseline && action !== "replace")
+        return {
+          entry: previous,
+          receipt: {
+            ...base,
+            revision: previous.revision,
+            status: "conflicted",
+            managed: false,
+            message: "Observed installation changed locally and was preserved",
+            localFiles: current.files,
+          },
+        };
+      const backup = join(
+        home,
+        "backups",
+        `${Date.now()}-${skill.name}-observed-${randomUUID()}`,
+      );
+      await cp(pointer!, backup, {
+        recursive: true,
+        dereference: false,
+        preserveTimestamps: true,
+      });
+      // Replace only the installation, never the repository or external source
+      // behind a preexisting link. The original files remain in place or backup.
+      migratingObserved = true;
+    }
   }
-  if (!migratingObserved && previous?.canonicalPath && previous.path === destination) {
+  if (!migratingObserved && !replacingChangedPointer && previous?.canonicalPath && previous.path === destination) {
     const intact = previous.copied
       ? !!rootInfo && !rootInfo.isSymbolicLink() &&
         !differs((await snapshot(destination)).hashes, previous.files)
       : await pointsTo(destination, previous.canonicalPath);
-    if (!intact)
-      return {
-        entry: previous,
-        receipt: {
-          ...base,
-          revision: previous.revision,
-          status: "conflicted",
-          message: "Managed skill link changed and was preserved",
-          localFiles: rootInfo?.isSymbolicLink()
-            ? []
-            : (await snapshot(destination)).files,
-        },
-      };
-    if (previous.copied) {
-      const transactionId = randomUUID();
-      const stage = `${destination}.equip-stage-${transactionId}`;
-      const oldPath = `${destination}.equip-old-${transactionId}`;
-      await cp(canonical.path, stage, {
-        recursive: true,
-        preserveTimestamps: true,
-      });
-      await saveJsonAtomic(join(home, "transaction.json"), {
-        destination,
-        stage,
-        oldPath,
-        hadOld: true,
-        revision: skill.revision,
-        transactionId,
-      } satisfies Journal);
-      await rename(destination, oldPath);
-      await rename(stage, destination);
+    if (!intact) {
+      if (action !== "replace")
+        return {
+          entry: previous,
+          receipt: {
+            ...base,
+            revision: previous.revision,
+            status: "conflicted",
+            message: "Managed skill link changed and was preserved",
+            localFiles: rootInfo?.isSymbolicLink()
+              ? []
+              : (await snapshot(destination)).files,
+          },
+        };
+      replacingChangedPointer = true;
+    }
+    if (!replacingChangedPointer) {
+      if (previous.copied) {
+        const transactionId = randomUUID();
+        const stage = `${destination}.equip-stage-${transactionId}`;
+        const oldPath = `${destination}.equip-old-${transactionId}`;
+        await cp(canonical.path, stage, {
+          recursive: true,
+          preserveTimestamps: true,
+        });
+        await saveJsonAtomic(join(home, "transaction.json"), {
+          destination,
+          stage,
+          oldPath,
+          hadOld: true,
+          revision: skill.revision,
+          transactionId,
+        } satisfies Journal);
+        await rename(destination, oldPath);
+        await rename(stage, destination);
+        return {
+          entry: {
+            ...previous,
+            revision: skill.revision,
+            files: canonical.hashes,
+            canonicalPath: canonical.path,
+            transactionId,
+          },
+          oldPath,
+          receipt: { ...base, status: "synchronized" },
+        };
+      }
       return {
         entry: {
           ...previous,
           revision: skill.revision,
           files: canonical.hashes,
           canonicalPath: canonical.path,
-          transactionId,
+          transactionId: canonical.transactionId ?? previous.transactionId,
         },
-        oldPath,
         receipt: { ...base, status: "synchronized" },
       };
     }
-    return {
-      entry: {
-        ...previous,
-        revision: skill.revision,
-        files: canonical.hashes,
-        canonicalPath: canonical.path,
-        transactionId: canonical.transactionId ?? previous.transactionId,
-      },
-      receipt: { ...base, status: "synchronized" },
-    };
   }
   // Matching preexisting folders can be observed without taking ownership.
   // Removals retain them, and updates still check their recorded baseline.
@@ -594,6 +605,7 @@ async function install(
       };
   }
   if (rootInfo?.isSymbolicLink() && !migratingObserved) {
+    linkedLocalFiles ??= (await snapshot(await realpath(destination))).files;
     if (action === "import" || action === "preserve")
       return {
         release: true,

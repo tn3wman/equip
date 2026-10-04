@@ -1,4 +1,4 @@
-import type { Device, Instructions, Skill, SyncStatus } from "../shared/types";
+import type { Device, Instructions, Receipt, Skill, SyncStatus } from "../shared/types";
 import { instructionDeployment } from "../shared/instructions";
 export function deployment(
   skill: Skill,
@@ -55,14 +55,19 @@ export function deployment(
   };
 }
 export function conflictDevices(skill: Skill, devices: Device[]): Device[] {
-  return devices.filter(device => !device.disconnect && !device.disconnectedAt &&
-    device.agents.some(agent => !skill.targets.some(target =>
+  return [...new Map(conflictInstallations(skill, devices).map(({ device }) => [device.id, device])).values()];
+}
+
+export function conflictInstallations(skill: Skill, devices: Device[]): { device: Device; receipt: Receipt }[] {
+  if (!skill.selected || !skill.enabled || !skill.versions.length) return [];
+  return devices.filter(device => !device.disconnect && !device.disconnectedAt).flatMap(device =>
+    device.agents.filter(agent => !skill.targets.some(target =>
       target.deviceId === device.id && target.agent === agent.id &&
       (!target.profile || target.profile === agent.profile) &&
-      (!target.project || target.project === agent.project) && !target.enabled) &&
-      device.receipts.some(receipt => !receipt.kind && receipt.skillId === skill.id &&
+      (!target.project || target.project === agent.project) && !target.enabled)).flatMap(agent =>
+      device.receipts.filter(receipt => !receipt.kind && receipt.skillId === skill.id &&
         receipt.agent === agent.id && receipt.profile === agent.profile &&
-        receipt.project === agent.project && receipt.status === "conflicted")));
+        receipt.project === agent.project && receipt.status === "conflicted").map(receipt => ({ device, receipt }))));
 }
 
 export function deviceStatus(

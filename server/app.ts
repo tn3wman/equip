@@ -2301,6 +2301,13 @@ export async function createApp(
           const original = req.workspace!.skills.find(
             (skill) => skill.id === receipt.skillId,
           );
+          const applied = action === "replace"
+            ? receipt.status === "synchronized" &&
+              (!original || receipt.revision === original.revision)
+            : receipt.status === "conflicted" &&
+              receipt.localFiles !== undefined;
+          if (!applied || receipt.status === "failed" || receipt.status === "offline")
+            continue;
           if (original && (action === "preserve" || action === "import")) {
             const existing = original.targets.find(
               (target) =>

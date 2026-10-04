@@ -71,6 +71,7 @@ import type {
 } from "../shared/types";
 import { SafetyBadge } from "./Safety";
 import SkillConflict from "./SkillConflict";
+import SkillSyncReview from "./SkillSyncReview";
 import { reviewedFilesRevision } from "../shared/conflicts";
 import { instructionsAsSkill } from "../shared/instructions";
 const lazyReloadKey = "equip:stale-chunk-reload";
@@ -477,6 +478,8 @@ export default function App() {
             <Library
               workspace={workspace}
               open={setSelected}
+              onChange={refresh}
+              notify={notify}
               navigate={navigate}
               create={() => startEditor()}
               connect={() => setConnect(true)}
@@ -692,6 +695,8 @@ export default function App() {
 function Library({
   workspace,
   open,
+  onChange,
+  notify,
   navigate,
   create,
   connect,
@@ -699,11 +704,15 @@ function Library({
 }: {
   workspace: Workspace;
   open: (s: Skill) => void;
+  onChange: () => Promise<void>;
+  notify: (message: string) => void;
   navigate: (p: Page) => void;
   create: () => void;
   connect: () => void;
   run: (fn: () => Promise<unknown>, message: string) => Promise<void>;
 }) {
+  const [reviewId, setReviewId] = useState<string>();
+  const reviewSkill = workspace.skills.find(skill => skill.id === reviewId);
   const [tab, setTab] = useState("all");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
@@ -858,7 +867,8 @@ function Library({
                 <button
                   className={`skill-row ${!skill.enabled ? "is-disabled" : ""}`}
                   key={skill.id}
-                  onClick={() => open(skill)}
+                  aria-label={needsReview.length ? `Review conflict for ${skill.title}` : undefined}
+                  onClick={() => needsReview.length ? setReviewId(skill.id) : open(skill)}
                 >
                   <div className="skill-cell">
                     <SkillIcon skill={skill} />
@@ -902,6 +912,7 @@ function Library({
                   </div>
                   <div className="status-cell">
                     <Status
+                      label={needsReview.length ? "Review conflict" : undefined}
                       status={
                         !skill.enabled
                           ? "disabled"
@@ -1094,6 +1105,7 @@ function Library({
           </div>
         </aside>
       </div>
+      {reviewSkill && <SkillSyncReview skill={reviewSkill} workspace={workspace} onClose={() => setReviewId(undefined)} onChange={onChange} notify={notify} onInspect={() => { setReviewId(undefined); open(reviewSkill); }} />}
     </div>
   );
 }

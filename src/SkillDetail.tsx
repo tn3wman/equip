@@ -33,6 +33,8 @@ import {
 import type { Skill, Workspace, SkillFile, Target } from "../shared/types";
 import type { SkillSafety } from "../shared/types";
 import { SafetyBadge, SafetyReport } from "./Safety";
+import { conflictInstallations } from "./sync-state";
+import SkillSyncReview from "./SkillSyncReview";
 
 export default function SkillDetail({
   skill,
@@ -66,6 +68,8 @@ export default function SkillDetail({
   const [safety, setSafety] = useState<SkillSafety | undefined>(skill.safety);
   const [safetyLoading, setSafetyLoading] = useState(skill.kind === "third-party");
   const [auditAcknowledged, setAuditAcknowledged] = useState(false);
+  const [syncReviewOpen, setSyncReviewOpen] = useState(false);
+  const conflicts = conflictInstallations(skill, workspace.devices);
   const [sourceOpen, setSourceOpen] = useState(false);
   const [upstreamSource, setUpstreamSource] = useState("");
   const [sourceError, setSourceError] = useState("");
@@ -391,6 +395,7 @@ export default function SkillDetail({
           </div>
         )}
         {installed && skill.revision && <div className="detail-actions"><a className="button small" href={`/api/skills/${skill.id}/export?revision=${encodeURIComponent(skill.revision)}`} download><ArrowDownToLine size={14} /> Download ZIP {revision(skill.revision)}</a></div>}
+        {!!conflicts.length && <div className="detail-conflict-notice"><AlertTriangle size={18} /><div><strong>Local copies differ from Equip</strong><p>{conflicts.length} installation{conflicts.length === 1 ? " has" : "s have"} different files. Back them up and use Equip's selected version.</p><button className="text-link" onClick={() => setSyncReviewOpen(true)}>Resolve conflict <ChevronRight size={14} /></button></div></div>}
         {installed && loading && <div className="catalog-loading" role="status"><Loader2 className="spin" size={16} /> Loading skill files…</div>}
         <div
           className="tabs detail-tabs"
@@ -686,6 +691,7 @@ export default function SkillDetail({
           </span>
         </div>
       </section>
+      {syncReviewOpen && <SkillSyncReview skill={skill} workspace={workspace} onClose={() => setSyncReviewOpen(false)} onChange={onChange} notify={notify} />}
       {sourceOpen && <Dialog title="Connect upstream source" onClose={() => { if (!busy) setSourceOpen(false); }}>
         <form className="dialog-body" onSubmit={event => { event.preventDefault(); void connectSource(); }}>
           <p>Connect the repository this skill came from. Equip keeps your selected revision and checks this source for future updates.</p>

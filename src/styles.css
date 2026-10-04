@@ -4121,6 +4121,44 @@ kbd {
 .status.conflicted {
   color: #71477c;
 }
+.skill-row .status.conflicted {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  white-space: normal;
+}
+.skill-sync-review .sync-selected,
+.detail-conflict-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px;
+  background: #f3edf6;
+  border: 1px solid #e5d9eb;
+  border-radius: 7px;
+  color: #62416f;
+}
+.sync-selected > svg,
+.detail-conflict-notice > svg { flex-shrink: 0; }
+.sync-selected p { margin-bottom: 0; overflow-wrap: anywhere; }
+.detail-conflict-notice { margin: 20px 30px; font-size: 12px; }
+.detail-conflict-notice p { margin: 6px 0 10px; line-height: 1.5; }
+.sync-conflict-location {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 15px 0;
+  border-bottom: 1px solid var(--border);
+}
+.sync-conflict-location > div { min-width: 0; flex: 1 1 220px; }
+.sync-conflict-location strong,
+.sync-conflict-location small,
+.sync-conflict-location code { display: block; }
+.sync-conflict-location small { margin: 5px 0; color: var(--muted); }
+.sync-conflict-location code { font-size: 10px; overflow-wrap: anywhere; }
+.skill-sync-review .dialog-actions { flex-wrap: wrap; }
+.skill-sync-review .dialog-actions button { white-space: normal; }
 .status.failed {
   color: #a14135;
 }

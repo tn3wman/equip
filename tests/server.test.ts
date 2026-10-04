@@ -949,6 +949,75 @@ test("target exceptions remain overrides, stale receipts do not sync, and import
   );
 });
 
+test("skill resolutions remain queued until the device acknowledges their action", async () => {
+  const cookie = await register("resolution-ack@example.com");
+  const files = novaSkill("resolution-ack").files;
+  const draft = await post(
+    "/api/skills",
+    { title: "Resolution acknowledgement", name: "resolution-ack", description: "Resolution acknowledgement", files },
+    cookie,
+  );
+  const published = await post(`/api/skills/${draft.body.id}/publish`, {}, cookie);
+  const device = await connectDevice(cookie, "Resolution client");
+  await call("/api/device/heartbeat", {
+    method: "POST",
+    headers: device.headers,
+    body: JSON.stringify({
+      name: "Resolution client",
+      os: "linux",
+      arch: "x64",
+      agents: [{ id: "codex", name: "Codex", path: "/resolution" }],
+    }),
+  });
+  const desired = await call("/api/device/desired", { headers: device.headers });
+  const key = `${published.body.id}:codex::`;
+  const receipt = (status: string, revision: string, localFiles?: unknown[]) => ({
+    skillId: published.body.id,
+    agent: "codex",
+    revision,
+    status,
+    timestamp: new Date().toISOString(),
+    ...(localFiles === undefined ? {} : { localFiles }),
+  });
+  const report = (value: ReturnType<typeof receipt>) =>
+    call("/api/device/receipts", {
+      method: "POST",
+      headers: device.headers,
+      body: JSON.stringify({ generation: desired.body.generation, receipts: [value] }),
+    });
+
+  await report(receipt("conflicted", published.body.revision, files));
+  await post(`/api/devices/${device.deviceId}/resolve`, {
+    skillId: published.body.id,
+    agent: "codex",
+    action: "replace",
+  }, cookie);
+  await report(receipt("conflicted", published.body.revision, files));
+  let workspace = await call("/api/workspace", {}, cookie);
+  assert.equal(workspace.body.devices[0].resolutions[key], "replace");
+
+  await report(receipt("synchronized", "stale-revision"));
+  workspace = await call("/api/workspace", {}, cookie);
+  assert.equal(workspace.body.devices[0].resolutions[key], "replace");
+
+  await report(receipt("synchronized", published.body.revision));
+  workspace = await call("/api/workspace", {}, cookie);
+  assert.equal(workspace.body.devices[0].resolutions[key], undefined);
+
+  await post(`/api/devices/${device.deviceId}/resolve`, {
+    skillId: published.body.id,
+    agent: "codex",
+    action: "preserve",
+  }, cookie);
+  await report(receipt("failed", published.body.revision, files));
+  workspace = await call("/api/workspace", {}, cookie);
+  assert.equal(workspace.body.devices[0].resolutions[key], "preserve");
+
+  await report(receipt("conflicted", published.body.revision, files));
+  workspace = await call("/api/workspace", {}, cookie);
+  assert.equal(workspace.body.devices[0].resolutions[key], undefined);
+});
+
 test("private sources resolve once on a connected device without exposing credentials", async () => {
   const cookie = await register("private-source@example.com");
   const queued = await post(

@@ -21,6 +21,15 @@ export function sameFileHashes(left: Record<string, string>, right: Record<strin
   return [...keys].every(key => comparableHash(left[key], platform) === comparableHash(right[key], platform));
 }
 
+export function sameInstalledFileHashes(current: Record<string, string>, baseline: Record<string, string> = {}, platform: NodeJS.Platform = process.platform) {
+  // Running bundled Python scripts creates bytecode. Keep it in snapshots and
+  // backups, but ignore extra runtime caches. Files shipped in the revision
+  // still participate in comparison, including deletions and modifications.
+  const installed = Object.fromEntries(Object.entries(current).filter(([path, hash]) =>
+    baseline[path] !== undefined || !/(^|\/)__pycache__\/[^/]+\.py[co]$/.test(path) || !/^\d+:[a-f0-9]{64}$/.test(hash)));
+  return sameFileHashes(installed, baseline, platform);
+}
+
 export function portableFilesRevision(files: SkillFile[]) {
   return skillRevision(files.map(file => ({ ...file,
     mode: process.platform !== "win32" && ((file.mode ?? 0o644) & 0o111) ? 0o755 : 0o644,

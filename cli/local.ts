@@ -4,7 +4,7 @@ import { basename, join } from "node:path";
 import { parse } from "yaml";
 import type { DesiredState, SkillFile } from "../shared/types.ts";
 import { skillRevision } from "../shared/library.ts";
-import { fileHashes, sameFileHashes, portableFilesRevision } from "./file-state.ts";
+import { fileHashes, sameInstalledFileHashes, portableFilesRevision } from "./file-state.ts";
 import { collectSkillFiles } from "./library.ts";
 import type { AgentTarget } from "./sync.ts";
 
@@ -73,7 +73,7 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
       const portableHash = portableFilesRevision(local.files);
       const prior = seen[path];
       const desiredSkill = desired.skills.find(s => s.name === local.name);
-      if (desiredSkill && sameFileHashes(fileHashes(desiredSkill.files), fileHashes(local.files))) {
+      if (desiredSkill && sameInstalledFileHashes(fileHashes(local.files), fileHashes(desiredSkill.files))) {
         seen[path] = { name: local.name, hash, portableHash, revision: desiredSkill.revision };
         continue;
       }
@@ -85,8 +85,8 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
         if (entry.canonicalPath === path || await realpath(entry.path).catch(() => undefined) === path)
           entries.push(entry);
       }
-      if (existing && entries.some(e => sameFileHashes(e.files, fileHashes(local.files)))) {
-        seen[path] = { name: local.name, hash, portableHash, revision: entries.find(e => sameFileHashes(e.files, fileHashes(local.files)))!.revision };
+      if (existing && entries.some(e => sameInstalledFileHashes(fileHashes(local.files), e.files))) {
+        seen[path] = { name: local.name, hash, portableHash, revision: entries.find(e => sameInstalledFileHashes(fileHashes(local.files), e.files))!.revision };
         continue;
       }
       if (prior?.hash === hash || prior?.portableHash === portableHash) continue;
