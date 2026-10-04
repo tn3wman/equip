@@ -124,8 +124,8 @@ test("local folders publish through one device and synchronize as canonical link
     assert.equal(await readFile(join(clients[0].home, "skills/foo/SKILL.md"), "utf8"), dashboard);
     assert.equal(await readFile(join(clients[1].home, "skills/foo/SKILL.md"), "utf8"), dashboard);
 
-    // One settling pass records the dashboard revision as the local edit baseline.
-    await runCli(["sync"], (clients[0] as any).environment);
+    // An edit immediately after receiving a dashboard update uses that newly
+    // installed revision, without requiring an extra settling sync.
     const localEdit = dashboard.replace("# Dashboard", "# Device one");
     await writeFile(join(clients[0].home, "skills/foo/SKILL.md"), localEdit);
     await runCli(["sync"], (clients[0] as any).environment);

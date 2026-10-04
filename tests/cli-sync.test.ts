@@ -162,6 +162,128 @@ test("local edits conflict and preserve the last good install", async () => {
   assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "local");
 });
 
+test("first connect preserves a same-name local skill when no baseline is known", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-unknown-base-"));
+  const target = join(root, "agent");
+  const home = join(root, "state");
+  await mkdir(join(target, "demo/scripts"), { recursive: true });
+  await writeFile(join(target, "demo/SKILL.md"), "edited before Equip");
+  await writeFile(join(target, "demo/scripts/run.sh"), "#!/bin/sh\n", {
+    mode: 0o755,
+  });
+
+  const receipts = await synchronize(
+    desired([skill("dashboard")]),
+    [{ id: "codex", path: target }],
+    home,
+  );
+
+  assert.equal(receipts[0].status, "conflicted");
+  assert.equal(receipts[0].revision, "");
+  assert.equal(
+    receipts[0].localFiles?.find((file) => file.path === "SKILL.md")?.content,
+    "edited before Equip",
+  );
+  assert.equal(
+    await readFile(join(target, "demo/SKILL.md"), "utf8"),
+    "edited before Equip",
+  );
+  assert.equal(
+    await readFile(join(home, "skills/demo/SKILL.md"), "utf8"),
+    "dashboard",
+  );
+});
+
+test("replacing an unknown-base canonical conflict keeps a recovery copy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-canonical-recovery-"));
+  const target = join(root, "agent");
+  const home = join(root, "state");
+  await mkdir(join(home, "skills/demo/scripts"), { recursive: true });
+  await writeFile(join(home, "skills/demo/SKILL.md"), "unknown local work");
+  await writeFile(join(home, "skills/demo/scripts/run.sh"), "#!/bin/sh\n", {
+    mode: 0o755,
+  });
+
+  const conflict = await synchronize(
+    desired([skill("dashboard")]),
+    [{ id: "codex", path: target }],
+    home,
+  );
+  assert.equal(conflict[0].status, "conflicted");
+  assert.equal(
+    await readFile(join(home, "skills/demo/SKILL.md"), "utf8"),
+    "unknown local work",
+  );
+
+  const replaced = await synchronize(
+    {
+      ...desired([skill("dashboard")]),
+      generation: 2,
+      resolutions: { "s1:codex::": "replace" },
+    },
+    [{ id: "codex", path: target }],
+    home,
+  );
+  assert.equal(replaced[0].status, "synchronized");
+  assert.equal(
+    await readFile(join(target, "demo/SKILL.md"), "utf8"),
+    "dashboard",
+  );
+  const backups = await import("node:fs/promises").then((fs) =>
+    fs.readdir(join(home, "backups")),
+  );
+  assert.equal(backups.length, 1);
+  assert.equal(
+    await readFile(join(home, "backups", backups[0], "SKILL.md"), "utf8"),
+    "unknown local work",
+  );
+});
+
+test("later sync distinguishes an unchanged base from a divergent local edit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-three-way-"));
+  const cleanTarget = join(root, "clean-agent");
+  const editedTarget = join(root, "edited-agent");
+  const cleanHome = join(root, "clean-state");
+  const editedHome = join(root, "edited-state");
+
+  await synchronize(
+    desired([skill("base")]),
+    [{ id: "codex", path: cleanTarget }],
+    cleanHome,
+  );
+  const clean = await synchronize(
+    { ...desired([skill("dashboard", "r2")]), generation: 2 },
+    [{ id: "codex", path: cleanTarget }],
+    cleanHome,
+  );
+  assert.equal(clean[0].status, "synchronized");
+  assert.equal(
+    await readFile(join(cleanTarget, "demo/SKILL.md"), "utf8"),
+    "dashboard",
+  );
+
+  await synchronize(
+    desired([skill("base")]),
+    [{ id: "codex", path: editedTarget }],
+    editedHome,
+  );
+  await writeFile(join(editedTarget, "demo/SKILL.md"), "local edit");
+  const divergent = await synchronize(
+    { ...desired([skill("dashboard", "r2")]), generation: 2 },
+    [{ id: "codex", path: editedTarget }],
+    editedHome,
+  );
+  assert.equal(divergent[0].status, "conflicted");
+  assert.equal(
+    divergent[0].localFiles?.find((file) => file.path === "SKILL.md")?.content,
+    "local edit",
+  );
+  assert.equal(
+    await readFile(join(editedTarget, "demo/SKILL.md"), "utf8"),
+    "local edit",
+  );
+});
+
 test("replace backs up conflicts and removal deletes only unchanged owned installs", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");
@@ -423,7 +545,7 @@ test("interrupted updates require the exact committed transaction even for share
   }
 });
 
-test("a symlinked skill root is conflicted without traversing or replacing its target", async () => {
+test("explicit replace swaps a symlinked skill root without changing its target", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");
   const external = join(root, "external");
@@ -437,13 +559,97 @@ test("a symlinked skill root is conflicted without traversing or replacing its t
     [{ id: "codex", path: target }],
     join(root, "state"),
   );
-  assert.equal(receipts[0].status, "conflicted");
-  assert.match(receipts[0].message ?? "", /symbolic link/);
+  assert.equal(receipts[0].status, "synchronized");
   assert.equal(
     await readFile(join(external, "private.txt"), "utf8"),
     "untouched",
   );
   assert.equal((await fs.lstat(join(target, "demo"))).isSymbolicLink(), true);
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "server");
+});
+
+test("first-connect symlink resolutions preserve its external target", async () => {
+  for (const action of ["import", "preserve"] as const) {
+    const root = await mkdtemp(join(tmpdir(), `equip-linked-${action}-`));
+    const target = join(root, "agent");
+    const external = join(root, "external");
+    const home = join(root, "state");
+    await mkdir(target);
+    await mkdir(join(external, "scripts"), { recursive: true });
+    await writeFile(join(external, "SKILL.md"), "external local edit");
+    await writeFile(join(external, "scripts/run.sh"), "#!/bin/sh\n", {
+      mode: 0o755,
+    });
+    await symlink(external, join(target, "demo"));
+
+    const receipts = await synchronize(
+      {
+        ...desired([skill("dashboard")]),
+        resolutions: { "s1:codex::": action },
+      },
+      [{ id: "codex", path: target }],
+      home,
+    );
+
+    assert.equal(receipts[0].status, "conflicted");
+    assert.equal(receipts[0].managed, false);
+    assert.equal(
+      receipts[0].localFiles?.find((file) => file.path === "SKILL.md")?.content,
+      "external local edit",
+    );
+    assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
+    assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "external local edit");
+  }
+});
+
+test("first-connect symlink replace backs up its pointer and contents without changing its target", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-linked-replace-"));
+  const target = join(root, "agent");
+  const external = join(root, "external");
+  const home = join(root, "state");
+  await mkdir(target);
+  await mkdir(join(external, "scripts"), { recursive: true });
+  await writeFile(join(external, "SKILL.md"), "external local edit");
+  await writeFile(join(external, "scripts/run.sh"), "#!/bin/sh\n", {
+    mode: 0o755,
+  });
+  await symlink(external, join(target, "demo"));
+
+  const replaced = await synchronize(
+    {
+      ...desired([skill("dashboard")]),
+      resolutions: { "s1:codex::": "replace" },
+    },
+    [{ id: "codex", path: target }],
+    home,
+  );
+
+  assert.equal(replaced[0].status, "synchronized");
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "dashboard");
+  assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "external local edit");
+  const backups = await import("node:fs/promises").then((fs) =>
+    fs.readdir(join(home, "backups")),
+  );
+  assert.equal(backups.length, 1);
+  assert.equal(
+    await readFile(join(home, "backups", backups[0], "contents/SKILL.md"), "utf8"),
+    "external local edit",
+  );
+  assert.equal(
+    JSON.parse(
+      await readFile(join(home, "backups", backups[0], "original-link.json"), "utf8"),
+    ).target,
+    external,
+  );
+
+  const updated = await synchronize(
+    { ...desired([skill("later", "r2")]), generation: 2 },
+    [{ id: "codex", path: target }],
+    home,
+  );
+  assert.equal(updated[0].status, "synchronized");
+  assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "later");
+  assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "external local edit");
 });
 
 test("a canonical edit conflicts across profiles while resolutions stay isolated", async () => {

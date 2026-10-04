@@ -238,7 +238,10 @@ async function prepareCanonical(
           message: "Canonical skill changed locally and was preserved",
         },
       };
-    if (entries.some((entry) => entry.canonicalPath === path && !entry.observed)) {
+    if (
+      replace ||
+      entries.some((entry) => entry.canonicalPath === path && !entry.observed)
+    ) {
       const backup = join(
         home,
         "backups",
@@ -573,6 +576,7 @@ async function install(
   // Matching preexisting folders can be observed without taking ownership.
   // Removals retain them, and updates still check their recorded baseline.
   let linkedLocalFiles: SkillFile[] | undefined;
+  let replacingUnownedLink = false;
   if (rootInfo && !previous) {
     const existing = await snapshot(await realpath(destination));
     linkedLocalFiles = existing.files;
@@ -597,19 +601,55 @@ async function install(
         },
       };
   }
-  if (rootInfo?.isSymbolicLink() && !migratingObserved)
-    return {
-      entry: previous,
-      receipt: {
-        ...base,
-        revision: previous?.revision ?? "",
-        status: "conflicted",
-        message: "Skill destination is a symbolic link and was preserved",
-        localFiles: linkedLocalFiles ?? [],
-      },
-    };
+  if (rootInfo?.isSymbolicLink() && !migratingObserved) {
+    if (action === "import" || action === "preserve")
+      return {
+        release: true,
+        receipt: {
+          ...base,
+          revision: previous?.revision ?? "",
+          status: "conflicted",
+          managed: false,
+          message:
+            action === "import"
+              ? "Imported linked local files and released management"
+              : "Preserved local skill link and released management",
+          localFiles: linkedLocalFiles ?? [],
+        },
+      };
+    if (action !== "replace")
+      return {
+        entry: previous,
+        receipt: {
+          ...base,
+          revision: previous?.revision ?? "",
+          status: "conflicted",
+          managed: false,
+          message:
+            "Existing skill link has no Equip baseline; choose preserve, import, or replace",
+          localFiles: linkedLocalFiles ?? [],
+        },
+      };
+    const backup = join(
+      home,
+      "backups",
+      `${Date.now()}-${skill.name}-linked-${randomUUID()}`,
+    );
+    await mkdir(backup, { recursive: true });
+    await cp(await realpath(destination), join(backup, "contents"), {
+      recursive: true,
+      dereference: false,
+      preserveTimestamps: true,
+    });
+    await writeFile(
+      join(backup, "original-link.json"),
+      JSON.stringify({ target: await readlink(destination) }, null, 2),
+      { mode: 0o600 },
+    );
+    replacingUnownedLink = true;
+  }
   const current = await snapshot(destination);
-  const conflict = !migratingObserved && differs(
+  const conflict = !migratingObserved && !replacingUnownedLink && differs(
     current.hashes,
     obsoletePath ? undefined : previous?.files,
   );

@@ -48,28 +48,57 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
   }
   let changed = false;
   const published = new Map<string,string>();
+  const inspected = new Map<string, Awaited<ReturnType<typeof localSkill>>>();
+  const newCopies = new Map<string, Set<string>>();
+  for (const path of candidates) {
+    if (known.get(basename(path))?.kind === "third-party") continue;
+    try {
+      const local = await localSkill(path);
+      inspected.set(path, local);
+      if (!known.has(local.name)) {
+        const copies = newCopies.get(local.name) ?? new Set<string>();
+        copies.add(skillRevision(local.files));
+        newCopies.set(local.name, copies);
+      }
+    } catch (error) { errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  // Inspect every unknown copy before publishing any of them. Directory order
+  // must not choose the winner when multiple profiles already disagree.
+  const ambiguous = new Set([...newCopies].filter(([, copies]) => copies.size > 1).map(([name]) => name));
+  for (const name of ambiguous) errors.push(`${name}: different local copies need review.`);
   for (const path of candidates) {
     try {
       const configured = known.get(basename(path));
       if (configured?.kind === "third-party") continue;
-      const local = await localSkill(path);
+      const local = inspected.get(path);
+      if (!local || ambiguous.has(local.name)) continue;
       const existing = known.get(local.name);
       if (existing?.kind === "third-party") continue;
       const hash = skillRevision(local.files);
       const prior = seen[path];
-      if (prior?.hash === hash) continue;
       const desiredSkill = desired.skills.find(s => s.name === local.name);
       if (desiredSkill && canonicalFiles(desiredSkill.files) === canonicalFiles(local.files)) {
         seen[path] = { name: local.name, hash, revision: desiredSkill.revision };
         continue;
       }
-      const entries = Object.values(ledger.installs).filter((e: any) => e.skillId === existing?.id) as Array<{ files: Record<string,string>; revision: string }>;
-      if (existing && entries.some(e => sameHashes(e.files, hashes(local.files)))) continue;
+      // A baseline belongs to this physical copy. Another profile's ledger
+      // cannot authorize publishing an unrelated preexisting folder.
+      const entries: Array<{ files: Record<string,string>; revision: string }> = [];
+      for (const entry of Object.values(ledger.installs) as Array<{ skillId: string; path: string; canonicalPath?: string; files: Record<string,string>; revision: string }>) {
+        if (entry.skillId !== existing?.id) continue;
+        if (entry.canonicalPath === path || await realpath(entry.path).catch(() => undefined) === path)
+          entries.push(entry);
+      }
+      if (existing && entries.some(e => sameHashes(e.files, hashes(local.files)))) {
+        seen[path] = { name: local.name, hash, revision: entries.find(e => sameHashes(e.files, hashes(local.files)))!.revision };
+        continue;
+      }
+      if (prior?.hash === hash) continue;
       if (published.has(local.name)) {
         if (published.get(local.name) !== hash) errors.push(`${local.name}: different local copies need review.`);
         continue;
       }
-      const result = await publish({ ...local, baseRevision: existing ? prior?.revision || entries[0]?.revision : prior?.revision });
+      const result = await publish({ ...local, baseRevision: existing ? entries[0]?.revision || prior?.revision : prior?.revision });
       seen[path] = { name: local.name, hash, revision: result.revision };
       published.set(local.name, hash);
       changed ||= result.changed;
