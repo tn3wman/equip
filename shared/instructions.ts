@@ -22,7 +22,8 @@ export function instructionsAsSkill(document: Instructions): Skill {
 
 export function instructionDeployment(document: Instructions, devices: Device[]) {
   const locations = devices.filter(d => !d.disconnect && !d.disconnectedAt).flatMap(device =>
-    (device.instructionLocations ?? []).filter(l => instructionEnabled(document, l, device.id))
+    (device.instructionLocations ?? []).filter(l => instructionEnabled(document, l, device.id) &&
+      !device.excludedAgents?.some(excluded => excluded.agent === l.agent && excluded.profile === l.profile && excluded.project === l.project))
       .map(location => ({ device, location })));
   let complete = 0;
   let status: 'synchronized' | 'pending' | 'offline' | 'conflicted' | 'failed' = 'pending';

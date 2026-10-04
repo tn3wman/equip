@@ -2267,6 +2267,7 @@ export async function createApp(
     if (req.headers["if-none-match"] === etag) { res.status(304).end(); return; }
     const account = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
     const current = JSON.parse(account!.workspace);
+    const localSkills = current.skills.map(({id,name,revision,kind}:Skill) => ({id,name,revision,kind}));
     // Devices need current revisions, not every historical bundle and draft.
     for (const field of ["skills", "instructions"] as const) current[field] = (current[field] ?? [])
       .filter((item: Skill | Instructions) => item.selected && item.enabled && item.revision)
@@ -2298,7 +2299,7 @@ export async function createApp(
       disconnect: device.disconnect,
       excludedAgents: device.excludedAgents ?? [],
       localSync: device.localSync?.enabled ?? false,
-      localSkills: req.workspace!.skills.map(({id,name,revision,kind}) => ({id,name,revision,kind})),
+      localSkills,
     };
     res.json(desired);
   }, true));
