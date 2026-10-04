@@ -98,6 +98,7 @@ export async function runNpmCommand(
     return exec(options.env?.ComSpec || process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], {
       timeout,
       env: options.env,
+      windowsVerbatimArguments: true,
     });
   }
   return exec(executable, args, { timeout, env: options.env });

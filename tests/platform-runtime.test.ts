@@ -151,7 +151,9 @@ process.exit(2);
       error => error as Error & { stderr?: string },
     );
     assert.ok(interruption, "the simulated npm interruption must fail installation");
-    const npmCalls = (await readFile(environment.EQUIP_NPM_LOG!, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    const npmLog = await readFile(environment.EQUIP_NPM_LOG!, "utf8").catch(() => "");
+    assert.ok(npmLog, `installer failed before npm install:\n${interruption.stderr ?? interruption.message}`);
+    const npmCalls = npmLog.trim().split("\n").map(line => JSON.parse(line));
     assert.ok(npmCalls.some(call => call[0] === "install"), interruption.stderr ?? interruption.message);
     const launcher = join(installRoot, "bin", process.platform === "win32" ? "equip.cmd" : "equip");
     await assert.rejects(readFile(launcher), { code: "ENOENT" });

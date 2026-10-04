@@ -99,8 +99,8 @@ if (-not $node -or $useBundled) {
   $arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
   $archive = 'node-v${NODE_VERSION}-win-' + $arch + '.zip'
   $work = Join-Path $installRoot '.node-download'; New-Item -ItemType Directory -Force -Path $work | Out-Null
-  Invoke-WebRequest "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -OutFile (Join-Path $work 'SHASUMS256.txt')
-  Invoke-WebRequest "https://nodejs.org/dist/v${NODE_VERSION}/$archive" -OutFile (Join-Path $work $archive)
+  Invoke-WebRequest "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -UseBasicParsing -OutFile (Join-Path $work 'SHASUMS256.txt')
+  Invoke-WebRequest "https://nodejs.org/dist/v${NODE_VERSION}/$archive" -UseBasicParsing -OutFile (Join-Path $work $archive)
   $line = Select-String -Path (Join-Path $work 'SHASUMS256.txt') -Pattern ([regex]::Escape($archive) + '$') | Select-Object -First 1
   if (-not $line) { throw 'Node checksum was not published.' }
   $expected = $line.Line.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0].ToLower()
@@ -111,8 +111,8 @@ if (-not $node -or $useBundled) {
   $nodePath = Join-Path $nodeDir 'node.exe'
 } else { $nodePath = $node.Source }
 New-Item -ItemType Directory -Force -Path $runtime,$binDir | Out-Null
-Invoke-WebRequest '${origin}/cli/manifest' -OutFile (Join-Path $runtime 'manifest.json')
-Invoke-WebRequest '${origin}/cli/equip.cjs' -OutFile (Join-Path $runtime 'equip.cjs.download')
+Invoke-WebRequest '${origin}/cli/manifest' -UseBasicParsing -OutFile (Join-Path $runtime 'manifest.json')
+Invoke-WebRequest '${origin}/cli/equip.cjs' -UseBasicParsing -OutFile (Join-Path $runtime 'equip.cjs.download')
 $manifest = Get-Content (Join-Path $runtime 'manifest.json') | ConvertFrom-Json
 if ($manifest.origin -ne '${origin}' -or ([Uri]$manifest.url).GetLeftPart([UriPartial]::Authority) -ne '${origin}' -or ([Uri]$manifest.url).AbsolutePath -ne '/cli/equip.cjs') { throw 'Equip release origin mismatch.' }
 $cliHash = (Get-FileHash (Join-Path $runtime 'equip.cjs.download') -Algorithm SHA256).Hash.ToLower()
