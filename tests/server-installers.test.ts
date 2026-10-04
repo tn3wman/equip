@@ -33,7 +33,7 @@ test("shell installer is valid and keeps isolated runs out of PATH and profile f
 
 test("PowerShell installer verifies Node and CLI archives and bakes runtime paths", () => {
   const content = powershellInstaller("http://127.0.0.1:4310", "1.7.0");
-  assert.match(content, /Get-FileHash/);
+  assert.match(content, /ComputeHash\(\$stream\)/);
   assert.match(content, /manifest\.json/);
   assert.match(content, /first install trusts this HTTPS origin/);
   assert.match(content, /skillsIntegrity/);

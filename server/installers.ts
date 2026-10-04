@@ -92,6 +92,12 @@ $installRoot = if ($env:EQUIP_INSTALL_ROOT) { $env:EQUIP_INSTALL_ROOT } else { J
 $runtime = Join-Path $installRoot 'runtime'
 $nodeDir = Join-Path $installRoot 'node'
 $binDir = Join-Path $installRoot 'bin'
+function Get-Sha256([string]$path) {
+  $algorithm = [Security.Cryptography.SHA256]::Create()
+  $stream = [IO.File]::OpenRead($path)
+  try { return ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+  finally { $stream.Dispose(); $algorithm.Dispose() }
+}
 $useBundled = $env:EQUIP_FORCE_BUNDLED_NODE -eq '1'
 $node = Get-Command node -ErrorAction SilentlyContinue
 if ($node -and -not $useBundled) { $parts = (& $node.Source -p "process.versions.node").Split('.'); $useBundled = [int]$parts[0] -lt 22 -or ([int]$parts[0] -eq 22 -and [int]$parts[1] -lt 20) }
@@ -104,7 +110,7 @@ if (-not $node -or $useBundled) {
   $line = Select-String -Path (Join-Path $work 'SHASUMS256.txt') -Pattern ([regex]::Escape($archive) + '$') | Select-Object -First 1
   if (-not $line) { throw 'Node checksum was not published.' }
   $expected = $line.Line.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0].ToLower()
-  $actual = (Get-FileHash (Join-Path $work $archive) -Algorithm SHA256).Hash.ToLower()
+  $actual = Get-Sha256 (Join-Path $work $archive)
   if ($actual -ne $expected) { throw 'Node download checksum mismatch.' }
   Remove-Item $nodeDir -Recurse -Force -ErrorAction SilentlyContinue; Expand-Archive (Join-Path $work $archive) $work -Force
   Move-Item (Join-Path $work $archive.Replace('.zip','')) $nodeDir; Remove-Item $work -Recurse -Force
@@ -115,7 +121,7 @@ Invoke-WebRequest '${origin}/cli/manifest' -UseBasicParsing -OutFile (Join-Path 
 Invoke-WebRequest '${origin}/cli/equip.cjs' -UseBasicParsing -OutFile (Join-Path $runtime 'equip.cjs.download')
 $manifest = Get-Content (Join-Path $runtime 'manifest.json') | ConvertFrom-Json
 if ($manifest.origin -ne '${origin}' -or ([Uri]$manifest.url).GetLeftPart([UriPartial]::Authority) -ne '${origin}' -or ([Uri]$manifest.url).AbsolutePath -ne '/cli/equip.cjs') { throw 'Equip release origin mismatch.' }
-$cliHash = (Get-FileHash (Join-Path $runtime 'equip.cjs.download') -Algorithm SHA256).Hash.ToLower()
+$cliHash = Get-Sha256 (Join-Path $runtime 'equip.cjs.download')
 if ($cliHash -ne $manifest.sha256.ToLower()) { throw 'Equip CLI checksum mismatch.' }
 Move-Item (Join-Path $runtime 'equip.cjs.download') (Join-Path $runtime 'equip.cjs') -Force
 $npmCli = if (Test-Path (Join-Path $nodeDir 'node_modules/npm/bin/npm-cli.js')) { Join-Path $nodeDir 'node_modules/npm/bin/npm-cli.js' } else { (Get-Command npm).Source }
