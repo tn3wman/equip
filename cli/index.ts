@@ -105,7 +105,7 @@ async function request<T>(
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...init.headers,
     },
-    signal: init.signal ?? AbortSignal.timeout(15_000),
+    signal: init.signal ?? AbortSignal.timeout(30_000),
   });
   if (!response.ok)
     throw new Error(`${response.status} ${await response.text()}`);

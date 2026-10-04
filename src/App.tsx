@@ -130,6 +130,8 @@ export default function App() {
     new URLSearchParams(location.search).get("code") || "",
   );
   const bootstrap = useRef<Promise<void> | null>(null);
+  const refreshInFlight = useRef<Promise<void> | null>(null);
+  const refreshPending = useRef(false);
   const authConfigResolved = useRef(false);
   useEffect(() => {
     if (!menu) return;
@@ -166,12 +168,28 @@ export default function App() {
     };
   }, [menu]);
   const refresh = useCallback(async () => {
-    try {
-      setWorkspace(await api<Workspace>("/workspace?view=dashboard"));
-      setError("");
-    } catch (e) {
-      setError((e as Error).message);
+    if (refreshInFlight.current) {
+      refreshPending.current = true;
+      return refreshInFlight.current;
     }
+    const request = Promise.resolve()
+      .then(async () => {
+        try {
+          do {
+            refreshPending.current = false;
+            try {
+              setWorkspace(await api<Workspace>("/workspace?view=dashboard"));
+              setError("");
+            } catch (e) {
+              setError((e as Error).message);
+            }
+          } while (refreshPending.current);
+        } finally {
+          refreshInFlight.current = null;
+        }
+      });
+    refreshInFlight.current = request;
+    return request;
   }, []);
   const loadAuthConfig = useCallback(async () => {
     try {
@@ -218,7 +236,7 @@ export default function App() {
     void bootstrap.current.then(() => {
       if (!cancelled)
         timer = setInterval(() => {
-          void refresh();
+          if (!refreshInFlight.current) void refresh();
           if (!authConfigResolved.current) void loadAuthConfig();
         }, 5000);
     });
