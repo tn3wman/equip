@@ -129,6 +129,19 @@ test("device recovery archives local files without changing desired state", asyn
     assert.equal(damagedExport.response.status, 200);
     assert.equal(Buffer.from(unzipSync(damagedExport.body)["recovered-skill/SKILL.md"]!).toString(), recoveredFiles[0].content);
 
+    const concurrentFiles = ["Concurrent A\n", "Concurrent B\n"].map(content => [{
+      path: "SKILL.md",
+      content,
+    }]);
+    const concurrent = await Promise.all(concurrentFiles.map(files =>
+      call("/api/device/recovery", "POST", { skillId: selected.id, files }, token)));
+    assert.ok(concurrent.every(result => result.response.status === 200));
+    const afterConcurrent = await call("/api/workspace");
+    for (const result of concurrent)
+      assert.ok(afterConcurrent.body.skills[0].versions.some((version: any) =>
+        version.revision === result.body.revision));
+    assert.equal(afterConcurrent.body.skills[0].versions.length, selected.versions.length + 3);
+
     const validRecoveredFiles = [{
       path: "SKILL.md",
       content: "---\nname: recovered-skill\ndescription: Archived valid copy\n---\n\nArchived\n",

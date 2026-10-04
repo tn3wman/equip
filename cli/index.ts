@@ -105,7 +105,7 @@ async function request<T>(
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...init.headers,
     },
-    signal: AbortSignal.timeout(15_000),
+    signal: init.signal ?? AbortSignal.timeout(15_000),
   });
   if (!response.ok)
     throw new Error(`${response.status} ${await response.text()}`);
@@ -323,7 +323,9 @@ async function applyState(s: State) {
   const instructionLocations = await discoverInstructionLocations(targets, {home:agentHome, autoDetect:s.autoDetect});
   const base = s.server || server;
   const archive: RecoveryArchive = async payload => {
-    const result = await request<{archived:boolean}>("/api/device/recovery", {method:"POST",body:JSON.stringify(payload)}, s.token, base);
+    const result = await request<{archived:boolean}>("/api/device/recovery", {
+      method:"POST",body:JSON.stringify(payload),signal:AbortSignal.timeout(60_000),
+    }, s.token, base);
     if (result.archived !== true) throw new Error("Equip could not confirm recovery history. Local files were preserved.");
   };
   await flushReceipts(s, base);

@@ -1874,6 +1874,23 @@ export async function createApp(
     req.workspace = parseWorkspace(account.workspace);
     next();
   };
+  const deviceIdentityAuth = async (
+    req: AuthedRequest,
+    res: Response,
+    next: NextFunction,
+  ) => {
+    const match = req.get("authorization")?.match(/^Bearer (.+)$/);
+    const row = match
+      ? await db.get<any>(
+          "SELECT account_id,device_id FROM device_tokens WHERE token_hash=? AND revoked_at IS NULL",
+          digest(match[1]),
+        )
+      : undefined;
+    if (!row) return res.status(401).json({ error: "invalid_token" });
+    req.accountId = row.account_id;
+    req.deviceId = row.device_id;
+    next();
+  };
   app.post(
     "/api/device/instructions/local",
     deviceAuth,
@@ -1907,13 +1924,9 @@ export async function createApp(
   );
   app.post(
     "/api/device/recovery",
-    deviceAuth,
-    lockedWorkspace,
+    deviceIdentityAuth,
     async (req: AuthedRequest, res, next) => {
       try {
-        const workspace = req.workspace!;
-        const device = workspace.devices.find(item => item.id === req.deviceId);
-        if (!device) throw httpError(401, "invalid_token");
         if (typeof req.body?.skillId !== "string" || !req.body.skillId)
           throw httpError(400, "skillId is required.");
         if (req.body.kind !== undefined && req.body.kind !== "instructions")
@@ -1923,37 +1936,45 @@ export async function createApp(
              req.body.path.length > 2048 || req.body.path.includes("\0")))
           throw httpError(400, "path must be a non-empty local path of at most 2048 characters.");
 
-        const isInstructions = req.body.kind === "instructions";
-        const item = isInstructions
-          ? (workspace.instructions ?? []).find(document => document.id === req.body.skillId)
-          : workspace.skills.find(skill => skill.id === req.body.skillId);
-        if (!item)
-          throw httpError(404, isInstructions ? "Instructions not found." : "Skill not found.");
+        const result = await runAccountLocked(req.accountId!, async () => {
+          const row = await db.get<any>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
+          if (!row) throw httpError(401, "invalid_token");
+          const workspace = parseWorkspace(row.workspace);
+          const device = workspace.devices.find(item => item.id === req.deviceId);
+          if (!device) throw httpError(401, "invalid_token");
+          const isInstructions = req.body.kind === "instructions";
+          const item = isInstructions
+            ? (workspace.instructions ?? []).find(document => document.id === req.body.skillId)
+            : workspace.skills.find(skill => skill.id === req.body.skillId);
+          if (!item)
+            throw httpError(404, isInstructions ? "Instructions not found." : "Skill not found.");
 
-        let files = clone(req.body.files) as SkillFile[];
-        if (isInstructions) {
-          validateInstructionFiles(files);
-          files = files.map(file => ({ ...file, path: (item as Instructions).filename }));
-          validateInstructionFiles(files, (item as Instructions).filename);
-        } else {
-          validateFileEntries(files);
-          if (!files.length) throw httpError(400, "Recovery files cannot be empty.");
-        }
-        const rev = revision(files);
-        const existing = item.versions.find(version =>
-          version.revision === rev && sameFiles(version.files, files));
-        if (!existing) {
-          const source = req.body.path ? ` at ${req.body.path}` : "";
-          item.versions.push({
-            id: id("version"),
-            revision: rev,
-            createdAt: iso(),
-            message: `Recovered from ${device.name}${source}`,
-            files: clone(files),
-          });
-        }
-        await saveWorkspace(db, req.accountId!, workspace);
-        res.json({ id: item.id, revision: rev, archived: true });
+          let files = clone(req.body.files) as SkillFile[];
+          if (isInstructions) {
+            validateInstructionFiles(files);
+            files = files.map(file => ({ ...file, path: (item as Instructions).filename }));
+            validateInstructionFiles(files, (item as Instructions).filename);
+          } else {
+            validateFileEntries(files);
+            if (!files.length) throw httpError(400, "Recovery files cannot be empty.");
+          }
+          const rev = revision(files);
+          const existing = item.versions.find(version =>
+            version.revision === rev && sameFiles(version.files, files));
+          if (!existing) {
+            const source = req.body.path ? ` at ${req.body.path}` : "";
+            item.versions.push({
+              id: id("version"),
+              revision: rev,
+              createdAt: iso(),
+              message: `Recovered from ${device.name}${source}`,
+              files: clone(files),
+            });
+            await saveWorkspace(db, req.accountId!, workspace);
+          }
+          return { id: item.id, revision: rev, archived: true };
+        });
+        res.json(result);
       } catch (error) { next(error); }
     },
   );
