@@ -66,6 +66,27 @@ test("Nova snapshot combines owned and installed skills and preserves bytes and 
   assert.match(snapshot.revision, /^[a-f0-9]{64}$/);
 });
 
+test("recorded vendored skills keep local bytes and import as third-party", async () => {
+  const root = await fixture();
+  const directory = await customSkill(root, "vendored-skill", "Locally patched");
+  await writeFile(join(directory, "patch.txt"), "local patch\n");
+  await writeFile(join(root, "skills/upstream.json"), JSON.stringify({
+    "vendored-skill": {
+      repository: "https://github.com/example/upstream",
+      revision: "recorded-revision",
+      path: "skills/vendored-skill",
+    },
+  }));
+
+  const snapshot = await readLibrarySnapshot(root, {
+    resolveMissing: async () => { throw new Error("must not resolve vendored content"); },
+  });
+
+  assert.equal(snapshot.skills[0].kind, "third-party");
+  assert.equal(snapshot.skills[0].source, "https://github.com/example/upstream");
+  assert.equal(snapshot.skills[0].files.find(file => file.path === "patch.txt")?.content, "local patch\n");
+});
+
 test("a missing listed skill is resolved through the supplied resolver", async () => {
   const root = await fixture();
   const installed = join(root, "installed");
@@ -138,6 +159,30 @@ test("a manifest mutation during missing-skill resolution rejects the snapshot",
               content: "---\nname: missing\ndescription: Resolved\n---\n",
             },
           ],
+        };
+      },
+    }),
+    /The library changed while its skills were being read/,
+  );
+});
+
+test("an upstream provenance mutation during resolution rejects the snapshot", async () => {
+  const root = await fixture();
+  const manifest = join(root, "skills/skills-sh.json");
+  const provenance = join(root, "skills/upstream.json");
+  await writeFile(manifest, JSON.stringify({ missing: "owner/repository" }));
+  await writeFile(provenance, "{}\n");
+  await assert.rejects(
+    readLibrarySnapshot(root, {
+      installedSkills: join(root, "installed"),
+      resolveMissing: async () => {
+        await writeFile(provenance, JSON.stringify({ recorded: { source: "owner/changed" } }));
+        return {
+          name: "missing", title: "Missing", description: "Resolved", author: "Fixture",
+          source: "owner/repository", category: "Test", icon: "Sparkles", color: "#000000",
+          revision: "resolved", requirements: [], files: [{
+            path: "SKILL.md", content: "---\nname: missing\ndescription: Resolved\n---\n",
+          }],
         };
       },
     }),

@@ -42,6 +42,28 @@ export async function readLibrarySnapshot(
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest))
     throw new Error("The library skills-sh.json must map skill names to sources.");
   const listed = Object.entries(manifest);
+  const provenancePath = join(skillsRoot, "upstream.json");
+  const provenanceText = await readFile(provenancePath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; });
+  const provenanceDocument: unknown = JSON.parse(provenanceText);
+  if (!provenanceDocument || typeof provenanceDocument !== "object" || Array.isArray(provenanceDocument))
+    throw new Error("The library upstream.json must map skill names to provenance records.");
+  const provenanceRoot = "skills" in provenanceDocument && (provenanceDocument as any).skills
+    ? (provenanceDocument as any).skills
+    : provenanceDocument;
+  if (!provenanceRoot || typeof provenanceRoot !== "object" || Array.isArray(provenanceRoot))
+    throw new Error("The library upstream.json must map skill names to provenance records.");
+  const provenance = new Map<string, string>();
+  for (const [name, record] of Object.entries(provenanceRoot)) {
+    safeName(name);
+    const source = typeof record === "string"
+      ? record
+      : record && typeof record === "object"
+        ? [(record as any).source, (record as any).repository, (record as any).sourceUrl]
+            .find(value => typeof value === "string" && value.trim())
+        : undefined;
+    if (typeof source !== "string") throw new Error(`Library skill ${name} has no upstream source.`);
+    provenance.set(name, source);
+  }
   const custom = (await readdir(skillsRoot, { withFileTypes: true }))
     .filter(entry => entry.isDirectory()).map(entry => entry.name);
   const entries: Array<{ name: string; source: string; kind: "custom" | "third-party"; directory?: string }> = [];
@@ -55,7 +77,10 @@ export async function readLibrarySnapshot(
     if (!(await stat(join(directory, "SKILL.md")).catch(() => null))?.isFile()) continue;
     safeName(name);
     if (entries.some(entry => entry.name === name)) throw new Error(`The library lists ${name} as both a repository skill and a third-party skill.`);
-    entries.push({ name, source: `${basename(root).toLowerCase().replace(/[^a-z0-9]+/g, "-")}:skills/${name}`, kind: "custom", directory });
+    const upstreamSource = provenance.get(name);
+    entries.push(upstreamSource
+      ? { name, source: upstreamSource, kind: "third-party", directory }
+      : { name, source: `${basename(root).toLowerCase().replace(/[^a-z0-9]+/g, "-")}:skills/${name}`, kind: "custom", directory });
   }
   if (!entries.length) throw new Error("The library has no skills to synchronize.");
   const skills: LibrarySnapshotSkill[] = await Promise.all(entries.map(async entry => {
@@ -71,6 +96,8 @@ export async function readLibrarySnapshot(
     return { name: entry.name, title: entry.name, source: entry.source, kind: entry.kind, files };
   }));
   if (originalManifest !== await readFile(manifestPath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }))
+    throw new Error("The library changed while its skills were being read. The next sync will retry.");
+  if (provenanceText !== await readFile(provenancePath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }))
     throw new Error("The library changed while its skills were being read. The next sync will retry.");
   skills.sort((a, b) => a.name.localeCompare(b.name));
   return { skills, revision: librarySnapshotRevision(skills) };

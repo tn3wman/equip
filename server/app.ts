@@ -1249,6 +1249,48 @@ export async function createApp(
     }),
   );
   app.post(
+    "/api/skills/:id/source",
+    ...mutate(async (req) => {
+      const skill = findSkill(req);
+      const source = typeof req.body?.source === "string" ? req.body.source.trim() : "";
+      if (!source) throw httpError(400, "source is required.");
+      let resolved: any;
+      try {
+        resolved = await resolveSource(source, skill.name);
+      } catch (error: any) {
+        throw httpError(error?.status ?? 400, error?.message ?? "Source unavailable.");
+      }
+      const metadata = validateFiles(resolved.files, 16_384);
+      if (resolved.name !== skill.name || metadata.name !== skill.name)
+        throw httpError(400, `Source must resolve to skill ${skill.name}.`);
+      const same = canonicalFiles(resolved.files) === canonicalFiles(skill.files);
+      const wasCustom = skill.kind === "custom";
+      const resolvedSource = resolved.source || source;
+      const refreshDesired =
+        skill.kind !== "third-party" ||
+        skill.source !== resolvedSource ||
+        skill.author !== resolved.author ||
+        skill.category !== "Community" ||
+        skill.icon !== "package" ||
+        (wasCustom && skill.autoUpdate);
+      skill.kind = "third-party";
+      skill.source = resolvedSource;
+      skill.author = resolved.author;
+      skill.category = "Community";
+      skill.icon = "package";
+      if (wasCustom) skill.autoUpdate = false;
+      skill.upstreamRevision = same
+        ? undefined
+        : (resolved.revision && resolved.revision !== skill.revision
+            ? resolved.revision
+            : revision(resolved.files));
+      skill.upstreamCheckedAt = iso();
+      skill.updatedAt = iso();
+      if (refreshDesired) bump(req.workspace!);
+      return skill;
+    }),
+  );
+  app.post(
     "/api/skills/:id/publish",
     ...mutate((req) => {
       const skill = findSkill(req);
@@ -1582,26 +1624,19 @@ export async function createApp(
         if (metadata.name !== original.name)
           throw httpError(409, "A renamed local skill must be imported as a separate draft.");
         const rev = revision(files);
+        const custom = original.kind === "custom";
         const changed =
           canonicalFiles(original.files) !== canonicalFiles(files) ||
-          original.kind !== "custom" ||
-          original.author !== req.workspace!.name ||
+          (custom && original.author !== req.workspace!.name) ||
           original.autoUpdate ||
           original.description !== metadata.description ||
           original.upstreamRevision !== undefined ||
-          original.upstreamCheckedAt !== undefined ||
-          original.catalogId !== undefined ||
-          original.catalogUrl !== undefined ||
-          original.sourceType !== undefined ||
-          original.official !== undefined ||
-          original.duplicate !== undefined ||
-          original.safety !== undefined;
+          original.upstreamCheckedAt !== undefined;
         if (changed) {
           original.description = metadata.description;
           original.files = files;
           original.revision = rev;
-          original.kind = "custom";
-          original.author = req.workspace!.name;
+          if (custom) original.author = req.workspace!.name;
           original.autoUpdate = false;
           original.updatedAt = iso();
           original.versions.unshift({
@@ -1613,13 +1648,6 @@ export async function createApp(
           });
           original.upstreamRevision = undefined;
           original.upstreamCheckedAt = undefined;
-          original.catalogId = undefined;
-          original.catalogUrl = undefined;
-          original.installs = undefined;
-          original.sourceType = undefined;
-          original.official = undefined;
-          original.duplicate = undefined;
-          original.safety = undefined;
           bump(req.workspace!);
           activity(req.workspace!, {
             type: "publish",

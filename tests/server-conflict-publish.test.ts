@@ -171,16 +171,20 @@ test("a reviewed device conflict can replace the central revision for every devi
     assert.equal(published.response.status, 200);
     workspace = (await request("/api/workspace")).body;
     const fork = workspace.skills.find((skill: any) => skill.id === skillId);
-    assert.equal(fork.kind, "custom");
+    assert.equal(fork.kind, "third-party");
     assert.equal(fork.source, "https://example.test/shared-tool.git");
-    assert.equal(fork.author, workspace.name);
+    assert.equal(fork.author, "Upstream author");
     assert.equal(fork.autoUpdate, false);
     assert.deepEqual(fork.files, localFiles);
     assert.deepEqual(fork.draft, existingDraft);
     assert.deepEqual(fork.targets, existingTargets);
     assert.equal(fork.upstreamRevision, undefined);
-    assert.equal(fork.catalogId, undefined);
-    assert.equal(fork.official, undefined);
+    assert.equal(fork.catalogId, "catalog-shared-tool");
+    assert.equal(fork.catalogUrl, "https://example.test/catalog/shared-tool");
+    assert.equal(fork.sourceType, "github");
+    assert.equal(fork.official, true);
+    assert.equal(fork.duplicate, true);
+    assert.equal(fork.safety.scope, "upstream");
     assert.equal(fork.versions[1].revision, baseRevision);
     assert.equal(workspace.activity[0].status, "pending");
 
@@ -188,6 +192,12 @@ test("a reviewed device conflict can replace the central revision for every devi
       request("/api/device/desired", {}, device.token).then((result) => result.body)));
     assert.ok(desired.every((state) => state.skills.find((skill: any) => skill.id === skillId).revision === fork.revision));
     assert.ok(desired.every((state) => JSON.stringify(state.skills.find((skill: any) => skill.id === skillId).files) === JSON.stringify(localFiles)));
+
+    const checked = await post(`/api/skills/${skillId}/check`, {});
+    assert.equal(checked.response.status, 200);
+    assert.equal(checked.body.upstreamRevision, "upstream-r1");
+    assert.deepEqual(checked.body.draft, existingDraft);
+    assert.deepEqual(checked.body.targets, existingTargets);
 
     const rollback = await post(`/api/skills/${skillId}/rollback`, { versionId: fork.versions[1].id });
     assert.equal(rollback.response.status, 200);

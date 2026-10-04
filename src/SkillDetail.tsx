@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -50,6 +50,9 @@ export default function SkillDetail({
   notify: (m: string) => void;
 }) {
   const panel = useRef<HTMLElement>(null);
+  const contentPanel = useRef<HTMLDivElement>(null);
+  const contentId = useId();
+  const reviewRequested = useRef(false);
   const close = useRef(onClose);
   close.current = onClose;
   const [tab, setTab] = useState("instructions");
@@ -63,6 +66,9 @@ export default function SkillDetail({
   const [safety, setSafety] = useState<SkillSafety | undefined>(skill.safety);
   const [safetyLoading, setSafetyLoading] = useState(skill.kind === "third-party");
   const [auditAcknowledged, setAuditAcknowledged] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const [upstreamSource, setUpstreamSource] = useState("");
+  const [sourceError, setSourceError] = useState("");
   const installed = workspace.skills.some(
     (s) => s.id === skill.id && s.selected,
   );
@@ -72,6 +78,36 @@ export default function SkillDetail({
   const flagged = safety?.status === "warn" || safety?.status === "fail";
   const files = data.files.length ? data.files : data.draft || [];
   const activeFile = files.find((f) => f.path === file) || files[0];
+  const revealReports = () => {
+    const content = contentPanel.current;
+    if (!content) return;
+    content.scrollTop = 0;
+    content.focus({ preventScroll: true });
+    content.scrollIntoView({ block: "start", behavior: "instant" });
+  };
+  const reviewReports = () => {
+    if (tab === "security") revealReports();
+    else { reviewRequested.current = true; setTab("security"); }
+  };
+  const connectSource = async () => {
+    setBusy(true);
+    setSourceError("");
+    try {
+      const updated = await api<Skill>(`/skills/${skill.id}/source`, "POST", { source: upstreamSource.trim() });
+      setActual(updated);
+      await onChange();
+      setSourceOpen(false);
+      notify("Upstream source connected. Your selected revision is preserved.");
+    } catch (requestError) {
+      setSourceError((requestError as Error).message);
+    } finally { setBusy(false); }
+  };
+  useEffect(() => {
+    if (tab === "security" && reviewRequested.current) {
+      reviewRequested.current = false;
+      revealReports();
+    }
+  }, [tab]);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
     panel.current?.focus();
@@ -252,7 +288,7 @@ export default function SkillDetail({
                 label={skill.versions.length ? "In your library" : "Draft"}
               />
             )}
-            {skill.kind === "third-party" && <SafetyBadge safety={safety} loading={safetyLoading} />}
+            {skill.kind === "third-party" && <SafetyBadge safety={safety} loading={safetyLoading} onReview={reviewReports} controls={contentId} />}
           </div>
           <div className="detail-actions">
             {installed ? (
@@ -331,7 +367,8 @@ export default function SkillDetail({
             )}
           </div>
           {installed && skill.kind === "third-party" && skill.upstreamCheckedAt && <p className="update-check-status">{hasUpdate ? `Update available · ${revision(skill.upstreamRevision!)}` : "Up to date at last check"} · Checked {ago(skill.upstreamCheckedAt)}</p>}
-          {skill.kind === "third-party" && flagged && !safetyLoading && <><button className="text-link" onClick={() => setTab("security")}>Review security reports <ArrowUpRight size={13} /></button>{(!installed || hasUpdate) && <label className="audit-acknowledgement"><input type="checkbox" checked={auditAcknowledged} onChange={(event) => setAuditAcknowledged(event.target.checked)} /><span><strong>I reviewed the audit findings</strong><small>Required before {installed ? "updating" : "adding"} this skill.</small></span></label>}</>}
+          {installed && skill.kind === "custom" && <button className="text-link" onClick={() => { setSourceError(""); setSourceOpen(true); }}>Connect an upstream source <ArrowUpRight size={13} /></button>}
+          {skill.kind === "third-party" && flagged && !safetyLoading && <><button className="text-link" onClick={reviewReports} aria-controls={contentId}>Review security reports <ArrowUpRight size={13} /></button>{(!installed || hasUpdate) && <label className="audit-acknowledgement"><input type="checkbox" checked={auditAcknowledged} onChange={(event) => setAuditAcknowledged(event.target.checked)} /><span><strong>I reviewed the audit findings</strong><small>Required before {installed ? "updating" : "adding"} this skill.</small></span></label>}</>}
         </div>
         {error && (
           <div className="notice error" role="alert">
@@ -376,6 +413,8 @@ export default function SkillDetail({
               role="tab"
               tabIndex={tab === t.id ? 0 : -1}
               aria-selected={tab === t.id}
+              aria-controls={contentId}
+              id={`${contentId}-${t.id}`}
               className={tab === t.id ? "active" : ""}
               key={t.id}
               onClick={() => setTab(t.id)}
@@ -385,10 +424,13 @@ export default function SkillDetail({
           ))}
         </div>
         <div
+          ref={contentPanel}
+          id={contentId}
           className="detail-content"
           tabIndex={0}
           role="tabpanel"
           aria-label={tab}
+          aria-labelledby={`${contentId}-${tab}`}
         >
           {tab === "instructions" && (
             <>
@@ -644,6 +686,14 @@ export default function SkillDetail({
           </span>
         </div>
       </section>
+      {sourceOpen && <Dialog title="Connect upstream source" onClose={() => { if (!busy) setSourceOpen(false); }}>
+        <form className="dialog-body" onSubmit={event => { event.preventDefault(); void connectSource(); }}>
+          <p>Connect the repository this skill came from. Equip keeps your selected revision and checks this source for future updates.</p>
+          <label className="field">Source<input value={upstreamSource} onChange={event => setUpstreamSource(event.target.value)} placeholder="owner/repository or repository URL" required disabled={busy} autoFocus /></label>
+          {sourceError && <div className="notice error" role="alert">{sourceError}</div>}
+          <div className="dialog-actions"><button type="button" className="button" disabled={busy} onClick={() => setSourceOpen(false)}>Cancel</button><button className="button primary" disabled={busy || !upstreamSource.trim()}>{busy ? <Loader2 className="spin" size={15} /> : null}{busy ? "Checking source…" : "Connect source"}</button></div>
+        </form>
+      </Dialog>}
       {confirm && (
         <Dialog
           title={

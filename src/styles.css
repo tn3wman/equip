@@ -1470,6 +1470,13 @@ kbd {
   color: #616b5d;
   background: #eef0eb;
 }
+button.safety-badge {
+  border: 1px solid currentColor;
+  cursor: pointer;
+}
+button.safety-badge:hover {
+  text-decoration: underline;
+}
 .discover-title {
   font-family: "Manrope Variable", sans-serif;
   font-size: 14px;
@@ -2235,15 +2242,19 @@ kbd {
 .detail-tabs {
   padding: 0 30px;
   gap: 26px;
+  overflow-x: auto;
   border-bottom: 1px solid var(--border);
 }
 .detail-tabs button {
+  flex-shrink: 0;
   font-size: 11px;
 }
 .detail-content {
   padding: 25px 30px;
   flex: 1;
+  min-height: 0;
   overflow: auto;
+  scroll-margin-top: 80px;
 }
 .detail-panel > .notice {
   margin: 0 20px 12px;
@@ -2326,6 +2337,9 @@ kbd {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+}
+.audit-meta {
+  flex-wrap: wrap;
 }
 .audit-heading strong {
   font-size: 12px;
