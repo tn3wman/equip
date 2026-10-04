@@ -18,7 +18,7 @@ export default function SkillConflict({
   device: Device;
   receipt: Receipt;
   onClose: () => void;
-  onResolve: (action: Resolution, expectedRevision: string) => Promise<void>;
+  onResolve: (action: Resolution, expectedRevision?: string) => Promise<void>;
 }) {
   const [equipSkill, setEquipSkill] = useState(skill);
   const [loadError, setLoadError] = useState("");
@@ -31,8 +31,8 @@ export default function SkillConflict({
     return () => { cancelled = true; };
   }, [skill?.id]);
   const comparisons = useMemo(
-    () => compareSkillFiles(receipt.localFiles || [], equipSkill?.files || []),
-    [receipt.localFiles, equipSkill?.files],
+    () => skill && !equipSkill?.files.length ? [] : compareSkillFiles(receipt.localFiles || [], equipSkill?.files || []),
+    [receipt.localFiles, equipSkill?.files, skill?.id],
   );
   const [selectedPath, setSelectedPath] = useState(comparisons[0]?.path);
   const [queued, setQueued] = useState<Resolution>();
@@ -47,7 +47,7 @@ export default function SkillConflict({
   const scope = [agent?.name || receipt.agent, receipt.profile, receipt.project].filter(Boolean).join(" · ");
   const permissionChanges = comparisons.filter((file) => file.modeChanged).length;
   const contentChanges = comparisons.filter((file) => file.contentChanged).length;
-  const comparisonReady = Boolean(equipSkill?.files.length) && !loadError;
+  const comparisonReady = (!skill || Boolean(equipSkill?.files.length)) && !loadError;
   const queuedCopy = queued === "replace"
     ? "Equip will back up the local folder, then install its version."
     : queued === "publish"
@@ -59,16 +59,16 @@ export default function SkillConflict({
   const excluded = skill?.targets.some(target => target.deviceId === device.id && target.agent === receipt.agent && target.profile === receipt.profile && target.project === receipt.project && !target.enabled);
   const completed = Boolean(queued && (
     queued === "preserve" || queued === "import"
-      ? excluded && !latestReceipt
-      : latestReceipt?.status === "synchronized" && latestReceipt.revision === skill?.revision
+      ? (!skill || excluded) && !latestReceipt
+      : !skill ? !latestReceipt : latestReceipt?.status === "synchronized" && latestReceipt.revision === skill.revision
   ));
 
   const resolve = async (action: Resolution) => {
-    if (!comparisonReady || !equipSkill) return;
+    if (!comparisonReady) return;
     setSubmitting(action);
     setResolveError("");
     try {
-      await onResolve(action, equipSkill.revision);
+      await onResolve(action, skill ? equipSkill?.revision : undefined);
       setQueued(action);
     } catch (error) {
       setResolveError((error as Error).message);
@@ -90,7 +90,7 @@ export default function SkillConflict({
             )}
           </div>
           <dl>
-            <div><dt>Local path</dt><dd><code>{receipt.path || "Path unavailable"}</code></dd></div>
+            <div><dt>Local path</dt><dd><code title={receipt.path}>{receipt.path || "Path unavailable"}</code></dd></div>
             <div><dt>Last Equip baseline</dt><dd><code>{receipt.revision ? revision(receipt.revision) : "Unknown"}</code></dd></div>
             <div><dt>Equip revision</dt><dd><code>{revision(equipSkill?.revision || "")}</code></dd></div>
             <div><dt>Comparison basis</dt><dd>{receipt.revision ? "Previously compared with the recorded Equip baseline" : "No shared baseline; neither version is assumed newer"}</dd></div>
@@ -105,7 +105,7 @@ export default function SkillConflict({
         <div className="conflict-workbench">
           <nav className="conflict-files" aria-label="Changed files">
             <div className="conflict-pane-title">Changed files</div>
-            {loadError ? <p className="conflict-empty">Could not load the Equip version: {loadError}</p> : !equipSkill?.files.length ? <p className="conflict-empty">Loading the Equip version…</p> : comparisons.length ? comparisons.map((file) => (
+            {loadError ? <p className="conflict-empty">Could not load the Equip version: {loadError}</p> : skill && !equipSkill?.files.length ? <p className="conflict-empty">Loading the Equip version…</p> : comparisons.length ? comparisons.map((file) => (
               <button
                 type="button"
                 key={file.path}
@@ -122,8 +122,9 @@ export default function SkillConflict({
             <div className="conflict-pane-title">
               <span>{selected?.path || "No file selected"}</span>
               {selected?.binary && <span>Binary file</span>}
+              {selected?.modeChanged && <span>Local permissions {selected.local?.mode?.toString(8) || "644"} · Equip {selected.equip?.mode?.toString(8) || "644"}</span>}
             </div>
-            {selected?.binary ? (
+            {selected?.binary && selected.contentChanged ? (
               <div className="binary-diff"><FileCode2 size={24} /><strong>Binary content differs</strong><p>Equip cannot show a line comparison. Choose a version below to keep its exact bytes.</p></div>
             ) : selected?.contentChanged ? (
               <div className="diff-code" role="table" aria-label="Line comparison">
@@ -150,8 +151,8 @@ export default function SkillConflict({
           <div className="conflict-queued" role="status"><Check size={17} /><div><strong>{completed ? "Computer confirmed your choice" : queued === "publish" ? "Local version published" : "Choice queued for this computer"}</strong><p>{completed ? "This installation has reconciled. Other selected destinations report their progress in Computers." : `${queuedCopy} The conflict stays visible until the computer reports completion.`}</p></div></div>
         ) : (
           <div className="conflict-choices">
-            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("replace")}><strong>Use Equip version</strong><span>Back up the local folder, then replace it with Equip’s revision.</span></button>
-            <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length} onClick={() => void resolve("publish")}><strong>Use local version everywhere</strong><span>Publish this reviewed local folder snapshot to Equip and all selected destinations. Files on this computer are preserved.</span><em>For a third-party skill, this creates a custom copy and turns off automatic upstream updates.</em></button>
+            <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("replace")}><strong>{skill ? "Use Equip version" : "Back up and remove"}</strong><span>{skill ? "Back up the local folder, then replace it with Equip’s revision." : "Equip removed this skill. Back up local edits, then remove this managed installation."}</span></button>
+            <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length || !skill} onClick={() => void resolve("publish")}><strong>Use local version everywhere</strong><span>Publish this reviewed local folder snapshot to Equip and all selected destinations. Files on this computer are preserved.</span>{skill?.kind === "third-party" && <em>This becomes a custom fork. Automatic upstream updates turn off.</em>}</button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady} onClick={() => void resolve("preserve")}><strong>Keep local on this computer</strong><span>Create an exception here and stop updates for this installation.</span></button>
             <button type="button" disabled={Boolean(submitting) || !comparisonReady || !receipt.localFiles?.length} onClick={() => void resolve("import")}><strong>Save local as custom draft</strong><span>Keep the local work in Equip as a separate unpublished draft.</span></button>
           </div>

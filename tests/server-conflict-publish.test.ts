@@ -72,6 +72,13 @@ test("a reviewed device conflict can replace the central revision for every devi
     });
     assert.equal(installed.response.status, 200);
     const skillId = installed.body.id as string;
+    const existingDraft = [{ path: "SKILL.md", content: "---\nname: shared-tool\ndescription: Unpublished work\n---\n\n# Unfinished draft\n" }];
+    const existingTargets = [{ deviceId: "unrelated-device", agent: "codex", enabled: false }];
+    const configured = await request(`/api/skills/${skillId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ draft: existingDraft, targets: existingTargets, autoUpdate: true }),
+    });
+    assert.equal(configured.response.status, 200);
     const devices: Array<{ id: string; token: string }> = [];
     for (const name of ["Source laptop", "Peer laptop"]) {
       const authorization = await post("/api/device/authorize", { name, os: "linux", arch: "x64" });
@@ -169,7 +176,8 @@ test("a reviewed device conflict can replace the central revision for every devi
     assert.equal(fork.author, workspace.name);
     assert.equal(fork.autoUpdate, false);
     assert.deepEqual(fork.files, localFiles);
-    assert.equal(fork.draft, undefined);
+    assert.deepEqual(fork.draft, existingDraft);
+    assert.deepEqual(fork.targets, existingTargets);
     assert.equal(fork.upstreamRevision, undefined);
     assert.equal(fork.catalogId, undefined);
     assert.equal(fork.official, undefined);

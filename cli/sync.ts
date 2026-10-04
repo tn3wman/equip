@@ -819,10 +819,17 @@ export async function synchronize(
             );
             canonicals.set(skill.id, canonical);
           }
+          const destination = join(target.path, skill.name);
+          const shared = Object.values(next.installs).find(entry =>
+            entry.skillId === skill.id && entry.path === destination && entry.canonicalPath && !entry.observed);
+          const previous = ledger.installs[key];
+          const sharedPrevious = shared && (!previous || previous.observed && previous.canonicalPath === shared.canonicalPath)
+            ? { ...shared, agent: target.id, profile: target.profile, project: target.project }
+            : previous;
           const result = await install(
             skill,
             target,
-            ledger.installs[key],
+            sharedPrevious,
             desired.resolutions[key] ??
             desired.resolutions[`${skill.id}:${target.id}`],
             home,
@@ -886,6 +893,16 @@ export async function synchronize(
     const canonicalGcCandidates = new Set<string>();
     for (const [key, old] of Object.entries(ledger.installs))
       if (!wanted.has(key)) {
+        // Several upstream agents can intentionally use the same directory.
+        // Release this destination rule without deleting another agent's link.
+        if (Object.entries(next.installs).some(([otherKey, entry]) => otherKey !== key && wanted.has(otherKey) && entry.path === old.path)) {
+          delete next.installs[key];
+          receipts.push({ skillId: old.skillId, agent: old.agent, profile: old.profile,
+            project: old.project, revision: old.revision, status: "synchronized",
+            path: old.path, timestamp: new Date().toISOString(),
+            message: "Released this destination; another selected agent shares the installation" });
+          continue;
+        }
         if (old.localOwned && old.canonicalPath) protectedCanonicals.add(old.canonicalPath);
         if (old.observed) {
           if (old.canonicalPath) protectedCanonicals.add(old.canonicalPath);

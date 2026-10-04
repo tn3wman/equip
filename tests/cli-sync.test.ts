@@ -896,6 +896,23 @@ test("an unchanged revision leaves the installed directory in place", async () =
   assert.equal(after.mtimeMs, before.mtimeMs);
 });
 
+test("shared agent directories remain managed, survive one exclusion, and remove their store after all exclusions", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "equip-shared-ownership-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), path = join(root, "shared");
+  const agents = [{ id: "one", path }, { id: "two", path }];
+  const value = skill("shared");
+  const installed = await synchronize(desired([value]), agents, home);
+  assert.ok(installed.every(receipt => receipt.status === "synchronized" && receipt.managed !== false));
+  const excluded = { ...value, targets: [{ deviceId: "", agent: "one", enabled: false }] };
+  const partial = await synchronize({ ...desired([excluded]), generation: 2 }, agents, home);
+  assert.ok(partial.every(receipt => receipt.status === "synchronized"));
+  assert.equal(await readFile(join(path, "demo/SKILL.md"), "utf8"), "shared");
+  await synchronize({ generation: 3, skills: [], resolutions: {} }, agents, home);
+  assert.equal(await lstat(join(path, "demo")).catch(() => null), null);
+  assert.equal(await lstat(join(home, "skills/demo")).catch(() => null), null);
+});
+
 
 test("removal preserves a locally substituted symlink even when its contents match", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-removal-link-"));
