@@ -9,6 +9,29 @@ permissions:
   contents: read
 
 jobs:
+  secrets:
+    name: Scan Git history for secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install checksum-pinned Infisical scanner
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 \
+            https://github.com/Infisical/cli/releases/download/v0.43.137/cli_0.43.137_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/infisical.tar.gz"
+          echo "308a90c7f9c307cb9c348d352a797a3a63b02e1a7836adbe8afddfd75c855531  $RUNNER_TEMP/infisical.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/infisical.tar.gz" -C "$RUNNER_TEMP" infisical
+      - name: Reject credentials in any fetched branch or historical commit
+        run: >-
+          "$RUNNER_TEMP/infisical" scan --telemetry=false --silent --redact --no-color
+          --config "$GITHUB_WORKSPACE/.infisical-scan.toml"
+          --log-opts='--all --full-history'
+          --report-path "$RUNNER_TEMP/equip-secret-scan.json"
+
   native-release:
     name: Native release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

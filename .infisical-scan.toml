@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+# These exact inert passwords belong to isolated test servers. Keep every other
+# rule and every other value in these files covered, including their history.
+[allowlist]
+condition = "AND"
+paths = ['''(?:^|/)tests/(?:cli-instructions-live|server-auth-abuse|server-recovery-history)\.test\.ts$''']
+regexTarget = "secret"
+regexes = ['''^(?:a private test password|incorrect-password|correct horse battery)$''']

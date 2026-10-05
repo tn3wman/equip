@@ -129,8 +129,8 @@ test("completed disconnections no longer count as deployment destinations", () =
 test("conflict origins identify only the affected active computer", () => {
   const conflicted = {
     ...device,
-    id: "aitopatom",
-    name: "aitopatom",
+    id: "workstation",
+    name: "workstation",
     receipts: [{ ...receipt, status: "conflicted" as const }],
   };
   const synchronized = {
@@ -146,7 +146,7 @@ test("conflict origins identify only the affected active computer", () => {
   });
   assert.deepEqual(
     conflictDevices(skill, [conflicted, synchronized]).map(({ id }) => id),
-    ["aitopatom"],
+    ["workstation"],
   );
 });
 

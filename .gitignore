@@ -3,5 +3,16 @@ dist/
 .vercel/
 .infisical.json
 .equip-data/
+.equip/
+.env*
+coverage/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.pem
+*.key
+*.p12
+*.pfx
 *.log
 .DS_Store
