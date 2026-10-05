@@ -1,0 +1,64 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  retainedConfiguredTargets,
+  selectAgentTargets,
+} from "../cli/targets.ts";
+
+const agents = [
+  {
+    id: "codex",
+    globalPath: "/home/.codex/skills",
+    projectPath: ".agents/skills",
+  },
+  { id: "eve", globalPath: "", projectPath: "agent/skills" },
+];
+
+test("default target selection skips detected project-only agents", () => {
+  assert.deepEqual(selectAgentTargets(agents, agents), [
+    { id: "codex", path: "/home/.codex/skills", profile: undefined },
+  ]);
+});
+
+test("detected profile labels flow into targets unless explicitly overridden", () => {
+  const detected = [
+    {
+      id: "codex",
+      globalPath: "/home/.codex_nova/skills",
+      projectPath: ".agents/skills",
+      profile: "nova",
+    },
+  ];
+  assert.deepEqual(selectAgentTargets(agents, detected), [
+    {
+      id: "codex",
+      path: "/home/.codex_nova/skills",
+      profile: "nova",
+    },
+  ]);
+  assert.equal(
+    selectAgentTargets(agents, detected, undefined, undefined, "override")[0]
+      .profile,
+    "override",
+  );
+});
+
+test("explicit project-only agent requires and respects a project root", () => {
+  assert.throws(
+    () => selectAgentTargets(agents, agents, ["eve"]),
+    /provide --project/,
+  );
+  const selected = selectAgentTargets(agents, agents, ["eve"], "/workspace");
+  assert.equal(selected[0].path, "/workspace/agent/skills");
+  assert.equal(selected[0].project, "/workspace");
+});
+
+test("auto detection drops cached globals but retains explicit profiles and projects", () => {
+  const targets = [
+    { id: "opencode", path: "/old-host-config/opencode/skills" },
+    { id: "codex", path: "/profiles/work", profile: "work" },
+    { id: "claude-code", path: "/project/.claude/skills", project: "/project" },
+  ];
+  assert.deepEqual(retainedConfiguredTargets(true, targets), targets.slice(1));
+  assert.deepEqual(retainedConfiguredTargets(false, targets), targets);
+});

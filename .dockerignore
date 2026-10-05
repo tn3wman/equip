@@ -1,11 +1,13 @@
-node_modules/
-dist/
-.vercel/
+node_modules
+dist
+.git
+.equip-data
+.equip
+.vercel
 .infisical.json
-.equip-data/
-.equip/
+.infisical-scan.toml
+coverage
 .env*
-coverage/
 *.sqlite
 *.sqlite-*
 *.db
@@ -16,3 +18,4 @@ coverage/
 *.pfx
 *.log
 .DS_Store
+tests

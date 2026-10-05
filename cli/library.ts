@@ -1,0 +1,112 @@
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, join, relative, resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
+import type { SkillFile } from "../shared/types.ts";
+import { librarySnapshotRevision, type LibrarySnapshotSkill } from "../shared/library.ts";
+import { resolveSkill } from "../shared/upstream.ts";
+
+function safeName(name: string) {
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64)
+    throw new Error(`Invalid Library skill name: ${name}`);
+}
+
+export async function collectSkillFiles(root: string, directory = root): Promise<SkillFile[]> {
+  const files: SkillFile[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    // These generated files are not part of a skill bundle.
+    if ([".git", ".DS_Store", "__pycache__"].includes(entry.name) || entry.name.endsWith(".pyc")) continue;
+    const path = join(directory, entry.name);
+    if (entry.isSymbolicLink())
+      throw new Error(`Library skill contains an unsupported link: ${relative(root, path)}`);
+    if (entry.isDirectory()) files.push(...await collectSkillFiles(root, path));
+    else if (entry.isFile()) {
+      const bytes = await readFile(path);
+      const binary = !Buffer.from(bytes.toString("utf8")).equals(bytes);
+      const mode = (await stat(path)).mode & 0o777;
+      files.push({ path: relative(root, path).split("\\").join("/"), content: bytes.toString(binary ? "base64" : "utf8"), ...(binary ? { encoding: "base64" as const } : {}), ...(mode !== 0o644 ? { mode } : {}) });
+    }
+  }
+  return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+export async function readLibrarySnapshot(
+  root: string,
+  options: { installedSkills?: string; resolveMissing?: typeof resolveSkill } = {},
+) {
+  const nested = join(root, "skills");
+  const skillsRoot = (await stat(nested).catch(() => null))?.isDirectory() ? nested : root;
+  const manifestPath = join(skillsRoot, "skills-sh.json");
+  const originalManifest = await readFile(manifestPath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; });
+  const manifest: unknown = JSON.parse(originalManifest);
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest))
+    throw new Error("The library skills-sh.json must map skill names to sources.");
+  const listed = Object.entries(manifest);
+  const provenancePath = join(skillsRoot, "upstream.json");
+  const provenanceText = await readFile(provenancePath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; });
+  const provenanceDocument: unknown = JSON.parse(provenanceText);
+  if (!provenanceDocument || typeof provenanceDocument !== "object" || Array.isArray(provenanceDocument))
+    throw new Error("The library upstream.json must map skill names to provenance records.");
+  const provenanceRoot = "skills" in provenanceDocument && (provenanceDocument as any).skills
+    ? (provenanceDocument as any).skills
+    : provenanceDocument;
+  if (!provenanceRoot || typeof provenanceRoot !== "object" || Array.isArray(provenanceRoot))
+    throw new Error("The library upstream.json must map skill names to provenance records.");
+  const provenance = new Map<string, string>();
+  for (const [name, record] of Object.entries(provenanceRoot)) {
+    safeName(name);
+    const source = typeof record === "string"
+      ? record
+      : record && typeof record === "object"
+        ? [(record as any).source, (record as any).repository, (record as any).sourceUrl]
+            .find(value => typeof value === "string" && value.trim())
+        : undefined;
+    if (typeof source !== "string") throw new Error(`Library skill ${name} has no upstream source.`);
+    provenance.set(name, source);
+  }
+  const custom = (await readdir(skillsRoot, { withFileTypes: true }))
+    .filter(entry => entry.isDirectory()).map(entry => entry.name);
+  const entries: Array<{ name: string; source: string; kind: "custom" | "third-party"; directory?: string }> = [];
+  for (const [name, source] of listed) {
+    safeName(name);
+    if (typeof source !== "string" || !source.trim()) throw new Error(`Library skill ${name} has no source.`);
+    entries.push({ name, source, kind: "third-party", directory: join(options.installedSkills ?? join(homedir(), ".agents/skills"), name) });
+  }
+  for (const name of custom) {
+    const directory = join(skillsRoot, name);
+    if (!(await stat(join(directory, "SKILL.md")).catch(() => null))?.isFile()) continue;
+    safeName(name);
+    if (entries.some(entry => entry.name === name)) throw new Error(`The library lists ${name} as both a repository skill and a third-party skill.`);
+    const upstreamSource = provenance.get(name);
+    entries.push(upstreamSource
+      ? { name, source: upstreamSource, kind: "third-party", directory }
+      : { name, source: `${basename(root).toLowerCase().replace(/[^a-z0-9]+/g, "-")}:skills/${name}`, kind: "custom", directory });
+  }
+  if (!entries.length) throw new Error("The library has no skills to synchronize.");
+  const skills: LibrarySnapshotSkill[] = await Promise.all(entries.map(async entry => {
+    const exists = await stat(join(entry.directory!, "SKILL.md")).catch(() => null);
+    const files = exists?.isFile()
+      ? await collectSkillFiles(await realpath(entry.directory!))
+      : (await (options.resolveMissing ?? resolveSkill)(entry.source, entry.name)).files;
+    const instructions = files.find(file => file.path === "SKILL.md")?.content;
+    const frontmatter = instructions?.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/);
+    const metadata = frontmatter ? parseYaml(frontmatter[1]) : null;
+    if (metadata?.name !== entry.name || typeof metadata.description !== "string")
+      throw new Error(`Library skill ${entry.name} has invalid or mismatched SKILL.md metadata.`);
+    return { name: entry.name, title: entry.name, source: entry.source, kind: entry.kind, files };
+  }));
+  if (originalManifest !== await readFile(manifestPath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }))
+    throw new Error("The library changed while its skills were being read. The next sync will retry.");
+  if (provenanceText !== await readFile(provenancePath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }))
+    throw new Error("The library changed while its skills were being read. The next sync will retry.");
+  skills.sort((a, b) => a.name.localeCompare(b.name));
+  return { skills, revision: librarySnapshotRevision(skills) };
+}
+
+export async function libraryImport(path: string, name?: string) {
+  const root = await realpath(resolve(path));
+  name = name || basename(root);
+  const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  if (!id) throw new Error("The library needs a name.");
+  return { id, name, ...await readLibrarySnapshot(root) };
+}
