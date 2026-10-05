@@ -1440,6 +1440,7 @@ kbd {
   gap: 16px;
 }
 .discover-skill {
+  min-width: 0;
   background: #fffefa;
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -1545,6 +1546,7 @@ button.safety-badge:hover {
   margin-top: 8px;
   padding-top: 8px;
   gap: 6px;
+  flex-wrap: wrap;
 }
 .discover-skill-bottom > span {
   font-size: 9px;
@@ -1555,15 +1557,10 @@ button.safety-badge:hover {
   overflow: hidden;
 }
 .discover-skill-bottom > span:first-child {
-  flex: 1;
+  flex: 1 1 80px;
   min-width: 0;
   white-space: nowrap;
   text-overflow: ellipsis;
-}
-.discover-skill-bottom .install-count {
-  flex: none;
-  color: #607054;
-  margin-left: 8px;
 }
 .load-more {
   display: flex;

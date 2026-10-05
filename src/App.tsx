@@ -1324,7 +1324,6 @@ function Discover({
                   {skill.official && <span className="official-label"><Check size={11} /> Official</span>}
                   <SafetyBadge safety={skill.safety} />
                 </div>
-                {typeof skill.installs === "number" && <span className="install-count"><ArrowDownToLine size={11} />{skill.installs.toLocaleString()}</span>}
                 <button
                   className="icon-button"
                   aria-label={`Inspect ${skill.title}`}
