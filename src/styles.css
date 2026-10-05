@@ -3705,8 +3705,8 @@ button.safety-badge:hover {
     grid-template-columns: 1fr;
   }
   .discover-skill {
-    min-height: 210px;
-    padding: 21px;
+    min-height: 0;
+    padding: 14px;
   }
   .discover-title {
     font-size: 16px;
