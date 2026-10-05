@@ -904,25 +904,25 @@ function Library({
                     <SkillIcon skill={skill} />
                     <div>
                       <div className="skill-title">
-                        {skill.title}
+                        <span className="skill-name">{skill.title}</span>
                         {skill.kind === "custom" && (
                           <span className="custom-tag">Custom</span>
                         )}
+                        <span className="skill-source" title={skill.kind === "custom" ? "Your workspace" : skill.source}>
+                          {skill.kind === "custom" ? (
+                            <>
+                              <span className="source-dot" />
+                              Your workspace
+                            </>
+                          ) : (
+                            <>
+                              <Github size={11} />
+                              {skill.source}
+                            </>
+                          )}
+                        </span>
                       </div>
                       <p>{skill.description}</p>
-                      <span className="skill-source">
-                        {skill.kind === "custom" ? (
-                          <>
-                            <span className="source-dot" />
-                            Your workspace
-                          </>
-                        ) : (
-                          <>
-                            <Github size={11} />
-                            {skill.source}
-                          </>
-                        )}
-                      </span>
                     </div>
                   </div>
                   <div className="revision-cell">
@@ -1301,16 +1301,11 @@ function Discover({
             return <article className="discover-skill" key={skill.catalogId || skill.id}>
               <div className="discover-skill-top">
                 <SkillIcon skill={skill} />
-                <div className="discover-labels">
-                  {installedSkill && <Status status="connected" label="In your library" />}
-                  {skill.official && <span className="official-label"><Check size={11} /> Official</span>}
-                  <SafetyBadge safety={skill.safety} />
-                </div>
+                <button className="discover-title" onClick={() => openResolved(skill)}>
+                  <span>{skill.title}</span>
+                  <ArrowUpRight size={17} />
+                </button>
               </div>
-              <button className="discover-title" onClick={() => openResolved(skill)}>
-                {skill.title}
-                <ArrowUpRight size={17} />
-              </button>
               <p>
                 {skill.description ||
                   "Inspect the source instructions and bundled files before adding this skill."}
@@ -1324,6 +1319,11 @@ function Discover({
                   <Github size={12} />
                   {skill.sourceType ? `${skill.sourceType} · ` : ""}{skill.author || skill.source}
                 </span>
+                <div className="discover-labels">
+                  {installedSkill && <Status status="connected" label="In your library" />}
+                  {skill.official && <span className="official-label"><Check size={11} /> Official</span>}
+                  <SafetyBadge safety={skill.safety} />
+                </div>
                 {typeof skill.installs === "number" && <span className="install-count"><ArrowDownToLine size={11} />{skill.installs.toLocaleString()}</span>}
                 <button
                   className="icon-button"
