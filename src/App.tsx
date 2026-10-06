@@ -49,7 +49,7 @@ import {
   FileText,
 } from "lucide-react";
 import AccountSettings from "./AccountSettings";
-import { api } from "./api";
+import { api, conditionalGet } from "./api";
 import {
   Logo,
   SkillIcon,
@@ -139,6 +139,7 @@ export default function App() {
   const bootstrap = useRef<Promise<void> | null>(null);
   const refreshInFlight = useRef<Promise<void> | null>(null);
   const refreshPending = useRef(false);
+  const workspaceEtag = useRef<string | undefined>(undefined);
   const authConfigResolved = useRef(false);
   useEffect(() => {
     if (!menu) return;
@@ -185,7 +186,12 @@ export default function App() {
           do {
             refreshPending.current = false;
             try {
-              setWorkspace(await api<Workspace>("/workspace?view=dashboard"));
+              const result = await conditionalGet<Workspace>(
+                "/workspace?view=dashboard",
+                workspaceEtag.current,
+              );
+              workspaceEtag.current = result.etag;
+              if (!result.unchanged && result.data) setWorkspace(result.data);
               setError("");
             } catch (e) {
               setError((e as Error).message);
@@ -223,6 +229,7 @@ export default function App() {
       const load = token
         ? api<Workspace>("/auth/email/consume", "POST", { token })
             .then((result) => {
+              workspaceEtag.current = undefined;
               setWorkspace(result);
               setError("");
             })
@@ -239,17 +246,34 @@ export default function App() {
     }
 
     let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      if (cancelled || document.hidden) return;
+      timer = setTimeout(async () => {
+        await refresh();
+        if (!authConfigResolved.current) await loadAuthConfig();
+        schedule();
+      }, 30_000);
+    };
+    const visibilityChanged = () => {
+      if (document.hidden) {
+        if (timer) clearTimeout(timer);
+        timer = undefined;
+        return;
+      }
+      void refresh().finally(schedule);
+      if (!authConfigResolved.current) void loadAuthConfig();
+    };
+    document.addEventListener("visibilitychange", visibilityChanged);
     void bootstrap.current.then(() => {
-      if (!cancelled)
-        timer = setInterval(() => {
-          if (!refreshInFlight.current) void refresh();
-          if (!authConfigResolved.current) void loadAuthConfig();
-        }, 5000);
+      if (!cancelled) schedule();
     });
     return () => {
       cancelled = true;
-      if (timer) clearInterval(timer);
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      if (timer) clearTimeout(timer);
     };
   }, [loadAuthConfig, refresh]);
   useEffect(() => {
@@ -639,6 +663,7 @@ export default function App() {
           retryConfig={loadAuthConfig}
           onClose={() => setAuth(false)}
           onSuccess={async (message) => {
+            workspaceEtag.current = undefined;
             await refresh();
             setAuth(false);
             setAuthLinkError("");
