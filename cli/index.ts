@@ -17,7 +17,7 @@ import {
   resolveSkill,
 } from "../shared/upstream.ts";
 import { serviceRemoval, writeService } from "./service.ts";
-import { flushReceiptOutbox, queueReceiptBatch } from "./outbox.ts";
+import { flushReceiptOutbox, queueReceiptBatch, receiptBatchFingerprint } from "./outbox.ts";
 import { synchronize, type AgentTarget } from "./sync.ts";
 import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
 import { discoverAgentProfiles } from "./profiles.ts";
@@ -52,6 +52,7 @@ const server = (
 ).replace(/\/$/, "");
 const statePath = join(equipHome, "state.json");
 const receiptsPath = join(equipHome, "receipts-outbox.json");
+const receiptAckPath = join(equipHome, "receipts-ack.json");
 type State = {
   token?: string;
   deviceId?: string;
@@ -89,6 +90,14 @@ async function saveWorkerFields(
     return;
   await save({ ...latest, ...fields });
 }
+async function acknowledgedReceiptFingerprint() {
+  return readFile(receiptAckPath, "utf8")
+    .then(value => (JSON.parse(value) as { fingerprint?: string }).fingerprint)
+    .catch(error => {
+      if (error.code === "ENOENT" || error instanceof SyntaxError) return undefined;
+      throw error;
+    });
+}
 async function request<T>(
   path: string,
   init: RequestInit = {},
@@ -113,8 +122,9 @@ async function request<T>(
   return response.json() as Promise<T>;
 }
 async function flushReceipts(s: State, base: string) {
-  await flushReceiptOutbox(receiptsPath, s.deviceId, (batch) =>
-    request(
+  await flushReceiptOutbox(receiptsPath, s.deviceId, async (batch) => {
+    if (batch.fingerprint && batch.fingerprint === await acknowledgedReceiptFingerprint()) return;
+    await request(
       "/api/device/receipts",
       {
         method: "POST",
@@ -125,19 +135,29 @@ async function flushReceipts(s: State, base: string) {
       },
       s.token,
       base,
-    ),
-  );
+    );
+    if (!batch.fingerprint) return;
+    const temporary = `${receiptAckPath}.${randomUUID()}.tmp`;
+    await writeFile(temporary, JSON.stringify({ fingerprint: batch.fingerprint }), { mode: 0o600 });
+    await rename(temporary, receiptAckPath);
+  });
 }
 async function postReceipts(
   s: State,
   base: string,
-  generation: number,
+  desired: DesiredState,
   receipts: Receipt[],
 ) {
+  const identity = createHash("sha256")
+    .update(`${base}\0${s.token ?? ""}\0${s.deviceId ?? ""}`)
+    .digest("hex");
+  const fingerprint = receiptBatchFingerprint(identity, desired, receipts);
+  if (await acknowledgedReceiptFingerprint() === fingerprint) return;
   await queueReceiptBatch(receiptsPath, {
     deviceId: s.deviceId,
-    generation,
+    generation: desired.generation,
     receipts,
+    fingerprint,
   });
   await flushReceipts(s, base);
 }
@@ -458,7 +478,7 @@ async function applyState(s: State) {
         : [];
     if (desired.disconnect === "remove") receipts.push(...await synchronizeInstructions(
       {generation:desired.generation,skills:[],resolutions:{},instructions:[]},allInstructionLocations,equipHome,s.deviceId,archive));
-    await postReceipts(s, base, desired.generation, receipts);
+    await postReceipts(s, base, desired, receipts);
     if (receipts.some(receipt => receipt.status !== 'synchronized')) {
       await saveWorkerFields(s,{lastError:'Disconnect removal is waiting for local conflicts to be resolved.'});
       return receipts;
@@ -477,7 +497,7 @@ async function applyState(s: State) {
   receipts.push(...await synchronizeInstructions(
     withRetainedInstructionDestinations(desired,currentInstructionSupport.unavailable),
     allInstructionLocations,equipHome,s.deviceId,archive));
-  await postReceipts(s, base, desired.generation, receipts);
+  await postReceipts(s, base, desired, receipts);
   const migration = await consolidate(equipHome,agentHome ?? homedir(),desired,archive);
   if (command === "tidy") console.log(JSON.stringify(migration,null,2));
   if (receipts.every((receipt) => receipt.status === "synchronized"))
@@ -736,7 +756,7 @@ async function main() {
           return;
         }
         await runSync(s);
-        delay = 30_000;
+        delay = 60_000 + Math.floor(Math.random() * 60_001);
         await new Promise((r) => setTimeout(r, delay));
       } catch (e) {
         if (e instanceof Disconnected) return;
