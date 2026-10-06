@@ -44,7 +44,9 @@ import {
   type LibrarySnapshotSkill,
 } from "../shared/library.ts";
 
-import { readWorkspace, writeWorkspace, migrateWorkspaces } from "./workspace-store.ts";
+import { readWorkspace, readWorkspaceWithOptions, writeWorkspace, migrateWorkspaces } from "./workspace-store.ts";
+import { PollCache } from "./poll-cache.ts";
+import { updateHeartbeat } from "./heartbeat.ts";
 import { PersistentRateLimiter, rateLimitKey } from "./rate-limit.ts";
 import { hasMergeMarkers } from "../shared/merge.ts";
 import { registerAccountRoutes } from "./account.ts";
@@ -626,6 +628,50 @@ export async function createApp(
       if (!(await lockAccount(transaction, accountId))) throw httpError(401, "authentication_required");
       return work();
     });
+  const pollCache = new PollCache();
+  type DeviceVersion = { device_id: string; version: number | string; desired_version: number | string; last_seen: string; disconnected: number };
+  const deviceVersions = (accountId: string, deviceId?: string) => db.all<DeviceVersion>(
+    `SELECT device_id,version,desired_version,last_seen,disconnected FROM workspace_devices WHERE account_id=?${deviceId ? " AND device_id=?" : " ORDER BY device_id"}`,
+    accountId, ...(deviceId ? [deviceId] : []),
+  );
+  const cachedDevice = async (accountId: string, row: DeviceVersion, desired = false) => {
+    const key = JSON.stringify([accountId, row.device_id, desired ? "desired-device" : "device", desired ? row.desired_version : row.version]);
+    let value = pollCache.get(key);
+    if (value === undefined) {
+      const stored = await db.get<{payload:string}>("SELECT payload FROM workspace_devices WHERE account_id=? AND device_id=?", accountId, row.device_id);
+      if (!stored) throw httpError(401, "invalid_token");
+      value = stored.payload;
+      pollCache.set(key, value);
+    }
+    const device = JSON.parse(value) as Device;
+    device.lastSeen = row.last_seen;
+    device.online = !row.disconnected && Date.parse(row.last_seen) >= Date.now() - 3 * 60_000;
+    return device;
+  };
+  const cachedWorkspace = async (accountId: string, version: number | string, view: "dashboard" | "desired" | "all") => {
+    const key = JSON.stringify([accountId, version, view]);
+    let value = pollCache.get(key);
+    if (value === undefined) {
+      const metadataKey = JSON.stringify([accountId, version, "metadata"]);
+      let metadata = pollCache.get(metadataKey);
+      if (metadata === undefined) {
+        const row = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", accountId);
+        if (!row) throw httpError(401, "authentication_required");
+        metadata = row.workspace;
+        pollCache.set(metadataKey, metadata);
+      }
+      value = await readWorkspaceWithOptions(db, accountId, metadata, { devices: false, bundles: view });
+      value = JSON.stringify({...JSON.parse(value), deviceOrder:JSON.parse(metadata).deviceOrder ?? []});
+      pollCache.set(key, value);
+    }
+    return parseWorkspace(value) as Workspace & {deviceOrder?:string[]};
+  };
+  const conditional = (req: Request, res: Response, etag: string) => {
+    res.set({ ETag: etag, "Cache-Control": "private, no-cache" });
+    const matches = req.get("if-none-match")?.split(",").some(tag => tag.trim().replace(/^W\//, "") === etag.replace(/^W\//, "") || tag.trim() === "*");
+    if (matches) { res.status(304).end(); return true; }
+    return false;
+  };
   const limiter = new PersistentRateLimiter(db);
   const limitAuth = async (req: Request, res: Response, namespace: string, limit: number, window = 10 * 60_000) => {
     const result = await limiter.consume(rateLimitKey(namespace, req.ip ?? "unknown"), limit, window);
@@ -676,7 +722,7 @@ export async function createApp(
     });
   };
   const auth =
-    (allowAutoDemo = false) =>
+    (allowAutoDemo = false, hydrate = false) =>
     async (req: AuthedRequest, res: Response, next: NextFunction) => {
       const token = req.cookies?.[SESSION_COOKIE];
       const session = token
@@ -692,13 +738,25 @@ export async function createApp(
         return next();
       }
       if (session?.account_id) {
-        const account = await db.get<any>(
-          "SELECT workspace FROM accounts WHERE id=?",
-          session.account_id,
-        );
+        const account = await db.get<{id:string}>("SELECT id FROM accounts WHERE id=?", session.account_id);
         if (account) {
           req.accountId = session.account_id;
-          req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, account.workspace, req.path === "/api/workspace" && req.query.view === "dashboard"));
+          if (hydrate) {
+            const row = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
+            const metadata = JSON.parse(row!.workspace) as Workspace;
+            // Detail and export routes return one item, so hydrate only that item.
+            for (const field of ["skills", "instructions", "retiredSkills", "retiredInstructions"] as const)
+              (metadata as any)[field] = (metadata[field] ?? []).filter(item => item.id === req.params.id);
+            if (req.path.endsWith("/export")) {
+              for (const skill of [...metadata.skills, ...(metadata.retiredSkills ?? [])]) {
+                skill.versions = typeof req.query.revision === "string" ? skill.versions.filter(version => version.revision === req.query.revision) : [];
+                skill.draft = undefined;
+                delete (skill as Skill & {draftBundle?:string}).draftBundle;
+                skill.proposal = undefined;
+              }
+            }
+            req.workspace = parseWorkspace(await readWorkspaceWithOptions(db, req.accountId!, JSON.stringify(metadata), {devices:false}));
+          }
           return next();
         }
       }
@@ -757,7 +815,7 @@ export async function createApp(
         );
       const accountId = id("account");
       await db.run(
-        "INSERT INTO accounts VALUES(?,?,?,?,?,?)",
+        "INSERT INTO accounts(id,name,email,password_hash,workspace,created_at) VALUES(?,?,?,?,?,?)",
         accountId,
         name.trim(),
         normalizedEmail,
@@ -823,27 +881,39 @@ export async function createApp(
     res.clearCookie(SESSION_COOKIE, { path: "/" });
     res.json({ ok: true });
   });
-  app.get("/api/workspace", auth(true), (req: AuthedRequest, res) => {
-    const workspace = clone(req.workspace!);
-    const cutoff = Date.now() - 2 * 60_000;
-    workspace.devices.forEach((device) => {
-      if (!device.demo)
-        device.online =
-          !device.disconnectedAt && Date.parse(device.lastSeen) >= cutoff;
-    });
-    // The dashboard uses history metadata; rollback reads immutable files on the server.
-    if (req.query.view === "dashboard")
-      for (const skill of [...workspace.skills, ...(workspace.retiredSkills ?? [])]) {
-        skill.files = [];
-        skill.draft = undefined;
-        skill.versions = skill.versions.map(version => ({ ...version, files: [] }));
-      }
-    if (req.query.view === "dashboard")
-      for (const document of [...(workspace.instructions ?? []), ...(workspace.retiredInstructions ?? [])]) {
-        document.draft = undefined;
-        document.versions = document.versions.map(version => ({ ...version, files: [] }));
-      }
-    res.json(workspace);
+  app.get("/api/workspace", auth(true), async (req: AuthedRequest, res, next) => {
+    try {
+      if (req.demo) return res.json(seedDemo());
+      await db.transaction(async () => {
+        const account = await db.get<{version:number|string}>("SELECT version FROM accounts WHERE id=?", req.accountId!);
+        if (!account) throw httpError(401, "authentication_required");
+        const rows = await deviceVersions(req.accountId!);
+        const states = rows.map(row => [row.device_id, row.version, !row.disconnected && Date.parse(row.last_seen) >= Date.now() - 3 * 60_000]);
+        const view = req.query.view === "dashboard" ? "dashboard" : "all";
+        // Last-seen timestamps can advance without changing the displayed state.
+        const etag = `W/"${digest(JSON.stringify([req.accountId, account.version, view, states]))}"`;
+        if (conditional(req, res, etag)) return;
+        const workspace = await cachedWorkspace(req.accountId!, account.version, view);
+        const byId = new Map(rows.map(row => [row.device_id, row]));
+        const ordered = workspace.deviceOrder?.length ? workspace.deviceOrder.flatMap(id => byId.has(id) ? [byId.get(id)!] : []) : rows;
+        workspace.devices = [];
+        for (const row of ordered) workspace.devices.push(await cachedDevice(req.accountId!, row));
+        delete workspace.deviceOrder;
+        // The dashboard uses history metadata; rollback reads immutable files on the server.
+        if (req.query.view === "dashboard")
+          for (const skill of [...workspace.skills, ...(workspace.retiredSkills ?? [])]) {
+            skill.files = [];
+            skill.draft = undefined;
+            skill.versions = skill.versions.map(version => ({ ...version, files: [] }));
+          }
+        if (req.query.view === "dashboard")
+          for (const document of [...(workspace.instructions ?? []), ...(workspace.retiredInstructions ?? [])]) {
+            document.draft = undefined;
+            document.versions = document.versions.map(version => ({ ...version, files: [] }));
+          }
+        res.json(workspace);
+      }, {readOnly: true});
+    } catch (error) { next(error); }
   });
 
   app.get("/api/discover", async (req, res, next) => {
@@ -886,7 +956,7 @@ export async function createApp(
     },
   );
 
-  const workspaceHandler = (handler: (req: AuthedRequest, res: Response, next: NextFunction) => unknown | Promise<unknown>, readOnly = false) =>
+  const workspaceHandler = (handler: (req: AuthedRequest, res: Response, next: NextFunction) => unknown | Promise<unknown>) =>
     async (req: AuthedRequest, res: Response, next: NextFunction) => {
       let body: unknown;
       let responseQueued = false;
@@ -899,12 +969,13 @@ export async function createApp(
         writable(req);
         const operation = async () => {
           const row = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
-          req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, row!.workspace, ["/api/device/heartbeat", "/api/device/receipts", "/api/device/desired"].includes(req.path), true));
+          req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, row!.workspace, req.path === "/api/device/receipts", true));
+          if (req.deviceId && !req.workspace!.devices.some(device => device.id === req.deviceId && !device.disconnectedAt))
+            throw httpError(401, "invalid_token");
           await handler(req, res, error => { failure = error ?? new Error("Unexpected middleware continuation."); });
           if (failure) throw failure;
         };
-        if (readOnly) await db.transaction(operation, { readOnly: true });
-        else await runAccountLocked(req.accountId!, operation);
+        await runAccountLocked(req.accountId!, operation);
         res.json = json;
         if (responseQueued && !res.destroyed) res.json(body);
       } catch (error) { res.json = json; next(error); }
@@ -976,7 +1047,7 @@ export async function createApp(
       throw httpError(409, "The Equip revision changed. Review the instructions again.");
   };
 
-  app.get("/api/instructions/:id", auth(true), (req: AuthedRequest, res, next) => {
+  app.get("/api/instructions/:id", auth(true, true), (req: AuthedRequest, res, next) => {
     try { res.json((req.workspace!.instructions ?? []).find(item => item.id === req.params.id) ?? req.workspace!.retiredInstructions?.find(item => item.id === req.params.id) ?? findInstructions(req)); } catch (error) { next(error); }
   });
   app.post("/api/instructions", ...mutate((req) => {
@@ -1098,10 +1169,10 @@ export async function createApp(
     req.workspace!.instructions!.push(document);
     return document;
   }));
-  app.get("/api/skills/:id", auth(true), (req: AuthedRequest, res, next) => {
+  app.get("/api/skills/:id", auth(true, true), (req: AuthedRequest, res, next) => {
     try { res.json(req.workspace!.skills.find(item => item.id === req.params.id) ?? req.workspace!.retiredSkills?.find(item => item.id === req.params.id) ?? findSkill(req)); } catch (error) { next(error); }
   });
-  app.get("/api/skills/:id/export", auth(true), async (req: AuthedRequest, res, next) => {
+  app.get("/api/skills/:id/export", auth(true, true), async (req: AuthedRequest, res, next) => {
     try {
       const skill = req.workspace!.skills.find(item => item.id === req.params.id) ?? req.workspace!.retiredSkills?.find(item => item.id === req.params.id) ?? findSkill(req);
       const version = typeof req.query.revision === "string" ? skill.versions.find(v => v.revision === req.query.revision) : undefined;
@@ -1887,29 +1958,6 @@ export async function createApp(
     }
   });
 
-  const deviceAuth = async (
-    req: AuthedRequest,
-    res: Response,
-    next: NextFunction,
-  ) => {
-    const match = req.get("authorization")?.match(/^Bearer (.+)$/);
-    const row = match
-      ? await db.get<any>(
-          "SELECT * FROM device_tokens WHERE token_hash=? AND revoked_at IS NULL",
-          digest(match[1]),
-        )
-      : undefined;
-    if (!row) return res.status(401).json({ error: "invalid_token" });
-    const account = await db.get<any>(
-      "SELECT workspace FROM accounts WHERE id=?",
-      row.account_id,
-    );
-    if (!account) return res.status(401).json({ error: "invalid_token" });
-    req.accountId = row.account_id;
-    req.deviceId = row.device_id;
-    req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, account.workspace, true));
-    next();
-  };
   const deviceIdentityAuth = async (
     req: AuthedRequest,
     res: Response,
@@ -1929,7 +1977,7 @@ export async function createApp(
   };
   app.post(
     "/api/device/instructions/local",
-    deviceAuth,
+    deviceIdentityAuth,
     workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const device = req.workspace!.devices.find(item => item.id === req.deviceId)!;
@@ -2015,7 +2063,7 @@ export async function createApp(
   );
   app.post(
     "/api/device/local",
-    deviceAuth,
+    deviceIdentityAuth,
     workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const workspace = req.workspace!;
@@ -2066,7 +2114,7 @@ export async function createApp(
   );
   app.post(
     "/api/device/library",
-    deviceAuth,
+    deviceIdentityAuth,
     workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         if (req.body?.expectedRevision !== undefined)
@@ -2110,7 +2158,7 @@ export async function createApp(
   );
   app.post(
     "/api/device/library/unlink",
-    deviceAuth,
+    deviceIdentityAuth,
     workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         res.json({ ok: true, unlinked: false });
@@ -2121,7 +2169,7 @@ export async function createApp(
   );
   app.post(
     "/api/device/source",
-    deviceAuth,
+    deviceIdentityAuth,
     workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const requestId = String(req.body?.requestId ?? "");
@@ -2260,88 +2308,89 @@ export async function createApp(
       }
     }),
   );
-  app.get("/api/device/desired", deviceIdentityAuth, workspaceHandler(async (req: AuthedRequest, res) => {
-    const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
-    const etag = `"${digest(JSON.stringify([req.accountId, device.id, req.workspace!.generation, req.workspace!.sourceRequests, device.resolutions, device.instructionResolutions, device.instructionResolutionChecks, device.instructionLocations, (device as Device & { instructionUnavailable?: unknown[] }).instructionUnavailable, device.disconnect, device.excludedAgents, device.localSync?.enabled]))}"`;
-    res.set({ ETag: etag, "Cache-Control": "private, no-cache" });
-    if (req.headers["if-none-match"] === etag) { res.status(304).end(); return; }
-    const account = await db.get<{workspace:string}>("SELECT workspace FROM accounts WHERE id=?", req.accountId!);
-    const current = JSON.parse(account!.workspace);
-    const localSkills = current.skills.map(({id,name,revision,kind}:Skill) => ({id,name,revision,kind}));
-    // Devices need current revisions, not every historical bundle and draft.
-    for (const field of ["skills", "instructions"] as const) current[field] = (current[field] ?? [])
-      .filter((item: Skill | Instructions) => item.selected && item.enabled && item.revision)
-      .map((item: any) => ({...item,versions:[],draft:undefined,draftBundle:undefined,proposal:undefined}));
-    current.retiredSkills = []; current.retiredInstructions = [];
-    req.workspace = parseWorkspace(await readWorkspace(db, req.accountId!, JSON.stringify(current)));
-    const skills = req
-      .workspace!.skills.filter(
-        (s) => s.selected && s.enabled && s.revision && s.files.length,
-      )
-      .map((skill) => ({
-        ...skill,
-        versions: [],
-        draft: undefined,
-        targets: skill.targets.filter((t) => t.deviceId === device.id),
-      }));
-    const desired: DesiredState = {
-      generation: req.workspace!.generation,
-      skills,
-      instructions: (req.workspace!.instructions ?? []).filter(document =>
-        document.selected && document.enabled && document.revision && document.files.length &&
-        (!(device.instructionLocations?.length) || device.instructionLocations.some(location => instructionEnabled(document, location, device.id)) || (device.instructionUnavailable ?? []).some(location => instructionEnabled(document, location, device.id))))
-        .map(document => ({ ...document, versions: [], draft: undefined,
-          targets: document.targets.filter(target => target.deviceId === device.id) })),
-      instructionResolutions: device.instructionResolutions ?? {},
-      instructionResolutionChecks: device.instructionResolutionChecks ?? {},
-      sourceRequests: req.workspace!.sourceRequests ?? [],
-      resolutions: device.resolutions ?? {},
-      disconnect: device.disconnect,
-      excludedAgents: device.excludedAgents ?? [],
-      localSync: device.localSync?.enabled ?? false,
-      localSkills,
-    };
-    res.json(desired);
-  }, true));
+  app.get("/api/device/desired", deviceIdentityAuth, async (req: AuthedRequest, res, next) => {
+    try {
+      await db.transaction(async () => {
+        const account = await db.get<{version:number|string}>("SELECT version FROM accounts WHERE id=?", req.accountId!);
+        const rows = await deviceVersions(req.accountId!, req.deviceId!);
+        if (!account || !rows[0] || rows[0].disconnected) throw httpError(401, "invalid_token");
+        const etag = `"${digest(JSON.stringify([req.accountId, req.deviceId, account.version, rows[0].desired_version]))}"`;
+        if (conditional(req, res, etag)) return;
+        const device = await cachedDevice(req.accountId!, rows[0], true);
+        req.workspace = await cachedWorkspace(req.accountId!, account.version, "desired");
+        const localSkills = req.workspace.skills.map(({id,name,revision,kind}) => ({id,name,revision,kind}));
+        const skills = req
+          .workspace!.skills.filter(
+            (s) => s.selected && s.enabled && s.revision && s.files.length,
+          )
+          .map((skill) => ({
+            ...skill,
+            versions: [],
+            draft: undefined,
+            proposal: undefined,
+            targets: skill.targets.filter((t) => t.deviceId === device.id),
+          }));
+        const desired: DesiredState = {
+          generation: req.workspace!.generation,
+          skills,
+          instructions: (req.workspace!.instructions ?? []).filter(document =>
+            document.selected && document.enabled && document.revision && document.files.length &&
+            (!(device.instructionLocations?.length) || device.instructionLocations.some(location => instructionEnabled(document, location, device.id)) || (device.instructionUnavailable ?? []).some(location => instructionEnabled(document, location, device.id))))
+            .map(document => ({ ...document, versions: [], draft: undefined,
+              targets: document.targets.filter(target => target.deviceId === device.id) })),
+          instructionResolutions: device.instructionResolutions ?? {},
+          instructionResolutionChecks: device.instructionResolutionChecks ?? {},
+          sourceRequests: req.workspace!.sourceRequests ?? [],
+          resolutions: device.resolutions ?? {},
+          disconnect: device.disconnect,
+          excludedAgents: device.excludedAgents ?? [],
+          localSync: device.localSync?.enabled ?? false,
+          localSkills,
+        };
+        res.json(desired);
+      }, {readOnly: true});
+    } catch (error) { next(error); }
+  });
   app.post(
     "/api/device/heartbeat",
-    deviceAuth,
-    workspaceHandler(async (req: AuthedRequest, res) => {
-      const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
-      device.name = String(req.body?.name ?? device.name);
-      device.os = String(req.body?.os ?? device.os);
-      device.arch = String(req.body?.arch ?? device.arch);
-      if (req.body?.agents !== undefined) {
-        validateAgents(req.body.agents);
-        device.agents = req.body.agents.map((agent: Device["agents"][number]) => ({
-          id: agent.id,
-          name: agent.name,
-          path: agent.path,
-          ...(agent.profile ? { profile: agent.profile } : {}),
-          ...(agent.project ? { project: agent.project } : {}),
-          ...(agent.aliases ? { aliases: clone(agent.aliases) } : {}),
-          ...(agent.detection ? {detection:agent.detection} : {}),
-          ...(agent.detectionPath ? {detectionPath:agent.detectionPath} : {}),
-        }));
-      }
-      if (req.body?.instructionLocations !== undefined)
-        device.instructionLocations = validateInstructionLocations(req.body.instructionLocations);
-      if (req.body?.instructionUnavailable !== undefined)
-        (device as Device & { instructionUnavailable?: Array<{ agent: string; reason: string }> }).instructionUnavailable =
-          validateInstructionUnavailable(req.body.instructionUnavailable);
-      if (typeof req.body?.localSyncPath === "string" && req.body.localSyncPath.length <= 2048)
-        device.localSync = { ...device.localSync, enabled: device.localSync?.enabled ?? false, path: req.body.localSyncPath };
-      if (typeof req.body?.localSyncError === "string")
-        device.localSync = { ...device.localSync, enabled: device.localSync?.enabled ?? false, error: req.body.localSyncError.slice(0, 1000) || undefined };
-      device.lastSeen = iso();
-      device.online = true;
-      await saveWorkspace(db, req.accountId!, req.workspace!);
-      res.json({ ok: true });
-    }),
+    deviceIdentityAuth,
+    async (req: AuthedRequest, res, next) => {
+      try {
+        const patch: Record<string, unknown> = {};
+        for (const field of ["name", "os", "arch"] as const)
+          if (req.body?.[field] !== undefined) patch[field] = String(req.body[field]);
+        if (req.body?.agents !== undefined) {
+          validateAgents(req.body.agents);
+          patch.agents = req.body.agents.map((agent: Device["agents"][number]) => ({
+            id: agent.id, name: agent.name, path: agent.path,
+            ...(agent.profile ? {profile:agent.profile} : {}),
+            ...(agent.project ? {project:agent.project} : {}),
+            ...(agent.aliases ? {aliases:clone(agent.aliases)} : {}),
+            ...(agent.detection ? {detection:agent.detection} : {}),
+            ...(agent.detectionPath ? {detectionPath:agent.detectionPath} : {}),
+          }));
+        }
+        if (req.body?.instructionLocations !== undefined)
+          patch.instructionLocations = validateInstructionLocations(req.body.instructionLocations);
+        if (req.body?.instructionUnavailable !== undefined)
+          patch.instructionUnavailable = validateInstructionUnavailable(req.body.instructionUnavailable);
+        const localSync: Record<string, unknown> = {};
+        if (typeof req.body?.localSyncPath === "string" && req.body.localSyncPath.length <= 2048)
+          localSync.path = req.body.localSyncPath;
+        if (typeof req.body?.localSyncError === "string") localSync.error = req.body.localSyncError.slice(0, 1000) || null;
+        if (Object.keys(localSync).length) patch.localSync = localSync;
+        // Coordinate with workspace mutations, but never fetch a device payload.
+        await runAccountLocked(req.accountId!, async () => {
+          if (!(await updateHeartbeat(db, req.accountId!, req.deviceId!, patch, iso())).changes)
+            throw httpError(401, "invalid_token");
+        });
+        res.json({ok:true});
+      } catch (error) { next(error); }
+    },
   );
   app.post(
     "/api/device/receipts",
-    deviceAuth,
+    deviceIdentityAuth,
     workspaceHandler(async (req: AuthedRequest, res, next) => {
       try {
         const device = req.workspace!.devices.find(
@@ -2626,7 +2675,7 @@ export async function createApp(
   );
   app.post(
     "/api/device/disconnected",
-    deviceAuth,
+    deviceIdentityAuth,
     workspaceHandler(async (req: AuthedRequest, res) => {
       const device = req.workspace!.devices.find((d) => d.id === req.deviceId)!;
       device.online = false;
@@ -2718,8 +2767,8 @@ export async function createApp(
     updating = true;
     try {
       await limiter.cleanup();
-      const accounts = await db.all<{ id: string; workspace: string }>(
-        "SELECT id,workspace FROM accounts",
+      const accounts = await db.all<{ id: string }>(
+        "SELECT id FROM accounts WHERE auto_updates=1",
       );
       for (const account of accounts) {
         await runAccountLocked(account.id, async () => {

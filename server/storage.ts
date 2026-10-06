@@ -15,15 +15,32 @@ export interface Store {
 }
 
 const schema = [
-  "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, workspace TEXT NOT NULL, created_at TEXT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, workspace TEXT NOT NULL, created_at TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, auto_updates INTEGER NOT NULL DEFAULT 0)",
   "CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, account_id TEXT, demo INTEGER NOT NULL DEFAULT 0, expires_at BIGINT NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
   "CREATE TABLE IF NOT EXISTS device_authorizations (device_code_hash TEXT PRIMARY KEY, user_code TEXT NOT NULL UNIQUE, account_id TEXT, name TEXT NOT NULL, os TEXT NOT NULL, arch TEXT NOT NULL, status TEXT NOT NULL, expires_at BIGINT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS device_tokens (token_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL, device_id TEXT NOT NULL, revoked_at BIGINT, created_at BIGINT NOT NULL, FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
   "CREATE TABLE IF NOT EXISTS auth_rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at BIGINT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS email_authorizations (token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT NOT NULL, expires_at BIGINT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS skill_bundles (account_id TEXT NOT NULL, hash TEXT NOT NULL, files TEXT NOT NULL, PRIMARY KEY(account_id,hash), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
-  "CREATE TABLE IF NOT EXISTS workspace_devices (account_id TEXT NOT NULL, device_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account_id,device_id), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
+  "CREATE TABLE IF NOT EXISTS workspace_devices (account_id TEXT NOT NULL, device_id TEXT NOT NULL, payload TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, desired_version INTEGER NOT NULL DEFAULT 0, last_seen TEXT NOT NULL DEFAULT '', disconnected INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id,device_id), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
 ];
+
+async function addColumn(store: Store, table: string, column: string, definition: string) {
+  if (store.dialect === "postgres") {
+    const existing = await store.get(
+      "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?",
+      table,
+      column,
+    );
+    if (existing) return false;
+    await store.run(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+    return true;
+  }
+  const columns = await store.all<{ name: string }>(`PRAGMA table_info(${table})`);
+  if (columns.some(item => item.name === column)) return false;
+  await store.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  return true;
+}
 
 class SQLiteStore implements Store {
   readonly dialect = "sqlite" as const;
@@ -130,11 +147,31 @@ class PostgresStore implements Store {
 }
 
 async function initialize(store: Store) {
-  for (const statement of schema) await store.run(statement);
+  for (const statement of schema)
+    await store.run(store.dialect === "postgres" ? statement.replaceAll("version INTEGER", "version BIGINT") : statement);
+  const versionType = store.dialect === "postgres" ? "BIGINT" : "INTEGER";
+  await addColumn(store, "accounts", "version", `${versionType} NOT NULL DEFAULT 0`);
+  const addedAutoUpdates = await addColumn(store, "accounts", "auto_updates", "INTEGER NOT NULL DEFAULT 0");
+  await addColumn(store, "workspace_devices", "version", `${versionType} NOT NULL DEFAULT 0`);
+  await addColumn(store, "workspace_devices", "desired_version", `${versionType} NOT NULL DEFAULT 0`);
+  const addedLastSeen = await addColumn(store, "workspace_devices", "last_seen", "TEXT NOT NULL DEFAULT ''");
+  const addedDisconnected = await addColumn(store, "workspace_devices", "disconnected", "INTEGER NOT NULL DEFAULT 0");
   await store.run(
     "CREATE UNIQUE INDEX IF NOT EXISTS accounts_email_lower_unique ON accounts(LOWER(email))",
   );
+  await store.run("CREATE INDEX IF NOT EXISTS accounts_auto_updates ON accounts(auto_updates)");
   await store.run("CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry ON auth_rate_limits(expires_at)");
+  if (store.dialect === "postgres") {
+    const autoUpdates = "CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(workspace::jsonb->'skills','[]'::jsonb)) skill WHERE skill->>'kind'='third-party' AND COALESCE((skill->>'autoUpdate')::boolean,FALSE)) THEN 1 ELSE 0 END";
+    if (addedAutoUpdates) await store.run(`UPDATE accounts SET auto_updates=${autoUpdates}`);
+    if (addedLastSeen || addedDisconnected)
+      await store.run(`UPDATE workspace_devices SET last_seen=COALESCE(payload::jsonb->>'lastSeen',''),disconnected=CASE WHEN jsonb_exists(payload::jsonb,'disconnectedAt') THEN 1 ELSE 0 END WHERE ${addedLastSeen ? "last_seen=''" : "TRUE"}`);
+  } else {
+    const autoUpdates = "CASE WHEN EXISTS (SELECT 1 FROM json_each(accounts.workspace,'$.skills') skill WHERE json_extract(skill.value,'$.kind')='third-party' AND json_extract(skill.value,'$.autoUpdate')=1) THEN 1 ELSE 0 END";
+    if (addedAutoUpdates) await store.run(`UPDATE accounts SET auto_updates=${autoUpdates}`);
+    if (addedLastSeen || addedDisconnected)
+      await store.run(`UPDATE workspace_devices SET last_seen=COALESCE(json_extract(payload,'$.lastSeen'),''),disconnected=CASE WHEN json_type(payload,'$.disconnectedAt') IS NOT NULL THEN 1 ELSE 0 END WHERE ${addedLastSeen ? "last_seen=''" : "1=1"}`);
+  }
   if (store.dialect === "postgres") {
     await store.run(
       "CREATE TABLE IF NOT EXISTS storage_migrations (name TEXT PRIMARY KEY, completed_at TEXT NOT NULL)",
@@ -206,9 +243,13 @@ export async function migrateLegacySqlite(store: Store, sqlitePath: string) {
 
 export async function backfillDisconnectedDevices(store: Store) {
   await store.transaction(async (transaction) => {
+    const legacyWorkspace = transaction.dialect === "postgres"
+      ? "workspace::jsonb->>'storageVersion' IS NULL AND jsonb_typeof(workspace::jsonb->'devices')='array'"
+      : "json_extract(workspace,'$.storageVersion') IS NULL AND json_type(workspace,'$.devices')='array'";
     const accounts = await transaction.all<{ id: string; workspace: string }>(
-      "SELECT id,workspace FROM accounts",
+      `SELECT id,workspace FROM accounts WHERE ${legacyWorkspace}`,
     );
+    if (!accounts.length) return;
     const tokens = await transaction.all<{
       account_id: string;
       device_id: string;
@@ -251,7 +292,7 @@ export async function backfillDisconnectedDevices(store: Store) {
       }
       if (changed)
         await transaction.run(
-          "UPDATE accounts SET workspace=? WHERE id=?",
+          "UPDATE accounts SET workspace=?,version=version+1 WHERE id=?",
           JSON.stringify(workspace),
           account.id,
         );
@@ -315,8 +356,8 @@ export function transactionalStore(store: Store): Store {
 }
 
 export async function lockAccount(store: Store, accountId: string) {
-  return store.get<{workspace: string}>(
-    `SELECT workspace FROM accounts WHERE id=?${store.dialect === "postgres" ? " FOR UPDATE" : ""}`,
+  return store.get<{id: string}>(
+    `SELECT id FROM accounts WHERE id=?${store.dialect === "postgres" ? " FOR UPDATE" : ""}`,
     accountId,
   );
 }

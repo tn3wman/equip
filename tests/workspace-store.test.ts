@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { Skill, Workspace } from "../shared/types.ts";
 import { openStore } from "../server/storage.ts";
-import { migrateWorkspaces, readWorkspace, writeWorkspace } from "../server/workspace-store.ts";
+import { migrateWorkspaces, readWorkspace, readWorkspaceWithOptions, writeWorkspace } from "../server/workspace-store.ts";
 
 const files = (name: string, body: string) => [{
   path: "SKILL.md",
@@ -93,6 +93,121 @@ test("identical bundle hashes remain account scoped", async () => {
     const secondRow = (await store.get<{ workspace: string }>("SELECT workspace FROM accounts WHERE id=?", "second"))!;
     const hydrated = JSON.parse(await readWorkspace(store, "second", secondRow.workspace)) as Workspace;
     assert.deepEqual(hydrated.skills[0].files, first.skills[0].files);
+  } finally {
+    await store.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("workspace versions advance only when metadata or devices change", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "equip-workspace-version-"));
+  const store = await openStore({ dataDir });
+  try {
+    const original = workspace("owner", "review");
+    await store.run("INSERT INTO accounts(id,name,email,password_hash,workspace,created_at) VALUES(?,?,?,?,?,?)",
+      "owner", original.name, original.email, "hash", JSON.stringify(original), new Date(0).toISOString());
+    await migrateWorkspaces(store);
+    const migrated = (await store.get<{ workspace: string; version: number }>("SELECT workspace,version FROM accounts WHERE id=?", "owner"))!;
+    assert.equal(migrated.version, 1);
+    const hydrated = JSON.parse(await readWorkspace(store, "owner", migrated.workspace)) as Workspace;
+
+    await writeWorkspace(store, "owner", hydrated);
+    assert.equal((await store.get<{ version: number }>("SELECT version FROM accounts WHERE id=?", "owner"))!.version, 1);
+
+    hydrated.skills[0].kind = "third-party";
+    hydrated.skills[0].autoUpdate = true;
+    await writeWorkspace(store, "owner", hydrated);
+    assert.deepEqual(
+      await store.get("SELECT version,auto_updates FROM accounts WHERE id=?", "owner"),
+      { version: 2, auto_updates: 1 },
+    );
+
+    hydrated.devices[0].name = "Renamed laptop";
+    await writeWorkspace(store, "owner", hydrated);
+    const changedDevice = (await store.get<{ version: number; desired_version: number }>("SELECT version,desired_version FROM workspace_devices WHERE account_id=? AND device_id=?", "owner", hydrated.devices[0].id))!;
+    assert.deepEqual(changedDevice, { version: 2, desired_version: 2 });
+    assert.equal((await store.get<{ version: number }>("SELECT version FROM accounts WHERE id=?", "owner"))!.version, 3);
+
+    hydrated.generation += 1;
+    await writeWorkspace(store, "owner", hydrated);
+    assert.equal((await store.get<{ version: number }>("SELECT version FROM accounts WHERE id=?", "owner"))!.version, 4);
+  } finally {
+    await store.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("selective hydration skips devices and history while preserving bundle references", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "equip-workspace-selective-"));
+  const store = await openStore({ dataDir });
+  try {
+    const original = workspace("owner", "review");
+    const disabled = { ...structuredClone(original.skills[0]), id: "disabled", name: "disabled", selected: false };
+    disabled.files = files("disabled", "Disabled current");
+    original.skills.push(disabled);
+    const retired = { ...structuredClone(original.skills[0]), id: "retired", name: "retired", selected: true, enabled: true };
+    retired.files = files("retired", "Retired current");
+    original.retiredSkills = [retired];
+    await store.run("INSERT INTO accounts(id,name,email,password_hash,workspace,created_at) VALUES(?,?,?,?,?,?)",
+      "owner", original.name, original.email, "hash", JSON.stringify(original), new Date(0).toISOString());
+    await migrateWorkspaces(store);
+    const row = (await store.get<{ workspace: string }>("SELECT workspace FROM accounts WHERE id=?", "owner"))!;
+    const stored = JSON.parse(row.workspace);
+    const currentHash = stored.skills[0].filesBundle;
+    const historyHash = stored.skills[0].versions[1].filesBundle;
+    const disabledHash = stored.skills[1].filesBundle;
+    const draftHash = stored.skills[0].draftBundle;
+    const retiredHash = stored.retiredSkills[0].filesBundle;
+    await store.run(`DELETE FROM skill_bundles WHERE account_id=? AND hash IN (?,?,?,?)`, "owner", historyHash, disabledHash, draftHash, retiredHash);
+
+    const hydrated = JSON.parse(await readWorkspaceWithOptions(store, "owner", row.workspace, {
+      devices: false,
+      bundles: "desired",
+      preserveReferences: true,
+    }));
+    assert.deepEqual(hydrated.devices, []);
+    assert.equal(hydrated.skills[0].files[0].content, original.skills[0].files[0].content);
+    assert.equal(hydrated.skills[0].filesBundle, currentHash);
+    assert.deepEqual(hydrated.skills[0].draft, []);
+    assert.equal(hydrated.skills[0].draftBundle, draftHash);
+    assert.deepEqual(hydrated.skills[0].versions[1].files, []);
+    assert.equal(hydrated.skills[0].versions[1].filesBundle, historyHash);
+    assert.deepEqual(hydrated.skills[1].files, []);
+    assert.equal(hydrated.skills[1].filesBundle, disabledHash);
+    assert.deepEqual(hydrated.retiredSkills[0].files, []);
+    assert.equal(hydrated.retiredSkills[0].filesBundle, retiredHash);
+  } finally {
+    await store.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("workspace writes collect only account-scoped bundles that no saved state references", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "equip-workspace-bundle-gc-"));
+  const store = await openStore({ dataDir });
+  try {
+    const owner = workspace("owner", "review");
+    const other = { ...workspace("other", "review"), skills: structuredClone(owner.skills) };
+    for (const [id, value] of [["owner", owner], ["other", other]] as const)
+      await store.run("INSERT INTO accounts(id,name,email,password_hash,workspace,created_at) VALUES(?,?,?,?,?,?)",
+        id, value.name, value.email, "hash", JSON.stringify(value), new Date(0).toISOString());
+    await migrateWorkspaces(store);
+
+    const ownerRow = (await store.get<{ workspace: string }>("SELECT workspace FROM accounts WHERE id=?", "owner"))!;
+    const stored = JSON.parse(ownerRow.workspace);
+    const oldDraft = stored.skills[0].draftBundle as string;
+    const history = stored.skills[0].versions.map((version: any) => version.filesBundle as string);
+    assert.ok(await store.get("SELECT hash FROM skill_bundles WHERE account_id=? AND hash=?", "owner", oldDraft));
+    assert.ok(await store.get("SELECT hash FROM skill_bundles WHERE account_id=? AND hash=?", "other", oldDraft));
+
+    const hydrated = JSON.parse(await readWorkspace(store, "owner", ownerRow.workspace)) as Workspace;
+    hydrated.skills[0].draft = files("review", "Replacement draft");
+    await writeWorkspace(store, "owner", hydrated);
+
+    assert.equal(await store.get("SELECT hash FROM skill_bundles WHERE account_id=? AND hash=?", "owner", oldDraft), undefined);
+    for (const hash of history)
+      assert.ok(await store.get("SELECT hash FROM skill_bundles WHERE account_id=? AND hash=?", "owner", hash));
+    assert.ok(await store.get("SELECT hash FROM skill_bundles WHERE account_id=? AND hash=?", "other", oldDraft));
   } finally {
     await store.close();
     await rm(dataDir, { recursive: true, force: true });

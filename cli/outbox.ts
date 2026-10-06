@@ -1,11 +1,25 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
-import type { Receipt } from "../shared/types.ts";
+import type { DesiredState, Receipt } from "../shared/types.ts";
 
 export interface ReceiptBatch {
   deviceId?: string;
   generation: number;
   receipts: Receipt[];
+  fingerprint?: string;
+}
+
+export function receiptBatchFingerprint(
+  identity: string,
+  desired: DesiredState,
+  receipts: Receipt[],
+) {
+  return createHash("sha256").update(JSON.stringify({
+    identity,
+    desired,
+    receipts: receipts.map(({ timestamp: _timestamp, ...receipt }) => receipt),
+  })).digest("hex");
 }
 
 export async function flushReceiptOutbox(

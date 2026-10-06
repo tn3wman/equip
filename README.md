@@ -2,7 +2,7 @@
 
 Equip manages AI agent skills and global instructions across your development computers. Choose skills in the dashboard, connect each computer once, and the background service installs the same selected revisions into detected agent profiles.
 
-Discovery and agent compatibility build on [Vercel Skills](https://github.com/vercel-labs/skills). Equip adds accounts, custom skill publishing, updates and rollback, local change review, and device receipts. Skills live in a canonical local store with agent symlinks wherever supported. Offline computers catch up when they reconnect; local edits require a decision before replacement.
+Discovery and agent compatibility build on [Vercel Skills](https://github.com/vercel-labs/skills). Equip adds accounts, custom skill publishing, updates and rollback, local change review, and device receipts. Skills live in a canonical local store with agent symlinks wherever supported. Offline computers catch up when they reconnect; local edits require a decision before replacement. Idle workers check every 60–120 seconds, and visible dashboards check every 30 seconds. Unchanged checks read only version fields; skill content transfers when needed.
 
 ## Connect a computer
 
