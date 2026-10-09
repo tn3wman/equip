@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp, chmod, readlink, realpath } from "node:fs/promises";
+import fsPromises, { mkdtemp, readFile, readdir, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp, chmod, readlink, realpath } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import test from "node:test";
@@ -1470,4 +1471,147 @@ test("links resolve correctly through agent roots at different physical depths",
     assert.equal((await synchronize({ ...desired([]), generation: 3 }, target, home))[0].status, "synchronized");
     await assert.rejects(lstat(join(physical, "demo")), /ENOENT/);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// Windows renames with MoveFileExW, which refuses an existing directory
+// destination; managed links there are junctions, so they count as directories.
+async function watchRenames(
+  t: import("node:test").TestContext,
+  platform: NodeJS.Platform,
+  fail: (from: string, to: string) => boolean = () => false,
+) {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...descriptor, value: platform });
+  const realRename = fsPromises.rename;
+  const renames: Array<[string, string]> = [];
+  t.mock.method(fsPromises, "rename", async (from: string, to: string) => {
+    renames.push([String(from), String(to)]);
+    if (platform === "win32" && (await stat(to).catch(() => null))?.isDirectory())
+      throw Object.assign(new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`), { code: "EPERM" });
+    if (fail(String(from), String(to)))
+      throw Object.assign(new Error(`EBUSY: resource busy or locked, rename '${from}' -> '${to}'`), { code: "EBUSY" });
+    return realRename(from, to);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    Object.defineProperty(process, "platform", descriptor);
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  return renames;
+}
+
+async function equipLeftovers(...dirs: string[]) {
+  const names = await Promise.all(dirs.map(dir => readdir(dir)));
+  return names.flat().filter(name => name.includes(".equip-"));
+}
+
+async function chainedAlias(prefix: string) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), prefix)));
+  const home = join(root, "state");
+  const agentsPath = join(root, ".agents/skills"), claudePath = join(root, ".claude/skills");
+  const targets = [{ id: "codex", path: agentsPath }, { id: "claude-code", path: claudePath }];
+  return { root, home, agentsPath, claudePath, targets,
+    intermediate: join(agentsPath, "demo"), destination: join(claudePath, "demo") };
+}
+
+test("on Windows a root migration replaces the duplicate alias junction through the transaction journal", async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "equip-win-root-migration-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const renames = await watchRenames(t, "win32");
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  const destination = join(newRoot, "demo");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  await mkdir(newRoot);
+  await symlink(join(home, "skills/demo"), destination, "junction");
+
+  const receipts = await synchronize({ ...desired([skill("two", "r2")]), generation: 2 }, [{ id: "pi", path: newRoot }], home);
+
+  assert.equal(receipts[0].status, "synchronized", JSON.stringify(receipts));
+  assert.ok(renames.some(([from, to]) => from === destination && to.startsWith(`${destination}.equip-old-`)));
+  assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "two");
+  await assert.rejects(lstat(join(oldRoot, "demo")), /ENOENT/);
+  assert.deepEqual(await equipLeftovers(oldRoot, newRoot), []);
+  await assert.rejects(lstat(join(home, "transaction.json")), /ENOENT/);
+  const entry = Object.values(JSON.parse(await readFile(join(home, "ledger.json"), "utf8")).installs)[0] as any;
+  assert.equal(entry.path, destination);
+  assert.equal(entry.revision, "r2");
+});
+
+test("on Windows an update normalizes a chained managed junction through the transaction journal", async t => {
+  const fixture = await chainedAlias("equip-win-alias-update-");
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const renames = await watchRenames(t, "win32");
+  await synchronize(desired([skill("one")]), fixture.targets, fixture.home);
+  await rm(fixture.destination);
+  await symlink(fixture.intermediate, fixture.destination, "junction");
+
+  const receipts = await synchronize(desired([skill("two", "r2")]), fixture.targets, fixture.home);
+
+  assert.ok(receipts.every(receipt => receipt.status === "synchronized"), JSON.stringify(receipts));
+  assert.ok(renames.some(([from, to]) => from === fixture.destination && to.startsWith(`${fixture.destination}.equip-old-`)));
+  assert.equal(await readlink(fixture.destination), join(fixture.home, "skills/demo"));
+  assert.equal(await readFile(join(fixture.destination, "SKILL.md"), "utf8"), "two");
+  assert.deepEqual(await equipLeftovers(fixture.agentsPath, fixture.claudePath), []);
+  await assert.rejects(lstat(join(fixture.home, "transaction.json")), /ENOENT/);
+});
+
+test("on Windows a re-enabled excluded destination moves its retained junction aside", async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "equip-win-excluded-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await watchRenames(t, "win32");
+  const target = { id: "codex", path: join(root, "agent") }, home = join(root, "state");
+  await synchronize(desired([skill("one")]), [target], home);
+  await synchronize({ ...desired([skill("two", "r2")]), generation: 2, excludedAgents: [{ agent: "codex" }] }, [target], home);
+  assert.match(await realpath(join(target.path, "demo")), /retained/);
+
+  const caughtUp = await synchronize({ ...desired([skill("two", "r2")]), generation: 3 }, [target], home);
+
+  assert.equal(caughtUp[0].status, "synchronized", JSON.stringify(caughtUp));
+  assert.equal(await readlink(join(target.path, "demo")), join(home, "skills/demo"));
+  assert.equal(await readFile(join(target.path, "demo/SKILL.md"), "utf8"), "two");
+  assert.deepEqual(await equipLeftovers(target.path), []);
+});
+
+for (const restoreFails of [false, true])
+  test(`on Windows a failed junction promotion restores the original link${restoreFails ? " through journal recovery" : ""}`, async t => {
+    const fixture = await chainedAlias("equip-win-alias-failure-");
+    t.after(() => rm(fixture.root, { recursive: true, force: true }));
+    let failures = 0;
+    await watchRenames(t, "win32", (from, to) => to === fixture.destination && failures > 0 &&
+      (from.includes(".equip-stage-") || from.includes(".equip-old-")) && failures-- > 0);
+    await synchronize(desired([skill("one")]), fixture.targets, fixture.home);
+    await rm(fixture.destination);
+    await symlink(fixture.intermediate, fixture.destination, "junction");
+    failures = restoreFails ? 2 : 1;
+
+    const receipts = await synchronize(desired([skill("two", "r2")]), fixture.targets, fixture.home);
+
+    assert.equal(failures, 0);
+    const failed = receipts.find(receipt => receipt.agent === "claude-code");
+    assert.equal(failed?.status, "failed", JSON.stringify(receipts));
+    assert.match(failed?.message ?? "", /EBUSY/);
+    assert.equal(await readlink(fixture.destination), fixture.intermediate, "the original link is restored");
+    assert.deepEqual(await equipLeftovers(fixture.agentsPath, fixture.claudePath), []);
+    await assert.rejects(lstat(join(fixture.home, "transaction.json")), /ENOENT/);
+    const retried = await synchronize(desired([skill("two", "r2")]), fixture.targets, fixture.home);
+    assert.ok(retried.every(receipt => receipt.status === "synchronized"), JSON.stringify(retried));
+    assert.equal(await readlink(fixture.destination), join(fixture.home, "skills/demo"));
+  });
+
+test("on POSIX a managed link replacement stays a single atomic rename", async t => {
+  const fixture = await chainedAlias("equip-posix-alias-update-");
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const renames = await watchRenames(t, "linux");
+  await synchronize(desired([skill("one")]), fixture.targets, fixture.home);
+  await rm(fixture.destination);
+  await symlink(relative(dirname(fixture.destination), fixture.intermediate), fixture.destination);
+  renames.length = 0;
+
+  const receipts = await synchronize(desired([skill("two", "r2")]), fixture.targets, fixture.home);
+
+  assert.ok(receipts.every(receipt => receipt.status === "synchronized"), JSON.stringify(receipts));
+  assert.ok(renames.some(([from, to]) => from.startsWith(`${fixture.destination}.equip-stage-`) && to === fixture.destination));
+  assert.ok(!renames.some(([, to]) => to.startsWith(`${fixture.destination}.equip-old-`)), JSON.stringify(renames));
+  assert.equal(await realpath(fixture.destination), await realpath(join(fixture.home, "skills/demo")));
 });
