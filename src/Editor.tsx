@@ -400,7 +400,7 @@ export default function Editor({
           <div className="editor-workbench">
             <aside className="editor-file-tree">
               <div className="editor-file-tree-head">
-                <span>SKILL FILES</span>
+                <span>Skill files</span>
                 <span>{files.length}</span>
               </div>
               {files.map((f) => (
@@ -561,7 +561,7 @@ export default function Editor({
                   spellCheck={false}
                 />
               )}
-              <div className="editor-validation">
+              <div className={`editor-validation ${validation ? "invalid" : ""}`}>
                 {validation ? (
                   <>
                     <AlertTriangle size={14} />

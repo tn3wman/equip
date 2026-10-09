@@ -18,11 +18,10 @@ import {
   Check,
   Copy,
   Command,
-  BookOpen,
   Compass,
   Laptop,
-  Activity as ActivityIcon,
   Settings2,
+  Activity as ActivityIcon,
   HelpCircle,
   MoreHorizontal,
   RefreshCw,
@@ -37,7 +36,6 @@ import {
   SlidersHorizontal,
   Sparkles,
   GitFork as Github,
-  GitBranch,
   WifiOff,
   AlertTriangle,
   Monitor,
@@ -46,9 +44,16 @@ import {
   ChevronsUpDown,
   Layers,
   Loader2,
-  FileText,
+  Sun,
+  Moon,
+  MonitorSmartphone,
+  AlertCircle,
 } from "lucide-react";
 import AccountSettings from "./AccountSettings";
+import CommandPalette, { paletteCommands } from "./CommandPalette";
+import Landing, { landingSections } from "./Landing";
+import { isPage, pageMeta, pageTitle, type Page } from "./pages";
+import { useTheme, type Theme } from "./theme";
 import { api, conditionalGet } from "./api";
 import {
   Logo,
@@ -106,32 +111,37 @@ const InstructionsPage = lazyWithReload(() => import("./Instructions"));
 import { pendingChangeCount } from "../shared/changes";
 import { conflictDevices, deployment, deviceStatus } from "./sync-state";
 
-const pages = [
-  "library",
-  "instructions",
-  "discover",
-  "devices",
-  "changes",
-  "activity",
-  "settings",
-] as const;
-type Page = (typeof pages)[number] | "editor";
+const isLandingHash = (value: string) => !value || landingSections.includes(value);
+/* The Vite dev server proxies the dashboard, but installers download from the API port. */
+const apiOrigin = () =>
+  location.port === "5173"
+    ? `${location.protocol}//${location.hostname}:4310`
+    : location.origin;
 export default function App() {
-  const [page, setPage] = useState<Page>(
-    () => (location.hash.slice(1) as Page) || "library",
-  );
+  const [page, setPage] = useState<Page>(() => {
+    const hash = location.hash.slice(1);
+    return isPage(hash) ? hash : "library";
+  });
   const [workspace, setWorkspace] = useState<Workspace>();
   const [emailSignIn, setEmailSignIn] = useState<boolean | null>(null);
   const [authLinkError, setAuthLinkError] = useState("");
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Skill>();
   const [historyRequested,setHistoryRequested] = useState(false);
+  /* Bumped when the palette picks a skill so the drawer remounts even for the
+     same skill, dropping any nested dialog or tab it had open. */
+  const [drawerEpoch, setDrawerEpoch] = useState(0);
   const [edit, setEdit] = useState<Skill>();
   const [connect, setConnect] = useState(false);
   const [auth, setAuth] = useState(false);
   const [help, setHelp] = useState(false);
   const [menu, setMenu] = useState(false);
-  const [toast, setToast] = useState("");
+  const [palette, setPalette] = useState(false);
+  /* Signed-out visitors arriving at the root or a landing anchor see the overview
+     first. Approval codes and sign-in links in the query string go straight to the app. */
+  const [landing, setLanding] = useState(() => isLandingHash(location.hash.slice(1)) && !location.search);
+  const [theme, setTheme] = useTheme();
+  const [toast, setToast] = useState<{ message: string; kind: "success" | "error" } | null>(null);
   const [busy, setBusy] = useState(false);
   const [approval, setApproval] = useState(
     new URLSearchParams(location.search).get("code") || "",
@@ -281,10 +291,18 @@ export default function App() {
   }, [auth, emailSignIn, loadAuthConfig]);
   useEffect(() => {
     const hash = () => {
-      const p = location.hash.slice(1) as Page;
-      if ([...pages, "editor"].includes(p)) {
+      const p = location.hash.slice(1);
+      if (isPage(p)) {
+        setLanding(false);
         setPage(p);
         setSelected(undefined);
+      } else if (isLandingHash(p)) {
+        // The dashboard unmounts, so close its surfaces rather than reopening them later.
+        setSelected(undefined);
+        setPalette(false);
+        setConnect(false);
+        setHelp(false);
+        setLanding(true);
       }
     };
     window.addEventListener("hashchange", hash);
@@ -292,16 +310,26 @@ export default function App() {
   }, []);
   useEffect(() => {
     if (!toast) return;
-    const timer = setTimeout(() => setToast(""), 4500);
+    const timer = setTimeout(() => setToast(null), toast.kind === "error" ? 7000 : 4500);
     return () => clearTimeout(timer);
   }, [toast]);
+  /* A palette action is an explicit choice, so it dismisses every open dialog,
+     including a pending device approval, which `equip connect` can restart. */
+  const closeDialogs = () => {
+    setConnect(false);
+    setHelp(false);
+    setAuth(false);
+    setApproval("");
+  };
   const navigate = (p: Page) => {
+    setLanding(false);
     setSelected(undefined);
     setPage(p);
     location.hash = p;
     setMenu(false);
   };
-  const notify = (message: string) => setToast(message);
+  const notify = (message: string, kind: "success" | "error" = "success") =>
+    setToast({ message, kind });
   const run = async (fn: () => Promise<unknown>, message: string) => {
     setBusy(true);
     try {
@@ -309,16 +337,18 @@ export default function App() {
       await refresh();
       notify(message);
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
   };
+  const onLanding = useRef(false);
+  onLanding.current = !!workspace?.demo && landing;
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k" && !onLanding.current) {
         e.preventDefault();
-        document.getElementById("skill-search")?.focus();
+        setPalette((open) => !open);
       }
     };
     window.addEventListener("keydown", key);
@@ -346,15 +376,52 @@ export default function App() {
     );
   const activeDevices = workspace.devices.filter((d) => !d.disconnectedAt);
   const selectedSkills = workspace.skills.filter((s) => s.selected);
-  const pending = activeDevices.filter((d) => !d.online).length;
   const startEditor = async (skill?: Skill) => {
     try {
       const complete = skill && workspace.skills.some(s => s.id === skill.id) && !skill.files.length && !skill.draft ? await api<Skill>(`/skills/${skill.id}`) : skill;
       setEdit(complete);
       setSelected(undefined);
       navigate("editor");
-    } catch (error) { notify((error as Error).message); }
+    } catch (error) { notify((error as Error).message, "error"); }
   };
+  const authDialog = auth && (
+    <AuthDialog
+      workspace={workspace}
+      emailSignIn={emailSignIn}
+      initialError={authLinkError}
+      retryConfig={loadAuthConfig}
+      onClose={() => setAuth(false)}
+      onSuccess={async (message) => {
+        workspaceEtag.current = undefined;
+        await refresh();
+        setAuth(false);
+        setAuthLinkError("");
+        setLanding(false);
+        notify(message);
+      }}
+    />
+  );
+  const toastView = toast && (
+    <div className={`toast ${toast.kind}`} role={toast.kind === "error" ? "alert" : "status"}>
+      {toast.kind === "error" ? <AlertCircle size={17} /> : <Check size={17} />}
+      <span>{toast.message}</span>
+      <button aria-label="Dismiss notification" onClick={() => setToast(null)}>
+        <X size={15} />
+      </button>
+    </div>
+  );
+  if (workspace.demo && landing)
+    return (
+      <>
+        <Landing
+          onSignIn={() => setAuth(true)}
+          onExplore={() => navigate("library")}
+          installCommand={`curl -fsSL ${apiOrigin()}/install.sh | sh`}
+        />
+        {authDialog}
+        {toastView}
+      </>
+    );
   return (
     <div className="app">
       <a className="skip-link" href="#main-content" inert={menu}>
@@ -367,8 +434,15 @@ export default function App() {
       >
         <a
           className="brand"
-          href="#library"
-          onClick={() => navigate("library")}
+          href={workspace.demo ? "#" : "#library"}
+          title={workspace.demo ? "Equip overview" : undefined}
+          onClick={(event) => {
+            if (!workspace.demo) return navigate("library");
+            event.preventDefault();
+            history.replaceState(null, "", location.pathname + location.search);
+            setMenu(false);
+            setLanding(true);
+          }}
         >
           <Logo />
           <span>
@@ -387,14 +461,7 @@ export default function App() {
         </button>
         <nav aria-label="Main navigation">
           <div className="nav-section">Workspace</div>
-          {[
-            { id: "library", label: "Skill library", icon: BookOpen },
-            { id: "instructions", label: "Instructions", icon: FileText },
-            { id: "discover", label: "Discover", icon: Compass },
-            { id: "devices", label: "Computers", icon: Laptop },
-            { id: "changes", label: "Changes", icon: GitBranch },
-            { id: "activity", label: "Activity", icon: ActivityIcon },
-          ].map(({ id, label, icon: Icon }) => (
+          {pageMeta.filter((entry) => entry.id !== "settings").map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               className={`nav-item ${page === id ? "active" : ""}`}
@@ -438,6 +505,30 @@ export default function App() {
             <span>Help & getting started</span>
             <ArrowUpRight size={14} />
           </button>
+          <div className="theme-row">
+            <span>Appearance</span>
+            <div className="theme-switch" role="radiogroup" aria-label="Appearance">
+              {(
+                [
+                  { id: "light", label: "Light", icon: Sun },
+                  { id: "dark", label: "Dark", icon: Moon },
+                  { id: "system", label: "Match system", icon: MonitorSmartphone },
+                ] as { id: Theme; label: string; icon: typeof Sun }[]
+              ).map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  role="radio"
+                  aria-checked={theme === id}
+                  aria-label={label}
+                  title={label}
+                  className={theme === id ? "active" : ""}
+                  onClick={() => setTheme(id)}
+                >
+                  <Icon size={14} />
+                </button>
+              ))}
+            </div>
+          </div>
           <button className="profile" onClick={() => setAuth(true)}>
             <span className="user-avatar">
               {workspace.name
@@ -480,17 +571,7 @@ export default function App() {
             </button>
             <span className="breadcrumb-root">Workspace</span>
             <ChevronRight size={13} />
-            <span>
-              {page === "editor"
-                ? "Skill editor"
-                : page === "library"
-                  ? "Skill library"
-                  : page === "instructions"
-                    ? "Instructions"
-                  : page === "devices"
-                    ? "Computers"
-                    : page.charAt(0).toUpperCase() + page.slice(1)}
-            </span>
+            <span>{pageTitle(page)}</span>
           </div>
           <div className="topbar-right">
             <span className="system-status">
@@ -502,6 +583,16 @@ export default function App() {
                   : "No computers online"}
             </span>
             <span className="topbar-divider" />
+            <button
+              className="palette-trigger"
+              onClick={() => setPalette(true)}
+              aria-label="Open command palette"
+              aria-keyshortcuts="Meta+K Control+K"
+            >
+              <Search size={15} />
+              <span>Jump to…</span>
+              <kbd>⌘K</kbd>
+            </button>
             <button
               className="icon-button"
               aria-label="View activity"
@@ -633,6 +724,7 @@ export default function App() {
           }
         >
           <SkillDetail
+            key={`${selected.id}:${drawerEpoch}`}
             skill={
               workspace.skills.find((s) => s.id === selected.id) || selected
             }
@@ -655,22 +747,7 @@ export default function App() {
           generation={workspace.generation}
         />
       )}
-      {auth && (
-        <AuthDialog
-          workspace={workspace}
-          emailSignIn={emailSignIn}
-          initialError={authLinkError}
-          retryConfig={loadAuthConfig}
-          onClose={() => setAuth(false)}
-          onSuccess={async (message) => {
-            workspaceEtag.current = undefined;
-            await refresh();
-            setAuth(false);
-            setAuthLinkError("");
-            notify(message);
-          }}
-        />
-      )}
+      {authDialog}
       {help && (
         <Dialog title="Your agents, equipped." onClose={() => setHelp(false)}>
           <div className="dialog-body help">
@@ -731,18 +808,39 @@ export default function App() {
           refresh={refresh}
         />
       )}
-      {toast && (
-        <div className="toast" role="status">
-          <Check size={17} />
-          <span>{toast}</span>
-          <button
-            aria-label="Dismiss notification"
-            onClick={() => setToast("")}
-          >
-            <X size={15} />
-          </button>
-        </div>
+      {palette && (
+        <CommandPalette
+          onClose={() => setPalette(false)}
+          commands={paletteCommands({
+            workspace,
+            /* Every palette action leaves at most one surface open, so the modal
+               stack order always matches what is visible. */
+            navigate: (p) => {
+              closeDialogs();
+              navigate(p as Page);
+            },
+            openSkill: (skill) => {
+              closeDialogs();
+              setHistoryRequested(false);
+              setDrawerEpoch((epoch) => epoch + 1);
+              setSelected(skill);
+            },
+            connect: () => {
+              closeDialogs();
+              setConnect(true);
+            },
+            create: () => {
+              closeDialogs();
+              void startEditor();
+            },
+            help: () => {
+              closeDialogs();
+              setHelp(true);
+            },
+          })}
+        />
       )}
+      {toastView}
     </div>
   );
 }
@@ -909,9 +1007,9 @@ function Library({
           </div>
           <div className="skill-table">
             <div className="table-head">
-              <span>SKILL</span>
-              <span>REVISION</span>
-              <span>STATUS</span>
+              <span>Skill</span>
+              <span>Revision</span>
+              <span>Installed on</span>
               <span />
             </div>
             {visible.map((skill) => {
@@ -983,6 +1081,18 @@ function Library({
                           ? "Unpublished"
                           : `${state.complete} of ${state.total} computers`}
                     </small>
+                    {skill.enabled && skill.versions.length > 0 && state.total > 0 && (
+                      <span
+                        className={`deploy-meter ${status}`}
+                        role="progressbar"
+                        aria-valuemin={0}
+                        aria-valuemax={state.total}
+                        aria-valuenow={state.complete}
+                        aria-label={`Installed on ${state.complete} of ${state.total} computers`}
+                      >
+                        <span style={{ width: `${(state.complete / state.total) * 100}%` }} />
+                      </span>
+                    )}
                     {!!needsReview.length && <small className="conflict-origin">{needsReview.length === 1 ? `${needsReview[0].name} needs review` : `${needsReview.length} computers need review`}</small>}
                   </div>
                   <MoreHorizontal className="row-more" size={18} />
@@ -1485,9 +1595,6 @@ function Discover({
     </div>
   );
 }
-function CodeIcon() {
-  return <span className="art-code">{"{ }"}</span>;
-}
 
 function Devices({
   workspace,
@@ -1681,7 +1788,7 @@ function Devices({
               ) : null}
               {expanded === device.id && (
                 <div className="device-expanded">
-                  <div className="notice" style={{ display: "block" }}>
+                  <div className="notice">
                     <label className="radio-option">
                       <input type="checkbox" checked={device.localSync?.enabled ?? false} disabled={workspace.demo || Boolean(device.disconnect)} onChange={event => run(() => api(`/devices/${device.id}/local-sync`, "PATCH", { enabled: event.target.checked }), event.target.checked ? "Local publishing enabled. New skills and custom edits will sync from this computer." : "Local publishing disabled. Dashboard updates still install.")} />
                       <span><strong>Publish local skills automatically</strong><small>New skill folders and custom-skill edits from these agent locations go to Equip, then your other computers. Edits to third-party skills are preserved for review.</small></span>
@@ -2110,10 +2217,7 @@ function ConnectDialog({
 }) {
   const [platform, setPlatform] = useState("mac");
   const [copied, setCopied] = useState(false);
-  const server =
-    location.port === "5173"
-      ? `${location.protocol}//${location.hostname}:4310`
-      : location.origin;
+  const server = apiOrigin();
   const command =
     platform === "windows"
       ? `irm ${server}/install.ps1 | iex`

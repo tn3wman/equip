@@ -190,7 +190,7 @@ export default function InstructionsPage({ workspace, refresh, notify }: Props) 
           <span>{content.length.toLocaleString()} characters</span>
           <button onClick={() => setHistoryOpen(!historyOpen)}><Clock3 size={15} /> History <ChevronDown size={14} /></button>
         </div>
-        {preview ? <article className="instruction-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown></article> : <textarea className="instruction-textarea" spellCheck value={content} onChange={(event) => setContent(event.target.value)} aria-label="Markdown instructions" />}
+        {preview ? <article className="instruction-preview markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown></article> : <textarea className="instruction-textarea" spellCheck value={content} onChange={(event) => setContent(event.target.value)} aria-label="Markdown instructions" />}
         <footer className="instruction-editor-footer">
           <button className="button danger-text" onClick={() => void remove()} disabled={Boolean(busy)}><Trash2 size={15} /> Delete</button>
           <span>{dirty ? "Unsaved changes" : `Updated ${ago(document.updatedAt)}`}</span>
@@ -198,7 +198,7 @@ export default function InstructionsPage({ workspace, refresh, notify }: Props) 
           <button className="button" onClick={() => void save()} disabled={!dirty || Boolean(busy)}><Save size={15} /> Save draft</button>
           <button className="button primary" onClick={() => void publish()} disabled={!content.trim() || Boolean(busy)}><Send size={15} /> Publish</button>
         </footer>
-        {historyOpen && <div className="instruction-history"><h2>Version history</h2>{document.versions.map((version) => <div key={version.id}><span><strong>{version.message || "Published version"}</strong><small>{ago(version.createdAt)} · {revision(version.revision)}</small></span><details><summary>Preview</summary><ReactMarkdown remarkPlugins={[remarkGfm]}>{version.files[0]?.content ?? ""}</ReactMarkdown></details><button onClick={() => void rollback(version.id)} disabled={Boolean(busy)}>Restore</button></div>)}</div>}
+        {historyOpen && <div className="instruction-history"><h2>Version history</h2>{document.versions.map((version) => <div key={version.id}><span><strong>{version.message || "Published version"}</strong><small>{ago(version.createdAt)} · {revision(version.revision)}</small></span><details><summary>Preview</summary><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{version.files[0]?.content ?? ""}</ReactMarkdown></div></details><button onClick={() => void rollback(version.id)} disabled={Boolean(busy)}>Restore</button></div>)}</div>}
       </section> : <section className="instruction-welcome"><FileText size={34} /><h2>One instruction set, every agent</h2><p>Equip publishes one global revision in each supported agent’s native instruction file.</p><button className="button primary" onClick={() => void create()}><Plus size={16} /> Create instructions</button></section>}
       <aside className="instruction-deployment" aria-label="Deployment locations">
         <div className="deployment-title"><span><Monitor size={17} /><strong>Locations</strong></span>{deployment && <small>{deployment.complete} of {deployment.total} applied{unavailable.length ? ` · ${unavailable.length} unavailable` : ""}</small>}</div>

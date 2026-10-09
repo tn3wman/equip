@@ -29,6 +29,8 @@ import {
   revision,
   ago,
   navigateTabs,
+  useModalPage,
+  tabbable,
 } from "./components";
 import type { Skill, Workspace, SkillFile, Target } from "../shared/types";
 import type { SkillSafety } from "../shared/types";
@@ -115,17 +117,16 @@ export default function SkillDetail({
       revealReports();
     }
   }, [tab]);
+  const isTop = useModalPage(false);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
     panel.current?.focus();
     const handler = (e: KeyboardEvent) => {
-      if (document.querySelector(".overlay")) return;
+      if (!isTop()) return;
       if (e.key === "Escape") close.current();
       if (e.key === "Tab") {
-        const nodes = panel.current?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled),input,select,a[href],[tabindex="0"]',
-        );
-        if (!nodes?.length) return;
+        const nodes = tabbable(panel.current);
+        if (!nodes.length) return;
         const first = nodes[0],
           last = nodes[nodes.length - 1];
         if (
@@ -252,7 +253,7 @@ export default function SkillDetail({
         aria-label={`${skill.title} details`}
       >
         <div className="detail-topbar">
-          <span>SKILL DETAILS</span>
+          <span>Skill details</span>
           <button
             className="icon-button"
             aria-label="Close skill details"
