@@ -50,4 +50,23 @@ jobs:
       - run: npm run typecheck
       - run: npm run build:cli
       - name: Test native install, update, and device authorization
-        run: npx tsx --test tests/platform-runtime.test.ts tests/cli-update-security.test.ts tests/cli-live.test.ts
+        run: npx tsx --test tests/platform-runtime.test.ts tests/cli-update-security.test.ts tests/cli-live.test.ts tests/cli-worker-live.test.ts
+
+  cli-release-version:
+    name: Check CLI release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+          cache: npm
+      - run: npm ci
+      - run: npx tsx --test tests/cli-release-version.test.ts
+      - name: Require a new version for CLI bundle changes
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before || github.event.repository.default_branch }}
+        run: npm run check:cli-release -- "$BASE_SHA"

@@ -31,6 +31,7 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
   const seen: Seen = JSON.parse(await readFile(seenPath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }));
   const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8").catch(error => { if (error.code === "ENOENT") return '{"installs":{}}'; throw error; }));
   const known = new Map((desired.localSkills ?? desired.skills).map(s => [s.name, s]));
+  const retiredNames = new Set((desired.retiredSkills ?? []).map(skill => skill.name));
   const candidates = new Set<string>();
   const errors: string[] = [];
   for (const root of new Set([join(home, "skills"), ...targets.map(t => t.path)])) {
@@ -49,6 +50,9 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
     if (known.get(basename(path))?.kind === "third-party") continue;
     try {
       const local = await localSkill(path);
+      // A retained local copy is recovery material after account deletion.
+      // Only an explicit local add may publish this name again.
+      if (!known.has(local.name) && retiredNames.has(local.name)) continue;
       inspected.set(path, local);
       if (!known.has(local.name)) {
         const copies = newCopies.get(local.name) ?? new Set<string>();

@@ -48,6 +48,7 @@ curl -fsSL "${origin}/cli/equip.cjs" -o "${"$"}runtime/equip.cjs.download"
 "${"$"}node_bin" -e "const fs=require('fs'),c=require('crypto');const m=JSON.parse(fs.readFileSync(process.argv[1]));const actual=c.createHash('sha256').update(fs.readFileSync(process.argv[2])).digest('hex');if(actual!==m.sha256){console.error('Equip CLI checksum mismatch.');process.exit(1)}" "${"$"}runtime/manifest.json" "${"$"}runtime/equip.cjs.download"
 mv "${"$"}runtime/equip.cjs.download" "${"$"}runtime/equip.cjs"
 if [ "${"$"}node_bin" = "${"$"}node_dir/bin/node" ]; then npm_cli="${"$"}node_dir/lib/node_modules/npm/bin/npm-cli.js"; else npm_cli="${"$"}(command -v npm)"; fi
+npm_cli="${"$"}("${"$"}node_bin" -e "process.stdout.write(require('fs').realpathSync(process.argv[1]))" "${"$"}npm_cli")"
 skills_version="${"$"}("${"$"}node_bin" -p "JSON.parse(require('fs').readFileSync(process.argv[1])).skillsVersion" "${"$"}runtime/manifest.json")"
 expected_integrity="${"$"}("${"$"}node_bin" -p "JSON.parse(require('fs').readFileSync(process.argv[1])).skillsIntegrity" "${"$"}runtime/manifest.json")"
 if [ -f "${"$"}npm_cli" ]; then registry_integrity="${"$"}("${"$"}node_bin" "${"$"}npm_cli" view "skills@${"$"}skills_version" dist.integrity --json | tr -d '\"')";

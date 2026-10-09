@@ -55,6 +55,26 @@ async function localFolder(root: string, directory: string, name: string, body: 
   return path;
 }
 
+test("retained retired folders remain local without being automatically republished", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-local-retired-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "equip");
+  const target = join(root, "codex");
+  const folder = await localFolder(target, "retired", "retired", "# Retained local edit");
+  const unrelated = await localFolder(target, "new", "new", "# New skill");
+  const publications: LocalPublication[] = [];
+  const result = await syncLocalSkills(home, [{ id: "codex", path: target }], {
+    ...desired([]), retiredSkills: [{ id: "old-retired", name: "retired", revision: "old-r1" }],
+  }, async publication => {
+    publications.push(publication);
+    return { id: "new-id", revision: "new-r1", changed: true };
+  });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(publications.map(publication => publication.name), ["new"]);
+  assert.equal(await readFile(join(folder, "SKILL.md"), "utf8"), contents("retired", "# Retained local edit"));
+  assert.equal(await readFile(join(unrelated, "SKILL.md"), "utf8"), contents("new", "# New skill"));
+});
+
 test("rw changes are neither local publications nor divergent copies, while executable edits publish", async t => {
   const root = await mkdtemp(join(tmpdir(), "equip-local-permissions-"));
   t.after(() => rm(root, { recursive: true, force: true }));

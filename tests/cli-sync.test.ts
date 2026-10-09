@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp, chmod, readlink, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import test from "node:test";
 import type { DesiredState, Skill } from "../shared/types.ts";
 import { synchronize as synchronizeRaw } from "../cli/sync.ts";
@@ -1057,6 +1057,136 @@ test("a clean managed skill rename moves ownership to the new folder", async () 
   assert.equal(await readFile(join(target, "renamed/SKILL.md"), "utf8"), "new");
 });
 
+test("a managed skill root migration adopts the duplicate alias across a canonical revision", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-migration-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  await mkdir(newRoot);
+  await symlink(join(home, "skills/demo"), join(newRoot, "demo"));
+  const receipts = await synchronize(
+    { ...desired([skill("two", "r2")]), generation: 2 },
+    [{ id: "pi", path: newRoot }],
+    home,
+  );
+
+  assert.equal(receipts[0].status, "synchronized");
+  await assert.rejects(lstat(join(oldRoot, "demo")), /ENOENT/);
+  assert.equal(await readFile(join(newRoot, "demo/SKILL.md"), "utf8"), "two");
+  const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
+  const entry = Object.values(ledger.installs)[0] as any;
+  assert.equal(entry.path, join(newRoot, "demo"));
+  assert.equal(entry.revision, "r2");
+});
+
+test("a managed skill root migration ignores generated Python bytecode", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-migration-cache-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  const cache = join(home, "skills/demo/scripts/__pycache__");
+  await mkdir(cache);
+  await writeFile(join(cache, "run.cpython-313.pyc"), Buffer.from([0, 1, 2]));
+  await mkdir(newRoot);
+  await symlink(join(home, "skills/demo"), join(newRoot, "demo"));
+
+  const receipts = await synchronize(desired([skill("one")]), [{ id: "pi", path: newRoot }], home);
+
+  assert.equal(receipts[0].status, "synchronized");
+  assert.deepEqual(await readFile(join(newRoot, "demo/scripts/__pycache__/run.cpython-313.pyc")), Buffer.from([0, 1, 2]));
+  await assert.rejects(lstat(join(oldRoot, "demo")), /ENOENT/);
+});
+
+test("a physical alias of the same agent root updates ownership without deleting the destination", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-directory-alias-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), physical = join(root, "physical"), alias = join(root, "alias");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: physical }], home);
+  await symlink(physical, alias);
+
+  const receipts = await synchronize(desired([skill("one")]), [{ id: "pi", path: alias }], home);
+
+  assert.equal(receipts[0].status, "synchronized");
+  assert.equal(await readFile(join(alias, "demo/SKILL.md"), "utf8"), "one");
+  assert.equal(await readFile(join(physical, "demo/SKILL.md"), "utf8"), "one");
+  const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
+  assert.equal((Object.values(ledger.installs)[0] as any).path, join(alias, "demo"));
+});
+
+test("a root migration preserves a foreign same-content pointer", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-foreign-pointer-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  const foreign = join(root, "foreign");
+  await cp(join(home, "skills/demo"), foreign, { recursive: true });
+  await mkdir(newRoot);
+  await symlink(foreign, join(newRoot, "demo"));
+
+  const receipts = await synchronize(desired([skill("one")]), [{ id: "pi", path: newRoot }], home);
+
+  assert.equal(receipts[0].status, "conflicted");
+  assert.match(receipts[0].message ?? "", /already occupied/);
+  assert.equal(await realpath(join(newRoot, "demo")), await realpath(foreign));
+  assert.equal((await lstat(join(oldRoot, "demo"))).isSymbolicLink(), true);
+});
+
+test("a root migration preserves a changed old pointer and a copied installation", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-changed-old-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  const foreign = join(root, "foreign");
+  await cp(join(home, "skills/demo"), foreign, { recursive: true });
+  await rm(join(oldRoot, "demo"));
+  await symlink(foreign, join(oldRoot, "demo"));
+  await mkdir(newRoot);
+  await symlink(join(home, "skills/demo"), join(newRoot, "demo"));
+  assert.equal((await synchronize(desired([skill("one")]), [{ id: "pi", path: newRoot }], home))[0].status, "conflicted");
+
+  await rm(join(oldRoot, "demo"));
+  await cp(join(home, "skills/demo"), join(oldRoot, "demo"), { recursive: true });
+  const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
+  (Object.values(ledger.installs)[0] as any).copied = true;
+  await writeFile(join(home, "ledger.json"), JSON.stringify(ledger));
+  assert.equal((await synchronize(desired([skill("one")]), [{ id: "pi", path: newRoot }], home))[0].status, "conflicted");
+});
+
+test("a root migration preserves an indirect old pointer even when it reaches the canonical directory", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-indirect-old-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  const intermediate = join(root, "user-alias");
+  await symlink(join(home, "skills/demo"), intermediate);
+  await rm(join(oldRoot, "demo"));
+  await symlink(intermediate, join(oldRoot, "demo"));
+  await mkdir(newRoot);
+  await symlink(join(home, "skills/demo"), join(newRoot, "demo"));
+
+  const receipts = await synchronize(desired([skill("one")]), [{ id: "pi", path: newRoot }], home);
+
+  assert.equal(receipts[0].status, "conflicted");
+  assert.equal(await readlink(join(oldRoot, "demo")), intermediate);
+  assert.equal(await realpath(join(newRoot, "demo")), await realpath(join(home, "skills/demo")));
+});
+
+test("a root migration preserves locally modified canonical content", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-root-modified-canonical-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  await mkdir(newRoot);
+  await symlink(join(home, "skills/demo"), join(newRoot, "demo"));
+  await writeFile(join(home, "skills/demo/SKILL.md"), "local");
+
+  const receipts = await synchronize(desired([skill("one")]), [{ id: "pi", path: newRoot }], home);
+
+  assert.equal(receipts[0].status, "conflicted");
+  assert.equal(await readFile(join(newRoot, "demo/SKILL.md"), "utf8"), "local");
+  assert.equal((await lstat(join(oldRoot, "demo"))).isSymbolicLink(), true);
+});
+
 test("a managed skill rename preserves a locally modified old folder", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");
@@ -1223,6 +1353,53 @@ test("removal preserves a locally substituted symlink even when its contents mat
   assert.equal(receipts[0].status, "conflicted");
   assert.equal((await lstat(join(target, "demo"))).isSymbolicLink(), true);
   assert.equal(await readFile(join(root, "local-work/SKILL.md"), "utf8"), "one");
+});
+
+test("an update normalizes a managed link chained through another managed destination", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-managed-alias-update-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state");
+  const agentsPath = join(root, ".agents/skills");
+  const claudePath = join(root, ".claude/skills");
+  const targets = [
+    { id: "codex", path: agentsPath },
+    { id: "claude-code", path: claudePath },
+  ];
+  await synchronize(desired([skill("one")]), targets, home);
+  const intermediate = join(agentsPath, "demo");
+  const destination = join(claudePath, "demo");
+  const intermediatePointer = await readlink(intermediate);
+  await rm(destination);
+  await symlink(relative(dirname(destination), intermediate), destination);
+
+  const receipts = await synchronize(desired([skill("two", "r2")]), targets, home);
+
+  assert.ok(receipts.every(receipt => receipt.status === "synchronized"), JSON.stringify(receipts));
+  assert.equal(await readlink(intermediate), intermediatePointer, "the intermediate managed alias remains untouched");
+  assert.notEqual(await readlink(destination), relative(dirname(destination), intermediate));
+  assert.equal(await realpath(destination), await realpath(join(home, "skills/demo")));
+  assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "two");
+});
+
+test("an update preserves a different physical copy even when it has the desired content", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-external-copy-update-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), target = join(root, "agent"), destination = join(target, "demo");
+  const targets = [{ id: "claude-code", path: target }];
+  await synchronize(desired([skill("one")]), targets, home);
+  const external = join(root, "external-copy");
+  await mkdir(join(external, "scripts"), { recursive: true });
+  await writeFile(join(external, "SKILL.md"), "two");
+  await writeFile(join(external, "scripts/run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+  await rm(destination);
+  await symlink(external, destination);
+
+  const receipts = await synchronize(desired([skill("two", "r2")]), targets, home);
+
+  assert.equal(receipts[0].status, "conflicted");
+  assert.match(receipts[0].message ?? "", /Managed skill link changed/);
+  assert.equal(await realpath(destination), await realpath(external));
+  assert.equal(await readFile(join(external, "SKILL.md"), "utf8"), "two");
 });
 
 test("removing adopted links removes every managed destination and the unreferenced store", async () => {
