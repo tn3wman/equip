@@ -1230,6 +1230,179 @@ test("a root migration preserves locally modified canonical content", async t =>
   assert.equal((await lstat(join(oldRoot, "demo"))).isSymbolicLink(), true);
 });
 
+test("a skill rename removes the previous canonical folder", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-gc-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state");
+  const agents = [{ id: "codex", path: join(root, "codex") }, { id: "claude-code", path: join(root, "claude") }];
+  await synchronize(desired([skill("old")]), agents, home);
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  const receipts = await synchronize({ generation: 2, skills: [renamed], resolutions: {} }, agents, home);
+  assert.deepEqual(receipts.map(r => r.status), ["synchronized", "synchronized"]);
+  await assert.rejects(lstat(join(home, "skills/demo")), "The old canonical folder is not left behind");
+  assert.equal(await readFile(join(home, "skills/renamed/SKILL.md"), "utf8"), "new");
+});
+
+test("a skill rename keeps an edited previous canonical folder of a copied installation", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-copied-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), target = join(root, "agent");
+  const agents = [{ id: "codex", path: target }];
+  await synchronize(desired([skill("old")]), agents, home);
+  // Mimic a platform without symlinks: the agent holds a copy, not a link.
+  await rm(join(target, "demo"));
+  await cp(join(home, "skills/demo"), join(target, "demo"), { recursive: true });
+  const ledgerPath = join(home, "ledger.json");
+  const ledger = JSON.parse(await readFile(ledgerPath, "utf8"));
+  for (const entry of Object.values(ledger.installs) as any[]) entry.copied = true;
+  await writeFile(ledgerPath, JSON.stringify(ledger));
+  await writeFile(join(home, "skills/demo/local.txt"), "edited in the canonical store");
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  await synchronize({ generation: 2, skills: [renamed], resolutions: {} }, agents, home);
+  assert.equal(await readFile(join(home, "skills/demo/local.txt"), "utf8"), "edited in the canonical store");
+});
+
+test("a skill rename keeps the previous canonical folder that a preserved agent still links to", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-preserve-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), codex = join(root, "codex");
+  const agents = [{ id: "codex", path: codex }, { id: "claude-code", path: join(root, "claude") }];
+  await synchronize(desired([skill("old")]), agents, home);
+  await writeFile(join(home, "skills/demo/SKILL.md"), "local");
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  await synchronize({ generation: 2, skills: [renamed], resolutions: { "s1:codex::": "preserve", "s1:claude-code::": "replace" } }, agents, home);
+  assert.equal(await readFile(join(codex, "demo/SKILL.md"), "utf8"), "local", "The preserved installation still resolves");
+});
+
+test("a preserved agent link to the previous canonical folder survives a later completed rename", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-preserve-later-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), codex = join(root, "codex"), claude = join(root, "claude");
+  const agents = [{ id: "codex", path: codex }, { id: "claude-code", path: claude }];
+  await synchronize(desired([skill("old")]), agents, home);
+  for (const dir of [codex, claude]) {
+    await mkdir(join(dir, "renamed"));
+    await writeFile(join(dir, "renamed/SKILL.md"), "unrelated");
+  }
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  await synchronize({ generation: 2, skills: [renamed], resolutions: { "s1:codex::": "preserve" } }, agents, home);
+  await rm(join(claude, "renamed"), { recursive: true });
+  const receipts = await synchronize({
+    generation: 3, skills: [renamed], resolutions: {},
+    excludedAgents: [{ agent: "codex" }],
+  } as DesiredState, agents, home);
+  assert.equal(receipts.find(receipt => receipt.agent === "claude-code")?.status, "synchronized");
+  assert.equal(await readFile(join(codex, "demo/SKILL.md"), "utf8"), "old", "The preserved link still resolves");
+});
+
+test("a skill rename keeps the previous canonical folder when an agent directory cannot be read", { skip: process.platform === "win32" }, async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-unreadable-"));
+  const home = join(root, "state"), codex = join(root, "codex"), claude = join(root, "claude");
+  t.after(async () => { await chmod(codex, 0o755).catch(() => {}); await rm(root, { recursive: true, force: true }); });
+  const agents = [{ id: "codex", path: codex }, { id: "claude-code", path: claude }];
+  await synchronize(desired([skill("old")]), agents, home);
+  for (const dir of [codex, claude]) {
+    await mkdir(join(dir, "renamed"));
+    await writeFile(join(dir, "renamed/SKILL.md"), "unrelated");
+  }
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  await synchronize({ generation: 2, skills: [renamed], resolutions: { "s1:codex::": "preserve" } }, agents, home);
+  await rm(join(claude, "renamed"), { recursive: true });
+  await chmod(codex, 0o000);
+  await synchronize({
+    generation: 3, skills: [renamed], resolutions: {},
+    excludedAgents: [{ agent: "codex" }],
+  } as DesiredState, agents, home);
+  await chmod(codex, 0o755);
+  assert.equal(await readFile(join(codex, "demo/SKILL.md"), "utf8"), "old", "The preserved link still resolves");
+});
+
+test("a conflicted shared-root adoption keeps the agent's record and edited old folder", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-shared-conflict-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), shared = join(root, "zencoder");
+  const agents = [{ id: "zencoder", path: shared }, { id: "zenflow", path: shared }];
+  await synchronize(desired([skill("old")]), agents, home);
+  const ledgerPath = join(home, "ledger.json");
+  const before = JSON.parse(await readFile(ledgerPath, "utf8"));
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  await synchronize({ generation: 2, skills: [renamed], resolutions: {} }, agents, home);
+  const after = JSON.parse(await readFile(ledgerPath, "utf8"));
+  const zenflow = Object.keys(before.installs).find(key => key.includes(":zenflow:"))!;
+  after.installs[zenflow] = before.installs[zenflow];
+  await writeFile(ledgerPath, JSON.stringify(after));
+  await mkdir(join(home, "skills/demo"), { recursive: true });
+  await writeFile(join(home, "skills/demo/SKILL.md"), "edited old");
+  await writeFile(join(home, "skills/renamed/SKILL.md"), "edited new");
+  const renamedAgain = { ...renamed, revision: "r3", files: renamed.files.map(file => file.path === "SKILL.md" ? { ...file, content: "newer" } : file) };
+  const receipts = await synchronize({ generation: 3, skills: [renamedAgain], resolutions: {} }, agents, home);
+  assert.ok(receipts.every(receipt => receipt.status === "conflicted"));
+  const final = JSON.parse(await readFile(ledgerPath, "utf8"));
+  assert.equal(final.installs[zenflow].path, before.installs[zenflow].path, "The stale record is kept until a successful adoption");
+  assert.equal(await readFile(join(home, "skills/demo/SKILL.md"), "utf8"), "edited old");
+});
+
+test("a skill rename keeps the previous canonical folder while a conflicted agent still uses it", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-gc-keep-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), codex = join(root, "codex");
+  const agents = [{ id: "codex", path: codex }, { id: "claude-code", path: join(root, "claude") }];
+  await synchronize(desired([skill("old")]), agents, home);
+  await mkdir(join(codex, "renamed"));
+  await writeFile(join(codex, "renamed/SKILL.md"), "unrelated");
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  const receipts = await synchronize({ generation: 2, skills: [renamed], resolutions: {} }, agents, home);
+  assert.equal(receipts.find(r => r.agent === "codex")?.status, "conflicted");
+  assert.equal(await readFile(join(codex, "demo/SKILL.md"), "utf8"), "old", "The conflicted agent keeps its working installation");
+});
+
+test("agents sharing a skill root both follow a rename", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-shared-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), shared = join(root, "zencoder");
+  const agents = [{ id: "zencoder", path: shared }, { id: "zenflow", path: shared }];
+  await synchronize(desired([skill("old")]), agents, home);
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  const receipts = await synchronize({ generation: 2, skills: [renamed], resolutions: {} }, agents, home);
+  assert.deepEqual(receipts.map(r => [r.agent, r.status]), [["zencoder", "synchronized"], ["zenflow", "synchronized"]]);
+  assert.equal(await readFile(join(shared, "renamed/SKILL.md"), "utf8"), "new");
+  await assert.rejects(lstat(join(shared, "demo")));
+  const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
+  assert.deepEqual(Object.values(ledger.installs).map((entry: any) => entry.path), [join(shared, "renamed"), join(shared, "renamed")]);
+  await assert.rejects(lstat(join(home, "skills/demo")));
+});
+
+test("a sibling stuck on an earlier shared-root rename conflict recovers", async t => {
+  const root = await mkdtemp(join(tmpdir(), "equip-rename-shared-stuck-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), shared = join(root, "zencoder");
+  const agents = [{ id: "zencoder", path: shared }, { id: "zenflow", path: shared }];
+  await synchronize(desired([skill("old")]), agents, home);
+  const ledgerPath = join(home, "ledger.json");
+  const before = JSON.parse(await readFile(ledgerPath, "utf8"));
+  const renamed = skill("new", "r2");
+  renamed.name = "renamed";
+  await synchronize({ generation: 2, skills: [renamed], resolutions: {} }, agents, home);
+  // Reproduce the state an earlier release left behind: zencoder moved the
+  // shared link, but zenflow's entry still names the old folder and revision.
+  const after = JSON.parse(await readFile(ledgerPath, "utf8"));
+  const zenflow = Object.keys(before.installs).find(key => key.includes(":zenflow:"))!;
+  after.installs[zenflow] = before.installs[zenflow];
+  await writeFile(ledgerPath, JSON.stringify(after));
+  const receipts = await synchronize({ generation: 3, skills: [renamed], resolutions: {} }, agents, home);
+  assert.deepEqual(receipts.map(r => r.status), ["synchronized", "synchronized"]);
+  const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
+  assert.ok(Object.values(ledger.installs).every((entry: any) => entry.path === join(shared, "renamed") && entry.revision === "r2"));
+});
+
 test("a managed skill rename preserves a locally modified old folder", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");
