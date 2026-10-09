@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile, lstat, readlink, realpath } from 'node:fs/promises';
+import fsPromises, { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile, lstat, readlink, realpath } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { discoverInstructionLocations, supportedInstructionLocations, syncLocalInstructions, synchronizeInstructions } from '../cli/instructions.ts';
 import { skillRevision } from '../shared/library.ts';
@@ -157,6 +158,70 @@ test('disabling a location keeps the file an enabled location reaches through a 
  assert.ok(receipts.every(receipt=>receipt.status==='synchronized'),JSON.stringify(receipts));assert.equal(await readFile(b.path,'utf8'),policy.files[0].content);
  receipts=await synchronizeInstructions(desired(policy),[a,b],state,'device');
  assert.deepEqual(receipts.map(receipt=>[receipt.profile,receipt.status]),[['alias','synchronized']]);
+});
+
+for (const preservedFirst of [false,true])
+test(`removing a location keeps the file a preserved directory alias shares${preservedFirst ? ' when the alias is processed first' : ''}`,async t=>{
+ const {root,state,a}=await fixture(t);await symlink(join(root,'config'),join(root,'config-alias'));const b={...a,profile:'alias',path:join(root,'config-alias/AGENTS.md')};const policy=doc();
+ await synchronizeInstructions(desired(policy),preservedFirst ? [b,a] : [a,b],state);
+ const receipts=await synchronizeInstructions({...desired(policy,{[instructionKey(policy.id,b)]:'preserve'}),instructions:[]},[a,b],state);
+ assert.equal(receipts.find(receipt=>receipt.profile==='alias')?.instructionResolution,'preserve',JSON.stringify(receipts));
+ assert.equal(await readFile(b.path,'utf8'),policy.files[0].content);
+ assert.deepEqual(JSON.parse(await readFile(join(state,'instructions-ledger.json'),'utf8')).installs,{});
+});
+
+async function linkedThroughA(t:any) {
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();
+ await synchronizeInstructions(desired(policy),[a,b],state);await rm(b.path);await symlink(a.path,b.path);await synchronizeInstructions(desired(policy),[a,b],state);
+ policy.targets=[{deviceId:'device',agent:a.agent,enabled:false},{deviceId:'device',agent:a.agent,profile:'other',enabled:true}];
+ return {root,state,a,b,policy,removeA:{...desired(policy,{[instructionKey(policy.id,a)]:'replace'})},canonical:join(state,'instructions',policy.id,'AGENTS.md')};
+}
+
+test('a survivor materialized during removal publishes its local edit',async t=>{
+ const {state,a,b,policy,removeA}=await linkedThroughA(t);await rm(a.path);await writeFile(a.path,'Local\n');
+ await synchronizeInstructions(removeA,[a,b],state,'device',async()=>{});
+ assert.equal(await lstat(a.path).catch(()=>null),null);assert.ok(!(await lstat(b.path)).isSymbolicLink());assert.equal(await readFile(b.path,'utf8'),'Local\n');
+ let calls=0;
+ const result=await syncLocalInstructions(state,[a,b],{...desired(policy),localSync:true},async payload=>{calls++;assert.equal(payload.baseRevision,policy.revision);assert.equal(payload.files[0].content,'Local\n');},'device');
+ assert.deepEqual(result,{changed:true,errors:[]});assert.equal(calls,1);
+});
+
+test('removal keeps a survivor\'s content when the instruction store has a local edit',async t=>{
+ const {state,a,b,removeA,canonical}=await linkedThroughA(t);await rm(a.path);await writeFile(a.path,'Original\n');await writeFile(canonical,'Edited store\n');
+ await synchronizeInstructions(removeA,[a,b],state,'device',async()=>{});
+ assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await readFile(b.path,'utf8'),'Original\n');assert.equal(await readFile(canonical,'utf8'),'Edited store\n');
+});
+
+for (const recoveryFails of [false,true])
+test(`a failed survivor replacement is recovered before another removal${recoveryFails ? ', and halts the pass when recovery fails' : ''}`,async t=>{
+ const {root,state,a}=await fixture(t);const policy=doc();
+ const [b,c,d]=['other','third','fourth'].map(profile=>({...a,profile,path:join(root,profile,'AGENTS.md')}));
+ for (const location of [b,c,d]) await mkdir(dirname(location.path));
+ await synchronizeInstructions(desired(policy),[a,b,c,d],state);
+ await rm(b.path);await symlink(a.path,b.path);await rm(d.path);await symlink(c.path,d.path);
+ await synchronizeInstructions(desired(policy),[a,b,c,d],state);
+ policy.targets=[{deviceId:'device',agent:a.agent,enabled:false},{deviceId:'device',agent:a.agent,profile:'other',enabled:true},{deviceId:'device',agent:a.agent,profile:'fourth',enabled:true}];
+ let failures=recoveryFails ? 2 : 1;const realRename=fsPromises.rename;
+ t.mock.method(fsPromises,'rename',async (from:string,to:string)=>{
+   if (to===b.path && failures>0 && (from.includes('.equip-stage-')||from.includes('.equip-old-'))) {failures--;throw Object.assign(new Error('EBUSY: resource busy'),{code:'EBUSY'});}
+   return realRename(from,to);
+ });
+ syncBuiltinESMExports();
+ t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+ const receipts=await synchronizeInstructions(desired(policy),[a,b,c,d],state,'device');
+ const status=(location:InstructionLocation)=>receipts.find(receipt=>receipt.profile===location.profile)?.status;
+ assert.equal(failures,0);assert.equal(status(a),'failed',JSON.stringify(receipts));assert.match(await readFile(a.path,'utf8'),/Original/);
+ if (recoveryFails) {
+   assert.equal(status(c),'failed');assert.equal(await readlink(d.path),c.path,'no change after an unrecovered failure');
+   assert.ok(await lstat(join(state,'instructions-transaction.json')));
+ } else {
+   assert.equal(status(c),'synchronized');assert.equal(await readlink(b.path),a.path,'the original link is restored');
+   await assert.rejects(lstat(join(state,'instructions-transaction.json')),/ENOENT/);
+ }
+ const retried=await synchronizeInstructions(desired(policy),[a,b,c,d],state,'device');
+ assert.ok(retried.every(receipt=>receipt.status==='synchronized'),JSON.stringify(retried));
+ for (const location of [b,d]) assert.equal(await readFile(location.path,'utf8'),policy.files[0].content);
+ assert.deepEqual((await readdir(dirname(b.path))).filter(name=>name.includes('.equip-')),[]);
 });
 
 test('local publishing rejects a foreign link even when its content matches a managed edit',async t=>{
