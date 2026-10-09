@@ -3,7 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#202722" />
+    <meta name="theme-color" content="#1d2822" />
+    <script>
+      // Apply the stored theme before paint so the first frame is never the wrong color.
+      try {
+        var equipTheme = localStorage.getItem("equip:theme");
+        if (equipTheme === "light" || equipTheme === "dark")
+          document.documentElement.setAttribute("data-theme", equipTheme);
+      } catch (error) {}
+    </script>
     <title>Equip · Your agents, equipped.</title>
     <link rel="icon" type="image/svg+xml" href="/equip.svg?v=2" />
   </head>

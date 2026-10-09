@@ -116,6 +116,50 @@ export function ago(date?: string) {
 export function revision(value: string) {
   return value?.replace(/^sha256:/, "").slice(0, 7) || "Unpublished";
 }
+/* Controls a focus trap may cycle through: enabled, rendered, and not opted out
+   of the tab order. Disabled or hidden fields would otherwise trap focus on BODY. */
+export function tabbable(root: HTMLElement | null) {
+  if (!root) return [];
+  return [
+    ...root.querySelectorAll<HTMLElement>(
+      'button,input,textarea,select,a[href],[tabindex]:not([tabindex="-1"])',
+    ),
+  ].filter(
+    (el) =>
+      !(el as HTMLButtonElement).disabled &&
+      el.getAttribute("tabindex") !== "-1" &&
+      el.offsetParent !== null,
+  );
+}
+/* Modal surfaces (dialogs, the command palette, the skill drawer) can stack, so
+   only the first to open captures page state and only the last to close restores
+   it, whatever order they unmount in. The returned function reports whether this
+   surface is the topmost one, so stacked dialogs answer keyboard events one at a
+   time. The drawer passes inertPage=false because the app marks its own regions
+   inert while leaving the drawer interactive. */
+const modalStack: { token: symbol; inertPage: boolean }[] = [];
+let pageState: { inert: boolean; overflow: string } | null = null;
+export function useModalPage(inertPage = true) {
+  const token = useRef(Symbol("modal")).current;
+  useEffect(() => {
+    const page = document.querySelector<HTMLElement>(".app, .landing");
+    if (!modalStack.length) {
+      pageState = { inert: page?.inert ?? false, overflow: document.body.style.overflow };
+    }
+    modalStack.push({ token, inertPage });
+    if (page && inertPage) page.inert = true;
+    document.body.style.overflow = "hidden";
+    return () => {
+      modalStack.splice(modalStack.findIndex((entry) => entry.token === token), 1);
+      if (!modalStack.length && pageState) {
+        document.body.style.overflow = pageState.overflow;
+        if (page) page.inert = pageState.inert;
+        pageState = null;
+      } else if (page) page.inert = modalStack.some((entry) => entry.inertPage);
+    };
+  }, [token, inertPage]);
+  return () => modalStack[modalStack.length - 1]?.token === token;
+}
 export function Dialog({
   title,
   children,
@@ -130,21 +174,16 @@ export function Dialog({
   const ref = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
   close.current = onClose;
+  const isTop = useModalPage();
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
-    const app = document.querySelector<HTMLElement>(".app");
-    const appWasInert = app?.inert ?? false;
-    if (app) app.inert = true;
-    const bodyOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
     ref.current?.focus();
     const key = (e: KeyboardEvent) => {
+      if (!isTop()) return;
       if (e.key === "Escape") close.current();
       if (e.key === "Tab") {
-        const focusable = ref.current?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled),input,textarea,select,a[href],[tabindex="0"]',
-        );
-        if (!focusable?.length) return;
+        const focusable = tabbable(ref.current);
+        if (!focusable.length) return;
         const first = focusable[0],
           last = focusable[focusable.length - 1];
         if (
@@ -162,8 +201,6 @@ export function Dialog({
     };
     document.addEventListener("keydown", key);
     return () => {
-      document.body.style.overflow = bodyOverflow;
-      if (app) app.inert = appWasInert;
       document.removeEventListener("keydown", key);
       previous?.focus();
     };
