@@ -104,7 +104,7 @@ export async function consolidate(home: string, agentHome: string, desired: Desi
       await symlink(process.platform === 'win32' ? canonical : relative(dirname(path),canonical),stage,process.platform === 'win32' ? 'junction':'dir');
       const tempJournal = journalPath+'.'+randomUUID()+'.tmp';
       await writeFile(tempJournal,JSON.stringify({path,old,stage,canonical,skillId:skill.id}),{mode:0o600});
-      await rename(tempJournal,journalPath);
+      await renameReplacing(tempJournal,journalPath);
       await rename(path,old);
       try {await rename(stage,path);} catch(error) {await rename(old,path);await rm(stage,{force:true});throw error;}
       // Recheck the renamed original in case a writer raced the final swap.
