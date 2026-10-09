@@ -1,0 +1,272 @@
+/* Equip design tokens.
+   Graphite and electric lime. The rail is near-black in both themes; the
+   content field is cool paper in light and layered graphite in dark. Lime is
+   the only saturated color and marks what is active, primary, or focused.
+   Themes switch by `data-theme` on <html>; "system" follows prefers-color-scheme. */
+
+:root {
+  color-scheme: light;
+
+  /* Brand: electric lime on graphite. */
+  --lime: #d3f25a;
+  --lime-strong: #c2e83a;
+  --lime-ink: #1a2605;
+  --olive: #0f120f;
+  --olive-2: #171b17;
+  --olive-3: #1f241f;
+  --olive-line: #262c26;
+  --olive-text: #c8cdc4;
+  --olive-text-muted: #8d948a;
+  --brand: #d3f25a;
+  --brand-hover: #c2e83a;
+  --rail-hover: rgb(255 255 255 / 0.05);
+  --rail-raise: rgb(255 255 255 / 0.09);
+  --rail-sink: rgb(0 0 0 / 0.3);
+  --lime-sink: rgb(0 0 0 / 0.14);
+  --on-brand: #1a2605;
+  --on-olive: #e9ece5;
+  --on-olive-strong: #f6f7f3;
+  --avatar-bg: #e8e2d4;
+  --avatar-ink: #4b4332;
+  --on-olive-danger: #ff8678;
+  --knob: #ffffff;
+
+  /* Field: cool paper, no tint. */
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --surface-2: #f4f4f1;
+  --surface-3: #ecece8;
+  --surface-hover: #f3f3f0;
+  --border: #e4e4df;
+  --border-strong: #cfcfc8;
+  --divider: #ebebe6;
+
+  /* Ink */
+  --ink: #0e100d;
+  --text: #24271f;
+  --text-2: #585c54;
+  --text-3: #656a61;
+  --text-disabled: #a3a79f;
+
+  /* Accent (interactive) */
+  --accent: #3f7a0a;
+  --accent-soft: #eef8d6;
+  --accent-ring: #3f7a0a;
+
+  /* Status */
+  --ok: #1a7d44;
+  --ok-soft: #e3f5e8;
+  --warn: #9a5a00;
+  --warn-soft: #fbf0d9;
+  --danger: #b8352a;
+  --danger-soft: #fde8e5;
+  --danger-hover: #9d2c22;
+  --on-danger: #ffffff;
+  --conflict: #6d48c9;
+  --conflict-soft: #efeafb;
+  --neutral: #5f655d;
+  --neutral-soft: #ededea;
+
+  /* Skill icon hues */
+  --hue-lavender-bg: #ece7f8; --hue-lavender-fg: #6f4fb0;
+  --hue-blue-bg: #e3ecf8;     --hue-blue-fg: #3f67a3;
+  --hue-green-bg: #e4f3d8;    --hue-green-fg: #3f7a0a;
+  --hue-peach-bg: #fae9dc;    --hue-peach-fg: #b2602a;
+  --hue-rose-bg: #f9e3e9;     --hue-rose-fg: #b24a6c;
+  --hue-sand-bg: #f6efd6;     --hue-sand-fg: #8d7420;
+
+  /* Code / terminal */
+  --code-bg: #f0f0ec;
+  --code-ink: #2b2f27;
+  --terminal-bg: #0f120f;
+  --terminal-ink: #e0f3a4;
+
+  /* Elevation */
+  --shadow-1: 0 1px 2px rgb(14 16 13 / 0.05), 0 0 0 1px rgb(14 16 13 / 0.03);
+  --shadow-2: 0 6px 18px rgb(14 16 13 / 0.08), 0 1px 2px rgb(14 16 13 / 0.05);
+  --shadow-3: 0 24px 64px rgb(14 16 13 / 0.18), 0 6px 16px rgb(14 16 13 / 0.08);
+  --shadow-panel: -20px 0 64px rgb(14 16 13 / 0.16);
+  --scrim: rgb(10 12 10 / 0.5);
+  --glow: 0 0 0 1px color-mix(in srgb, var(--lime) 40%, transparent), 0 10px 30px color-mix(in srgb, var(--lime) 28%, transparent);
+
+  /* Shape */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 18px;
+  --r-pill: 999px;
+
+  /* Type */
+  --font-ui: "DM Sans Variable", system-ui, sans-serif;
+  --font-display: "Manrope Variable", "DM Sans Variable", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;
+  --fs-lg: 15px;
+  --fs-xl: 18px;
+  --fs-2xl: 22px;
+  --fs-3xl: 32px;
+  --fs-4xl: 42px;
+
+  /* Layout */
+  --sidebar: 240px;
+  --topbar: 60px;
+  --gutter: 40px;
+  --page-max: 1560px;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 140ms;
+  --dur: 220ms;
+  --dur-slow: 360ms;
+
+}
+
+/* Dark theme */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --olive: #0a0c0a;
+  --olive-2: #121512;
+  --olive-3: #191d19;
+  --olive-line: #222622;
+  --olive-text: #c4c9c0;
+  --olive-text-muted: #8a9087;
+  --brand: #d3f25a;
+  --brand-hover: #e0f87d;
+  --on-brand: #1a2605;
+  --avatar-bg: #3a3630;
+  --avatar-ink: #e6dcc8;
+
+  --bg: #0d0f0d;
+  --surface: #131613;
+  --surface-2: #181c18;
+  --surface-3: #1f241f;
+  --surface-hover: #1a1f1a;
+  --border: #232823;
+  --border-strong: #343a34;
+  --divider: #1f241f;
+
+  --ink: #f4f5f1;
+  --text: #dadcd5;
+  --text-2: #a4a9a0;
+  --text-3: #8f958b;
+  --text-disabled: #575c56;
+
+  --accent: #d3f25a;
+  --accent-soft: #1c2412;
+  --accent-ring: #b5dd3f;
+
+  --ok: #6fd48a;
+  --ok-soft: #142a1b;
+  --warn: #f2b84b;
+  --warn-soft: #2f2412;
+  --danger: #ff8678;
+  --danger-soft: #3a1d19;
+  --danger-hover: #ffa093;
+  --on-danger: #2b0d09;
+  --conflict: #c3a6ff;
+  --conflict-soft: #26203a;
+  --neutral: #9ca399;
+  --neutral-soft: #1f241f;
+
+  --hue-lavender-bg: #262038; --hue-lavender-fg: #c3a6ff;
+  --hue-blue-bg: #1b2534;     --hue-blue-fg: #8fb4e6;
+  --hue-green-bg: #1c2412;    --hue-green-fg: #c9ec6a;
+  --hue-peach-bg: #33241a;    --hue-peach-fg: #f0a874;
+  --hue-rose-bg: #341f28;     --hue-rose-fg: #f097b4;
+  --hue-sand-bg: #302b18;     --hue-sand-fg: #e3c86a;
+
+  --code-bg: #171b17;
+  --code-ink: #d6d9d0;
+  --terminal-bg: #070807;
+  --terminal-ink: #dff3a0;
+
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.5), 0 0 0 1px rgb(255 255 255 / 0.03);
+  --shadow-2: 0 6px 18px rgb(0 0 0 / 0.5), 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-3: 0 24px 64px rgb(0 0 0 / 0.7), 0 6px 16px rgb(0 0 0 / 0.5);
+  --shadow-panel: -20px 0 64px rgb(0 0 0 / 0.6);
+  --scrim: rgb(0 0 0 / 0.66);
+}
+
+/* Follow the OS when no explicit theme is stored. The block above is emitted
+   twice on purpose; keep both copies identical. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+
+    --olive: #0a0c0a;
+    --olive-2: #121512;
+    --olive-3: #191d19;
+    --olive-line: #222622;
+    --olive-text: #c4c9c0;
+    --olive-text-muted: #8a9087;
+    --brand: #d3f25a;
+    --brand-hover: #e0f87d;
+    --on-brand: #1a2605;
+    --avatar-bg: #3a3630;
+    --avatar-ink: #e6dcc8;
+
+    --bg: #0d0f0d;
+    --surface: #131613;
+    --surface-2: #181c18;
+    --surface-3: #1f241f;
+    --surface-hover: #1a1f1a;
+    --border: #232823;
+    --border-strong: #343a34;
+    --divider: #1f241f;
+
+    --ink: #f4f5f1;
+    --text: #dadcd5;
+    --text-2: #a4a9a0;
+    --text-3: #8f958b;
+    --text-disabled: #575c56;
+
+    --accent: #d3f25a;
+    --accent-soft: #1c2412;
+    --accent-ring: #b5dd3f;
+
+    --ok: #6fd48a;
+    --ok-soft: #142a1b;
+    --warn: #f2b84b;
+    --warn-soft: #2f2412;
+    --danger: #ff8678;
+    --danger-soft: #3a1d19;
+    --danger-hover: #ffa093;
+    --on-danger: #2b0d09;
+    --conflict: #c3a6ff;
+    --conflict-soft: #26203a;
+    --neutral: #9ca399;
+    --neutral-soft: #1f241f;
+
+    --hue-lavender-bg: #262038; --hue-lavender-fg: #c3a6ff;
+    --hue-blue-bg: #1b2534;     --hue-blue-fg: #8fb4e6;
+    --hue-green-bg: #1c2412;    --hue-green-fg: #c9ec6a;
+    --hue-peach-bg: #33241a;    --hue-peach-fg: #f0a874;
+    --hue-rose-bg: #341f28;     --hue-rose-fg: #f097b4;
+    --hue-sand-bg: #302b18;     --hue-sand-fg: #e3c86a;
+
+    --code-bg: #171b17;
+    --code-ink: #d6d9d0;
+    --terminal-bg: #070807;
+    --terminal-ink: #dff3a0;
+
+    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.5), 0 0 0 1px rgb(255 255 255 / 0.03);
+    --shadow-2: 0 6px 18px rgb(0 0 0 / 0.5), 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-3: 0 24px 64px rgb(0 0 0 / 0.7), 0 6px 16px rgb(0 0 0 / 0.5);
+    --shadow-panel: -20px 0 64px rgb(0 0 0 / 0.6);
+    --scrim: rgb(0 0 0 / 0.66);
+  }
+}
+
+@media (min-width: 1500px) {
+  :root { --sidebar: 256px; --gutter: 48px; }
+}
+@media (max-width: 1180px) {
+  :root { --sidebar: 220px; --gutter: 28px; }
+}
+@media (max-width: 700px) {
+  :root { --sidebar: 268px; --gutter: 18px; --topbar: 56px; }
+}
