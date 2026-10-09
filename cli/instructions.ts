@@ -380,6 +380,14 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
     // only record of the moved-aside file, so nothing else may change this pass.
     let halted: Error|undefined;
     const haltedMessage = () => `Instructions were not changed because an interrupted replacement could not be recovered: ${halted!.message}`;
+    // Locations reported earlier in this pass that name an unrecovered file, through
+    // any directory alias, no longer have it.
+    const failReceiptsAt = async (path: string) => {
+      const physical = await physicalPath(path);
+      for (const receipt of receipts)
+        if (receipt.kind === 'instructions' && receipt.path && await physicalPath(receipt.path) === physical)
+          Object.assign(receipt,{status:'failed',message:haltedMessage()});
+    };
     // Removing a location must not leave a surviving link to it dangling: enabled
     // managed locations link straight to the store, released ones keep a copy.
     const detachFrom = async (removedKey: string, removedPath: string) => {
@@ -401,12 +409,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         try {await replaceFile(home,ledger,key,entry.path,stage,{...entry,pointer},entry.filename,entry.skillId,archive,{expectedHash:relink ? canonical!.hash : current.hash,shared});}
         catch (error) {
           try {await recover(home,ledger,archive);await rm(stage,{force:true});}
-          catch (recoveryError) {
-            halted = recoveryError as Error;
-            // These locations reported success earlier in this pass, but their file is now unrecovered.
-            for (const receipt of receipts) if (receipt.kind === 'instructions' && [key,...Object.keys(shared)].includes(instructionKey(receipt.skillId,receipt)))
-              Object.assign(receipt,{status:'failed',message:haltedMessage()});
-          }
+          catch (recoveryError) {halted = recoveryError as Error;await failReceiptsAt(entry.path);}
           throw error;
         }
       }
@@ -526,7 +529,10 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           receipts.push({...base,revision:doc.revision,status:shadowed ? 'failed' : 'synchronized',managed:!entry.observed,
             ...(action === 'replace' ? {instructionResolution:action} : {}),
             ...(shadowed ? {message:'Installed, but AGENTS.override.md takes precedence. Move or edit the override to use Equip instructions.'} : location.warning ? {message:location.warning} : {})});
-        } catch (error) {await recover(home,ledger,archive).catch(recoveryError => {halted = recoveryError as Error;});receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:(error as Error).message});}
+        } catch (error) {
+          await recover(home,ledger,archive).catch(recoveryError => {halted = recoveryError as Error;});
+          if (halted) await failReceiptsAt(location.path);
+          receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:(error as Error).message});}
       }
     }
     // Files that stay (wanted, excluded, preserved, or imported) can be another

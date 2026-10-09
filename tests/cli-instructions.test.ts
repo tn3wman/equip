@@ -270,6 +270,32 @@ test('a failed ledger commit with a failed rollback halts without committing the
  assert.deepEqual((await readdir(join(root,'other'))).filter(name=>name.includes('.equip-')),[]);
 });
 
+test('a new directory alias whose commit and rollback fail invalidates the existing location receipt',async t=>{
+ const {root,state,a}=await fixture(t);const policy=doc();await synchronizeInstructions(desired(policy),[a],state);
+ await symlink(join(root,'config'),join(root,'config-alias'));const b={...a,profile:'alias',path:join(root,'config-alias/AGENTS.md')};
+ const ledgerPath=join(state,'instructions-ledger.json');
+ let ledgerFailures=1,blocked=true;const realRename=fsPromises.rename;
+ t.mock.method(fsPromises,'rename',async (from:string,to:string)=>{
+   if ((to===ledgerPath && ledgerFailures-- > 0) || (blocked && to===b.path && from.includes('.equip-old-')))
+     throw Object.assign(new Error('EBUSY: resource busy'),{code:'EBUSY'});
+   return realRename(from,to);
+ });
+ syncBuiltinESMExports();
+ t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+
+ const receipts=await synchronizeInstructions(desired(policy),[a,b],state);
+
+ assert.deepEqual(receipts.map(receipt=>[receipt.profile,receipt.status]),[[undefined,'failed'],['alias','failed']],JSON.stringify(receipts));
+ assert.equal(await lstat(a.path).catch(()=>null),null);assert.ok(await lstat(join(state,'instructions-transaction.json')));
+
+ blocked=false;
+ const retried=await synchronizeInstructions(desired(policy),[a,b],state);
+
+ assert.ok(retried.every(receipt=>receipt.status==='synchronized'),JSON.stringify(retried));
+ assert.equal(await readFile(a.path,'utf8'),policy.files[0].content);
+ await assert.rejects(lstat(join(state,'instructions-transaction.json')),/ENOENT/);
+});
+
 test('an instruction journal whose recovery keeps failing fails every location without changes until it recovers',async t=>{
  const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));
  const v1=doc();await synchronizeInstructions(desired(v1),[a,b],state);
