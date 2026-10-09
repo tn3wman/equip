@@ -19,7 +19,8 @@ const exec = promisify(execFile);
 async function waitForState(
   statePath: string,
   check: (state: any) => boolean | Promise<boolean>,
-  timeout = 10_000,
+  // A cold Windows CI runner can spend well over 10 s on a worker's first sync.
+  timeout = 30_000,
 ) {
   return new Promise<void>((resolve, reject) => {
     let checking = false;
@@ -73,7 +74,7 @@ async function stop(child: ChildProcess) {
   await exited;
 }
 
-test("a rejected worker update stays visible without blocking skill installation", { timeout: 30_000 }, async t => {
+test("a rejected worker update stays visible without blocking skill installation", { timeout: 90_000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), "equip-worker-update-"));
   let instance: Awaited<ReturnType<typeof createApp>> | undefined;
   let upstreamListener: Server | undefined;
@@ -223,21 +224,35 @@ test("a rejected worker update stays visible without blocking skill installation
     EQUIP_SKILLS_ROOT: resolve("node_modules/skills"),
     EQUIP_NO_SERVICE: "1",
   };
+  let output = "";
   const startWorker = () => {
     const child = spawn(process.execPath, [bundle, "worker"], {
       env: environment,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    child.stdout?.on("data", chunk => { output += chunk; });
+    child.stderr?.on("data", chunk => { output += chunk; });
     workers.add(child);
     child.once("exit", () => workers.delete(child));
     return child;
+  };
+  // Reports how long each worker phase took and, on failure, what the worker printed.
+  const phase = async (name: string, completion: Promise<void>) => {
+    const started = Date.now();
+    try {
+      await completion;
+    } catch (error) {
+      const state = await readFile(statePath, "utf8").catch(() => "(no state)");
+      throw new Error(`${name}: ${(error as Error).message}\nstate: ${state}\nworker output:\n${output}`);
+    }
+    t.diagnostic(`${name} took ${Date.now() - started} ms`);
   };
   const firstCompletion = waitForState(statePath, async state =>
     state.lastUpdateError?.includes("reuses the current Equip version") &&
       await readFile(join(target, "worker-live", "SKILL.md"), "utf8").then(() => true).catch(() => false),
   );
   const firstWorker = startWorker();
-  await firstCompletion;
+  await phase("rejected update", firstCompletion);
   await stop(firstWorker);
   const status = await exec(process.execPath, [bundle, "status"], { env: environment });
   const visible = JSON.parse(status.stdout);
@@ -252,7 +267,7 @@ test("a rejected worker update stays visible without blocking skill installation
     state => !!state.lastSync && state.lastSync !== failedState.lastSync,
   );
   const secondWorker = startWorker();
-  await throttledCompletion;
+  await phase("throttled check", throttledCompletion);
   await stop(secondWorker);
   assert.equal(manifestRequests, 1, "a recent failed update check must be throttled");
   const throttledState = JSON.parse(await readFile(statePath, "utf8"));
@@ -267,7 +282,7 @@ test("a rejected worker update stays visible without blocking skill installation
       !!state.lastSync && state.lastSync !== throttledState.lastSync,
   );
   const thirdWorker = startWorker();
-  await recoveredCompletion;
+  await phase("recovered update", recoveredCompletion);
   await stop(thirdWorker);
   const recoveredStatus = JSON.parse((await exec(process.execPath, [bundle, "status"], { env: environment })).stdout);
   assert.equal(recoveredStatus.lastUpdateError, undefined);
