@@ -209,6 +209,41 @@ async function createManagedLink(source: string, destination: string) {
   await symlink(target, destination, process.platform === "win32" ? "junction" : "dir");
 }
 
+// Windows rename (MoveFileExW) refuses an existing directory destination, and
+// managed links there are junctions. Move the old link aside under the
+// transaction journal so recovery can restore it; the caller records the
+// returned transactionId in the ledger and then removes oldPath.
+async function promoteManagedLink(
+  home: string,
+  stage: string,
+  destination: string,
+  journal: Pick<Journal, "revision" | "skillId" | "expectedFiles">,
+): Promise<{ oldPath?: string; transactionId?: string }> {
+  if (process.platform !== "win32") {
+    await rename(stage, destination);
+    return {};
+  }
+  const transactionId = randomUUID();
+  const oldPath = `${destination}.equip-old-${transactionId}`;
+  await saveJsonAtomic(join(home, "transaction.json"), {
+    destination,
+    stage,
+    oldPath,
+    hadOld: true,
+    transactionId,
+    ...journal,
+  } satisfies Journal);
+  await rename(destination, oldPath);
+  try {
+    await rename(stage, destination);
+  } catch (error) {
+    // If this restore also fails, recovery restores oldPath from the journal.
+    await rename(oldPath, destination).catch(() => {});
+    throw error;
+  }
+  return { oldPath, transactionId };
+}
+
 async function archiveChanged(
   archive: RecoveryArchive | undefined,
   skillId: string,
@@ -384,6 +419,7 @@ async function install(
       },
     };
   const desired = desiredHashes(skill.files);
+  const linkJournal = { revision: skill.revision, skillId: skill.id, expectedFiles: canonical.hashes };
   const obsoletePath =
     previous?.path !== destination ? previous?.path : undefined;
   if (obsoletePath) {
@@ -441,6 +477,7 @@ async function install(
           basename(obsoletePath) === basename(destination);
         const stage = `${destination}.equip-stage-${randomUUID()}`;
         await createManagedLink(canonical.path, stage);
+        let replaced: Awaited<ReturnType<typeof promoteManagedLink>>;
         try {
           const [stillOld, stillDestination] = await Promise.all([
             realpath(obsoletePath).catch(() => undefined),
@@ -449,7 +486,7 @@ async function install(
           if (stillOld !== oldTarget || stillDestination !== destinationTarget ||
               !await pointsTo(obsoletePath, previous.canonicalPath))
             throw new Error("Managed skill alias changed during synchronization and was preserved");
-          await rename(stage, destination);
+          replaced = await promoteManagedLink(home, stage, destination, linkJournal);
         } catch (error) {
           await rm(stage, { recursive: true, force: true }).catch(() => {});
           throw error;
@@ -462,8 +499,9 @@ async function install(
             files: canonical.hashes,
             canonicalPath: canonical.path,
             retainedFromCanonical: undefined,
-            transactionId: canonical.transactionId ?? previous.transactionId,
+            transactionId: replaced.transactionId ?? canonical.transactionId ?? previous.transactionId,
           },
+          oldPath: replaced.oldPath,
           ...(sameDirectoryEntry ? {} : { obsoletePath }),
           receipt: { ...base, status: "synchronized" },
         };
@@ -582,6 +620,7 @@ async function install(
     }
   }
   if (!migratingObserved && !replacingChangedPointer && previous?.canonicalPath && previous.path === destination) {
+    let replaced: Awaited<ReturnType<typeof promoteManagedLink>> | undefined;
     let intact = previous.copied
       ? !!rootInfo && !rootInfo.isSymbolicLink() &&
         !differs((await snapshot(destination)).hashes, previous.files)
@@ -603,7 +642,7 @@ async function install(
         try {
           if (await realpath(destination).catch(() => undefined) !== previousCanonicalTarget)
             throw new Error("Managed skill link changed during synchronization and was preserved");
-          await rename(stage, destination);
+          replaced = await promoteManagedLink(home, stage, destination, linkJournal);
         } catch (error) {
           await rm(stage, { recursive: true, force: true }).catch(() => {});
           throw error;
@@ -661,10 +700,16 @@ async function install(
           receipt: { ...base, status: "synchronized" },
         };
       }
-      if (resolve(previous.canonicalPath) !== resolve(canonical.path)) {
+      // A normalized link above already points at the current canonical store.
+      if (!replaced && resolve(previous.canonicalPath) !== resolve(canonical.path)) {
         const stage = `${destination}.equip-stage-${randomUUID()}`;
         await createManagedLink(canonical.path, stage);
-        await rename(stage, destination);
+        try {
+          replaced = await promoteManagedLink(home, stage, destination, linkJournal);
+        } catch (error) {
+          await rm(stage, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
       }
       return {
         entry: {
@@ -673,8 +718,9 @@ async function install(
           files: canonical.hashes,
           canonicalPath: canonical.path,
           retainedFromCanonical: undefined,
-          transactionId: canonical.transactionId ?? previous.transactionId,
+          transactionId: replaced?.transactionId ?? canonical.transactionId ?? previous.transactionId,
         },
+        oldPath: replaced?.oldPath,
         receipt: { ...base, status: "synchronized" },
       };
     }
