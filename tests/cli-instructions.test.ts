@@ -186,6 +186,19 @@ test('a survivor materialized during removal publishes its local edit',async t=>
  assert.deepEqual(result,{changed:true,errors:[]});assert.equal(calls,1);
 });
 
+test('a materialized survivor publishes through every directory alias of its file',async t=>{
+ const {root,state,a}=await fixture(t);await mkdir(join(root,'other'));await symlink(join(root,'other'),join(root,'other-alias'));const policy=doc();
+ const b={...a,profile:'other',path:join(root,'other/AGENTS.md')},c={...a,profile:'third',path:join(root,'other-alias/AGENTS.md')};
+ await synchronizeInstructions(desired(policy),[a,b,c],state);await rm(b.path);await symlink(a.path,b.path);await synchronizeInstructions(desired(policy),[a,b,c],state);
+ await rm(a.path);await writeFile(a.path,'Local\n');
+ policy.targets=[{deviceId:'device',agent:a.agent,enabled:false},...['other','third'].map(profile=>({deviceId:'device',agent:a.agent,profile,enabled:true}))];
+ await synchronizeInstructions(desired(policy,{[instructionKey(policy.id,a)]:'replace'}),[a,b,c],state,'device',async()=>{});
+ assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await readFile(c.path,'utf8'),'Local\n');
+ let calls=0;
+ const result=await syncLocalInstructions(state,[a,b,c],{...desired(policy),localSync:true},async payload=>{calls++;assert.equal(payload.files[0].content,'Local\n');},'device');
+ assert.deepEqual(result,{changed:true,errors:[]});assert.equal(calls,1);
+});
+
 test('removal keeps a survivor\'s content when the instruction store has a local edit',async t=>{
  const {state,a,b,removeA,canonical}=await linkedThroughA(t);await rm(a.path);await writeFile(a.path,'Original\n');await writeFile(canonical,'Edited store\n');
  await synchronizeInstructions(removeA,[a,b],state,'device',async()=>{});

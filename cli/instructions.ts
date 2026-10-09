@@ -261,8 +261,10 @@ async function recover(home: string, ledger: Ledger, archive?:RecoveryArchive) {
 }
 
 // expectedHash names the staged content, which differs from entry.hash when an
-// entry keeps an older baseline for local edits it still has to publish.
-async function replaceFile(home: string, ledger: Ledger, key: string, destination: string, stage: string, entry: Entry|Canonical, filename:InstructionFilename, skillId:string, archive:RecoveryArchive|undefined, canonical = false, expectedHash = entry.hash) {
+// entry keeps an older baseline for local edits it still has to publish. shared
+// entries name the same physical file and commit with this replacement.
+async function replaceFile(home: string, ledger: Ledger, key: string, destination: string, stage: string, entry: Entry|Canonical, filename:InstructionFilename, skillId:string, archive:RecoveryArchive|undefined,
+  {canonical = false, expectedHash = entry.hash, shared = {}}: {canonical?: boolean; expectedHash?: string; shared?: Record<string,Entry>} = {}) {
   const transaction = randomUUID();
   const old = destination + '.equip-old-' + transaction;
   const hadOld = Boolean(await lstat(destination).catch(() => null));
@@ -272,7 +274,7 @@ async function replaceFile(home: string, ledger: Ledger, key: string, destinatio
   await rename(stage,destination);
   entry.transaction = transaction;
   if (canonical) ledger.canonicals[key] = entry as Canonical;
-  else ledger.installs[key] = entry as Entry;
+  else Object.assign(ledger.installs,shared,{[key]:entry as Entry});
   try {await atomicJson(ledgerPath(home),ledger);}
   catch (error) {
     const persisted = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
@@ -363,7 +365,12 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         const relink = canonical?.exists && !canonical.pointer && current.portableHash === canonical.portableHash;
         // A materialized copy keeps the entry's baseline so its local edits stay publishable.
         const {stage,pointer} = relink ? await stageLink(entry.path,canonicalPath) : {stage:await stageFile(entry.path,current.files[0]),pointer:undefined};
-        try {await replaceFile(home,ledger,key,entry.path,stage,{...entry,pointer},entry.filename,entry.skillId,archive,false,relink ? canonical!.hash : current.hash);}
+        // Directory aliases of this file change with it; each keeps its own baseline.
+        const physical = await physicalPath(entry.path);
+        const shared: Record<string,Entry> = {};
+        for (const [otherKey,other] of Object.entries(ledger.installs))
+          if (otherKey !== key && !other.observed && await physicalPath(other.path) === physical) shared[otherKey] = {...other,pointer};
+        try {await replaceFile(home,ledger,key,entry.path,stage,{...entry,pointer},entry.filename,entry.skillId,archive,{expectedHash:relink ? canonical!.hash : current.hash,shared});}
         catch (error) {
           try {await recover(home,ledger,archive);await rm(stage,{force:true});}
           catch (recoveryError) {halted = recoveryError as Error;}
@@ -427,7 +434,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         const stage = canonicalPath + '.equip-stage-' + randomUUID();
         await writeFile(stage,doc.files[0].content,{mode:doc.files[0].mode ?? 0o644});
         await chmod(stage,doc.files[0].mode ?? 0o644);
-        await replaceFile(home,ledger,doc.id,canonicalPath,stage,{path:canonicalPath,hash:desiredHash,portableHash:desiredPortableHash,revision:doc.revision},doc.filename,doc.id,archive,true);
+        await replaceFile(home,ledger,doc.id,canonicalPath,stage,{path:canonicalPath,hash:desiredHash,portableHash:desiredPortableHash,revision:doc.revision},doc.filename,doc.id,archive,{canonical:true});
       } else {
         ledger.canonicals[doc.id] = {...previousCanonical,path:canonicalPath,hash:currentCanonical.hash,portableHash:desiredPortableHash,revision:doc.revision};
       }
