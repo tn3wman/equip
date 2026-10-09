@@ -56,3 +56,34 @@ test("receipt fingerprints ignore timestamps but include connection and desired 
     resolutions: { skill: "replace" },
   }, [receipt]));
 });
+
+test("atomic JSON writes retry while Windows holds the destination open", async (t) => {
+  const fs = await import("node:fs");
+  const { syncBuiltinESMExports } = await import("node:module");
+  const { renameReplacing } = await import("../cli/atomic.ts");
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  t.after(() => { Object.defineProperty(process, "platform", platform); syncBuiltinESMExports(); });
+  const sharingViolation = (code: string) => Object.assign(new Error(code), { code });
+  let calls = 0;
+  let failures = 0;
+  t.mock.method(fs.promises, "rename", async () => {
+    calls++;
+    if (failures-- > 0) throw sharingViolation("EPERM");
+  });
+  syncBuiltinESMExports();
+  Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+  failures = 2;
+  await renameReplacing("state.json.tmp", "state.json");
+  assert.equal(calls, 3, "two sharing violations, then the replacement lands");
+
+  calls = 0;
+  failures = Infinity;
+  await assert.rejects(renameReplacing("a", "b", 4), /EPERM/);
+  assert.equal(calls, 4, "a handle that never closes still fails");
+
+  Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+  calls = 0;
+  failures = 1;
+  await assert.rejects(renameReplacing("a", "b"), /EPERM/);
+  assert.equal(calls, 1, "other platforms fail immediately");
+});

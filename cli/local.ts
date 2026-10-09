@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { parse } from "yaml";
 import type { DesiredState, SkillFile } from "../shared/types.ts";
@@ -7,6 +7,7 @@ import { skillRevision } from "../shared/library.ts";
 import { fileHashes, sameInstalledFileHashes, portableFilesRevision } from "./file-state.ts";
 import { collectSkillFiles } from "./library.ts";
 import type { AgentTarget } from "./sync.ts";
+import { renameReplacing } from "./atomic.ts";
 
 export type LocalPublication = { name: string; files: SkillFile[]; sourcePath: string; baseRevision?: string; explicit?: boolean };
 export type PublishLocal = (skill: LocalPublication) => Promise<{ id: string; revision: string; changed: boolean }>;
@@ -31,6 +32,7 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
   const seen: Seen = JSON.parse(await readFile(seenPath, "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; }));
   const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8").catch(error => { if (error.code === "ENOENT") return '{"installs":{}}'; throw error; }));
   const known = new Map((desired.localSkills ?? desired.skills).map(s => [s.name, s]));
+  const retiredNames = new Set((desired.retiredSkills ?? []).map(skill => skill.name));
   const candidates = new Set<string>();
   const errors: string[] = [];
   for (const root of new Set([join(home, "skills"), ...targets.map(t => t.path)])) {
@@ -49,6 +51,9 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
     if (known.get(basename(path))?.kind === "third-party") continue;
     try {
       const local = await localSkill(path);
+      // A retained local copy is recovery material after account deletion.
+      // Only an explicit local add may publish this name again.
+      if (!known.has(local.name) && retiredNames.has(local.name)) continue;
       inspected.set(path, local);
       if (!known.has(local.name)) {
         const copies = newCopies.get(local.name) ?? new Set<string>();
@@ -103,6 +108,6 @@ export async function syncLocalSkills(home: string, targets: AgentTarget[], desi
   await mkdir(home, { recursive: true });
   const temporary = `${seenPath}.${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify(seen), { mode: 0o600 });
-  await rename(temporary, seenPath);
+  await renameReplacing(temporary, seenPath);
   return { changed, errors };
 }

@@ -176,6 +176,7 @@ export interface DesiredState {
   disconnect?: "retain" | "remove";
   localSync?: boolean;
   localSkills?: Array<Pick<Skill, "id" | "name" | "revision" | "kind">>;
+  retiredSkills?: Array<Pick<Skill, "id" | "name" | "revision">>;
   excludedAgents?: Array<{agent: string; profile?: string; project?: string}>;
 }
 export type InstructionFilename = "CLAUDE.md" | "AGENTS.md";

@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { promisify } from "node:util";
 import test from "node:test";
 import { createApp } from "../server/app.ts";
+
+const exec = promisify(execFile);
 
 test(
   "CLI completes device authorization and first sync against an isolated live server",
@@ -81,7 +84,7 @@ test(
       const child = spawn(
         process.execPath,
         bundled
-          ? [bundle, "connect", "--headless", "--once", "--server", base]
+          ? [bundle, "connect", "--headless", "--once", "--server", base, "--profile", "work"]
           : [
               "--import",
               "tsx",
@@ -91,6 +94,8 @@ test(
               "--once",
               "--server",
               base,
+              "--profile",
+              "work",
             ],
         {
           cwd: bundled ? tmpdir() : process.cwd(),
@@ -139,6 +144,25 @@ test(
         await readFile(join(root, "target/private-test/SKILL.md"), "utf8"),
         "---\nname: private-test\ndescription: Device-resolved source\n---\n# Private\n",
       );
+      const completedSync = state.lastSync;
+      await writeFile(join(root, "target/private-test/SKILL.md"), "local edit\n");
+      const failed = await exec(process.execPath, ["--import", "tsx", "cli/index.ts", "sync", "--profile", "work"], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          EQUIP_HOME: join(root, "client"),
+          EQUIP_AGENT_HOME: join(root, "fake-agent-home"),
+          EQUIP_TARGET: join(root, "target"),
+          EQUIP_AGENT: "codex",
+          EQUIP_SKILLS_ROOT: resolve("node_modules/skills"),
+          EQUIP_NO_SERVICE: "1",
+        },
+      }).then(() => undefined, error => error as { code?: number; stdout?: string; stderr?: string });
+      assert.equal(failed?.code, 1, `${failed?.stdout ?? ""}${failed?.stderr ?? ""}`);
+      assert.match(failed?.stdout ?? "", /conflicted\s+codex\//);
+      const failedState = JSON.parse(await readFile(join(root, "client/state.json"), "utf8"));
+      assert.equal(failedState.lastSync, completedSync, "lastSync remains the last complete synchronization");
+      assert.equal(failedState.lastError, "private-test at codex/work: Canonical skill changed locally and was preserved");
     } finally {
       await new Promise<void>((resolve) => proxy.close(() => resolve()));
       await new Promise<void>((resolve) => listener.close(() => resolve()));

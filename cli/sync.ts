@@ -14,7 +14,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileHashes, sameInstalledFileHashes } from "./file-state.ts";
 import { portableFilesRevision } from "./file-state.ts";
 import type {
@@ -24,6 +24,7 @@ import type {
   SkillFile,
 } from "../shared/types.ts";
 import type { RecoveryArchive } from "./recovery.ts";
+import { renameReplacing } from "./atomic.ts";
 
 export interface AgentTarget {
   id: string;
@@ -118,7 +119,7 @@ async function saveJsonAtomic(path: string, value: unknown, mode = 0o600) {
   await mkdir(dirname(path), { recursive: true });
   const temp = `${path}.${randomUUID()}.tmp`;
   await writeFile(temp, JSON.stringify(value, null, 2), { mode });
-  await rename(temp, path);
+  await renameReplacing(temp, path);
 }
 
 async function snapshot(
@@ -207,6 +208,47 @@ async function createManagedLink(source: string, destination: string) {
     ? source
     : relative(await realpath(dirname(destination)), await realpath(source));
   await symlink(target, destination, process.platform === "win32" ? "junction" : "dir");
+}
+
+// Windows rename (MoveFileExW) refuses an existing directory destination, and
+// managed links there are junctions. Move the old link aside under the
+// transaction journal so recovery can restore it; the caller records the
+// returned transactionId in the ledger and then removes oldPath (and obsoletePath,
+// which recovery also removes once the ledger shows the replacement committed).
+// POSIX replaces atomically, journaling only a migration's obsolete old root.
+async function promoteManagedLink(
+  home: string,
+  stage: string,
+  destination: string,
+  journal: Pick<Journal, "revision" | "skillId" | "expectedFiles" | "obsoletePath">,
+): Promise<{ oldPath?: string; transactionId?: string }> {
+  if (process.platform !== "win32" && !journal.obsoletePath) {
+    await rename(stage, destination);
+    return {};
+  }
+  const transactionId = randomUUID();
+  const oldPath = `${destination}.equip-old-${transactionId}`;
+  await saveJsonAtomic(join(home, "transaction.json"), {
+    destination,
+    stage,
+    oldPath,
+    hadOld: true,
+    transactionId,
+    ...journal,
+  } satisfies Journal);
+  if (process.platform !== "win32") {
+    await rename(stage, destination);
+    return { transactionId };
+  }
+  await rename(destination, oldPath);
+  try {
+    await rename(stage, destination);
+  } catch (error) {
+    // If this restore also fails, recovery restores oldPath from the journal.
+    await rename(oldPath, destination).catch(() => {});
+    throw error;
+  }
+  return { oldPath, transactionId };
 }
 
 async function archiveChanged(
@@ -383,6 +425,8 @@ async function install(
         localFiles: canonical.conflict.files,
       },
     };
+  const desired = desiredHashes(skill.files);
+  const linkJournal = { revision: skill.revision, skillId: skill.id, expectedFiles: canonical.hashes };
   const obsoletePath =
     previous?.path !== destination ? previous?.path : undefined;
   if (obsoletePath) {
@@ -414,6 +458,63 @@ async function install(
     const destinationSnapshot = destinationInfo?.isSymbolicLink()
       ? { files: [], hashes: { ".": "symlink" } }
       : await snapshot(destination);
+    if (previous?.canonicalPath && !previous.copied && oldInfo?.isSymbolicLink() &&
+        destinationInfo?.isSymbolicLink() &&
+        await pointsTo(obsoletePath, previous.canonicalPath)) {
+      const [oldTarget, destinationTarget, previousCanonicalTarget, canonicalTarget] =
+        await Promise.all([
+          realpath(obsoletePath).catch(() => undefined),
+          realpath(destination).catch(() => undefined),
+          realpath(previous.canonicalPath).catch(() => undefined),
+          realpath(canonical.path).catch(() => undefined),
+        ]);
+      let canonicalSnapshot = canonicalSnapshots.get(canonical.path);
+      if (!canonicalSnapshot) {
+        canonicalSnapshot = snapshot(canonical.path);
+        canonicalSnapshots.set(canonical.path, canonicalSnapshot);
+      }
+      if (oldTarget && oldTarget === destinationTarget &&
+          oldTarget === previousCanonicalTarget && oldTarget === canonicalTarget &&
+          !differs((await canonicalSnapshot).hashes, desired)) {
+        const [oldParent, destinationParent] = await Promise.all([
+          realpath(dirname(obsoletePath)).catch(() => undefined),
+          realpath(dirname(destination)).catch(() => undefined),
+        ]);
+        const sameDirectoryEntry = !!oldParent && oldParent === destinationParent &&
+          basename(obsoletePath) === basename(destination);
+        const stage = `${destination}.equip-stage-${randomUUID()}`;
+        await createManagedLink(canonical.path, stage);
+        let replaced: Awaited<ReturnType<typeof promoteManagedLink>>;
+        try {
+          const [stillOld, stillDestination] = await Promise.all([
+            realpath(obsoletePath).catch(() => undefined),
+            realpath(destination).catch(() => undefined),
+          ]);
+          if (stillOld !== oldTarget || stillDestination !== destinationTarget ||
+              !await pointsTo(obsoletePath, previous.canonicalPath))
+            throw new Error("Managed skill alias changed during synchronization and was preserved");
+          replaced = await promoteManagedLink(home, stage, destination,
+            sameDirectoryEntry ? linkJournal : { ...linkJournal, obsoletePath });
+        } catch (error) {
+          await rm(stage, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
+        return {
+          entry: {
+            ...previous,
+            path: destination,
+            revision: skill.revision,
+            files: canonical.hashes,
+            canonicalPath: canonical.path,
+            retainedFromCanonical: undefined,
+            transactionId: replaced.transactionId ?? canonical.transactionId ?? previous.transactionId,
+          },
+          oldPath: replaced.oldPath,
+          ...(sameDirectoryEntry ? {} : { obsoletePath }),
+          receipt: { ...base, status: "synchronized" },
+        };
+      }
+    }
     if (oldChanged || destinationInfo) {
       const conflictPath = destinationInfo ? destination : obsoletePath;
       const localFiles = destinationInfo
@@ -460,7 +561,6 @@ async function install(
     }
   }
   const rootInfo = await lstat(destination).catch(() => null);
-  const desired = desiredHashes(skill.files);
   let migratingObserved = false;
   let replacingChangedPointer = false;
   if (previous?.observed) {
@@ -528,10 +628,36 @@ async function install(
     }
   }
   if (!migratingObserved && !replacingChangedPointer && previous?.canonicalPath && previous.path === destination) {
-    const intact = previous.copied
+    let replaced: Awaited<ReturnType<typeof promoteManagedLink>> | undefined;
+    let intact = previous.copied
       ? !!rootInfo && !rootInfo.isSymbolicLink() &&
         !differs((await snapshot(destination)).hashes, previous.files)
       : await pointsTo(destination, previous.canonicalPath);
+    if (!intact && !previous.copied && rootInfo?.isSymbolicLink()) {
+      const [destinationTarget, previousCanonicalTarget] = await Promise.all([
+        realpath(destination).catch(() => undefined),
+        realpath(previous.canonicalPath).catch(() => undefined),
+      ]);
+      let canonicalSnapshot = canonicalSnapshots.get(previous.canonicalPath);
+      if (!canonicalSnapshot) {
+        canonicalSnapshot = snapshot(previous.canonicalPath);
+        canonicalSnapshots.set(previous.canonicalPath, canonicalSnapshot);
+      }
+      if (destinationTarget && destinationTarget === previousCanonicalTarget &&
+          !differs((await canonicalSnapshot).hashes, desired)) {
+        const stage = `${destination}.equip-stage-${randomUUID()}`;
+        await createManagedLink(canonical.path, stage);
+        try {
+          if (await realpath(destination).catch(() => undefined) !== previousCanonicalTarget)
+            throw new Error("Managed skill link changed during synchronization and was preserved");
+          replaced = await promoteManagedLink(home, stage, destination, linkJournal);
+        } catch (error) {
+          await rm(stage, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
+        intact = true;
+      }
+    }
     if (!intact) {
       if (action !== "replace")
         return {
@@ -582,10 +708,16 @@ async function install(
           receipt: { ...base, status: "synchronized" },
         };
       }
-      if (resolve(previous.canonicalPath) !== resolve(canonical.path)) {
+      // A normalized link above already points at the current canonical store.
+      if (!replaced && resolve(previous.canonicalPath) !== resolve(canonical.path)) {
         const stage = `${destination}.equip-stage-${randomUUID()}`;
         await createManagedLink(canonical.path, stage);
-        await rename(stage, destination);
+        try {
+          replaced = await promoteManagedLink(home, stage, destination, linkJournal);
+        } catch (error) {
+          await rm(stage, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
       }
       return {
         entry: {
@@ -594,8 +726,9 @@ async function install(
           files: canonical.hashes,
           canonicalPath: canonical.path,
           retainedFromCanonical: undefined,
-          transactionId: canonical.transactionId ?? previous.transactionId,
+          transactionId: replaced?.transactionId ?? canonical.transactionId ?? previous.transactionId,
         },
+        oldPath: replaced?.oldPath,
         receipt: { ...base, status: "synchronized" },
       };
     }
@@ -751,6 +884,45 @@ async function install(
   };
 }
 
+// One journal file records an interrupted replacement. Until it is recovered,
+// change nothing (a new journal would overwrite it) and fail every installation
+// and pending removal, so callers such as disconnect never treat the pass as done.
+async function unrecoveredReceipts(
+  desired: DesiredState,
+  targets: AgentTarget[],
+  home: string,
+  error: unknown,
+): Promise<Receipt[]> {
+  const journalPath = join(home, "transaction.json");
+  const journal = await readFile(journalPath, "utf8")
+    .then((text) => JSON.parse(text) as Journal).catch(() => undefined);
+  const path = journal?.destination ?? journalPath;
+  const message = `A previous replacement at ${path} could not be recovered: ${
+    error instanceof Error ? error.message : String(error)}; Equip will retry on the next sync.`;
+  const ledger = await loadLedger(home).catch((): Ledger => ({ generation: 0, installs: {} }));
+  const timestamp = new Date().toISOString();
+  const receipts: Receipt[] = [];
+  const keys = new Set<string>();
+  for (const target of targets) {
+    if (excludedDestination(desired, target)) continue;
+    for (const skill of desired.skills.filter((s) => s.enabled && enabledFor(s, target))) {
+      const key = keyFor(skill, target);
+      keys.add(key);
+      receipts.push({ skillId: skill.id, agent: target.id, profile: target.profile,
+        project: target.project, revision: ledger.installs[key]?.revision ?? "", status: "failed",
+        message, path: ledger.installs[key]?.path ?? join(target.path, skill.name), timestamp });
+    }
+  }
+  for (const [key, entry] of Object.entries(ledger.installs))
+    if (!keys.has(key) && !excludedDestination(desired, entry))
+      receipts.push({ skillId: entry.skillId, agent: entry.agent, profile: entry.profile,
+        project: entry.project, revision: entry.revision, status: "failed", message, path: entry.path, timestamp });
+  if (!receipts.length)
+    receipts.push({ skillId: journal?.skillId ?? "", agent: "", revision: journal?.revision ?? "",
+      status: "failed", message, path, timestamp });
+  return receipts;
+}
+
 export async function synchronize(
   desired: DesiredState,
   targets: AgentTarget[],
@@ -780,7 +952,11 @@ export async function synchronize(
     await lock.writeFile(
       JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
     );
-    await recover(home, archive);
+    try {
+      await recover(home, archive);
+    } catch (error) {
+      return await unrecoveredReceipts(desired, targets, home, error);
+    }
     const ledger = await loadLedger(home);
     const next: Ledger = {
       generation: ledger.generation,
@@ -819,6 +995,11 @@ export async function synchronize(
       if (process.platform === "win32") await recover(home,archive);
     }
     const receipts: Receipt[] = [];
+    // Set when an interrupted replacement could not be recovered: its journal is
+    // the only record of the moved-aside files, so nothing else may change this pass.
+    let halted: Error | undefined;
+    const haltedMessage = () =>
+      `Skills were not changed because an interrupted replacement could not be recovered: ${halted!.message}`;
     const canonicals = new Map<string, Promise<CanonicalState>>();
     const canonicalSnapshots = new Map<
       string,
@@ -833,6 +1014,12 @@ export async function synchronize(
         if (Object.values(ledger.installs).some(entry => entry.skillId === skill.id &&
           entry.path === destination && excludedDestination(desired, entry))) continue;
         const key = keyFor(skill, target);
+        if (halted) {
+          receipts.push({ skillId: skill.id, agent: target.id, profile: target.profile,
+            project: target.project, revision: ledger.installs[key]?.revision ?? "", status: "failed",
+            message: haltedMessage(), path: ledger.installs[key]?.path, timestamp: new Date().toISOString() });
+          continue;
+        }
         try {
           let canonical = canonicals.get(skill.id);
           if (!canonical) {
@@ -879,12 +1066,16 @@ export async function synchronize(
               await rm(result.oldPath, { recursive: true, force: true }).catch(
                 () => {},
               );
+            let obsoleteRemoved = true;
             if (result.obsoletePath)
               await rm(result.obsoletePath, {
                 recursive: true,
                 force: true,
-              }).catch(() => {});
-            if (result.oldPath || result.obsoletePath)
+              }).catch(() => { obsoleteRemoved = false; });
+            // A stranded old root stays journaled until recovery removes it.
+            if (!obsoleteRemoved)
+              await recover(home, archive).catch((error) => { halted = error; });
+            else if (result.oldPath || result.obsoletePath)
               await rm(join(home, "transaction.json"), { force: true }).catch(
                 () => {},
               );
@@ -893,7 +1084,7 @@ export async function synchronize(
         } catch (error) {
           if (ledger.installs[key]) next.installs[key] = ledger.installs[key];
           else delete next.installs[key];
-          await recover(home, archive).catch(() => {});
+          await recover(home, archive).catch((recoveryError) => { halted = recoveryError; });
           receipts.push({
             skillId: skill.id,
             agent: target.id,
@@ -908,7 +1099,7 @@ export async function synchronize(
         }
       }
     }
-    await recover(home, archive);
+    if (!halted) await recover(home, archive);
     const wanted = new Set(
       targets.flatMap((t) =>
         desired.skills
@@ -925,6 +1116,12 @@ export async function synchronize(
     for (const [key, old] of Object.entries(ledger.installs))
       if (!wanted.has(key)) {
         if (excludedDestination(desired, old)) continue;
+        if (halted) {
+          receipts.push({ skillId: old.skillId, agent: old.agent, profile: old.profile,
+            project: old.project, revision: old.revision, status: "failed",
+            message: haltedMessage(), path: old.path, timestamp: new Date().toISOString() });
+          continue;
+        }
         // Several upstream agents can intentionally use the same directory.
         // Release this destination rule without deleting another agent's link.
         if (Object.entries(next.installs).some(([otherKey, entry]) => otherKey !== key && wanted.has(otherKey) && entry.path === old.path)) {
@@ -1055,6 +1252,7 @@ export async function synchronize(
           });
         }
       }
+    if (halted) return receipts;
     next.generation = desired.generation;
     await saveJsonAtomic(join(home, "ledger.json"), next);
     // Different spellings can refer to the same store (e.g. /var and

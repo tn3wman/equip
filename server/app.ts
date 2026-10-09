@@ -1037,6 +1037,16 @@ export async function createApp(
     if (!skill) throw httpError(404, "Skill not found.");
     return skill;
   };
+  const retireSkill = (workspace: Workspace, skillId: string) => {
+    const index = workspace.skills.findIndex((skill) => skill.id === skillId);
+    if (index < 0) throw httpError(404, "Skill not found.");
+    const skill = workspace.skills[index];
+    workspace.retiredSkills ??= [];
+    workspace.retiredSkills.push({ ...skill, selected: false, enabled: false });
+    workspace.skills.splice(index, 1);
+    bump(workspace);
+    return skill;
+  };
   const findInstructions = (req: AuthedRequest) => {
     const document = (req.workspace!.instructions ?? []).find(item => item.id === req.params.id);
     if (!document) throw httpError(404, "Instructions not found.");
@@ -1518,14 +1528,7 @@ export async function createApp(
   app.delete(
     "/api/skills/:id",
     ...mutate((req) => {
-      const index = req.workspace!.skills.findIndex(
-        (s) => s.id === req.params.id,
-      );
-      if (index < 0) throw httpError(404, "Skill not found.");
-      req.workspace!.retiredSkills ??= [];
-      req.workspace!.retiredSkills.push({...req.workspace!.skills[index], selected:false, enabled:false});
-      req.workspace!.skills.splice(index, 1);
-      bump(req.workspace!);
+      retireSkill(req.workspace!, String(req.params.id));
       return { ok: true };
     }),
   );
@@ -1975,6 +1978,33 @@ export async function createApp(
     req.deviceId = row.device_id;
     next();
   };
+  app.delete(
+    "/api/device/skills/:id",
+    deviceIdentityAuth,
+    workspaceHandler(async (req: AuthedRequest, res) => {
+      const skill = req.workspace!.skills.find((item) => item.id === req.params.id);
+      if (!skill) throw httpError(404, "Skill not found.");
+      if (req.body?.expectedRevision !== skill.revision)
+        throw httpError(409, "The Equip revision changed. Review the skill again.");
+      const removed = retireSkill(req.workspace!, skill.id);
+      const device = req.workspace!.devices.find((item) => item.id === req.deviceId)!;
+      activity(req.workspace!, {
+        type: "remove",
+        title: `${removed.title} removed by ${device.name}`,
+        description: "Connected computers will remove unchanged managed installations.",
+        status: "pending",
+        deviceId: device.id,
+        skillId: removed.id,
+      });
+      await saveWorkspace(db, req.accountId!, req.workspace!);
+      res.json({
+        ok: true,
+        id: removed.id,
+        name: removed.name,
+        generation: req.workspace!.generation,
+      });
+    }),
+  );
   app.post(
     "/api/device/instructions/local",
     deviceIdentityAuth,
@@ -2076,6 +2106,8 @@ export async function createApp(
         if (typeof req.body?.sourcePath !== "string" || !req.body.sourcePath || req.body.sourcePath.length > 2048)
           throw httpError(400, "A local source path is required.");
         let skill = workspace.skills.find(s => s.name === metadata.name);
+        if (!skill && req.body?.explicit !== true && workspace.retiredSkills?.some(s => s.name === metadata.name))
+          throw httpError(409, "This skill was removed in Equip. Local files were preserved.");
         if (skill && !sameFiles(skill.files, files)) {
           if (skill.kind !== "custom")
             throw httpError(409, "This skill has a separate source. Import it under another name or resolve its local conflict.");
@@ -2346,6 +2378,7 @@ export async function createApp(
           excludedAgents: device.excludedAgents ?? [],
           localSync: device.localSync?.enabled ?? false,
           localSkills,
+          retiredSkills: (req.workspace!.retiredSkills ?? []).map(({id,name,revision}) => ({id,name,revision})),
         };
         res.json(desired);
       }, {readOnly: true});

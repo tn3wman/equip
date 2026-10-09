@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { chmod, cp, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import type { DesiredState, InstructionFilename, InstructionLocation, Instructions, Receipt, SkillFile } from '../shared/types.ts';
 import { skillRevision } from '../shared/library.ts';
 import { instructionEnabled, instructionKey } from '../shared/instructions.ts';
@@ -8,6 +8,7 @@ import { portableFilesRevision } from './file-state.ts';
 import { discoverConfigurationRoots, type ProfileDiscoveryOptions } from './profiles.ts';
 import type { RecoveryArchive } from './recovery.ts';
 import type { AgentTarget } from './sync.ts';
+import { renameReplacing } from './atomic.ts';
 
 const limit = 256 * 1024;
 interface Entry { skillId: string; agent: string; profile?: string; project?: string; path: string; filename: InstructionFilename; revision: string; hash: string; portableHash?: string; pointer?: string; observed?: boolean; originalBackup?: string; transaction?: string }
@@ -30,7 +31,7 @@ async function atomicJson(path: string, value: unknown) {
   await mkdir(dirname(path), { recursive: true });
   const temp = path + '.' + randomUUID() + '.tmp';
   await writeFile(temp, JSON.stringify(value, null, 2), {mode:0o600});
-  await rename(temp,path);
+  await renameReplacing(temp,path);
 }
 async function snapshot(path: string, filename: InstructionFilename) {
   const info = await lstat(path).catch(e => { if (e.code === 'ENOENT') return undefined; throw e; });
@@ -43,6 +44,98 @@ async function snapshot(path: string, filename: InstructionFilename) {
     throw new Error('Instructions must be UTF-8 text without NUL bytes; this file was preserved.');
   const files: SkillFile[] = [{path:filename, content:data.toString('utf8'), mode:resolved.mode & 0o777}];
   return {exists:true, files, hash:skillRevision(files), portableHash:portableFilesRevision(files), pointer:info.isSymbolicLink() ? await readlink(path) : undefined};
+}
+
+async function sameManagedInstruction(
+  home: string,
+  entry: Entry | undefined,
+  current: { pointer?: string },
+  path: string,
+) {
+  if (!entry || entry.observed || entry.path !== path || !entry.pointer || !current.pointer) return false;
+  const canonicalPath = join(home, 'instructions', entry.skillId, entry.filename);
+  const canonical = await lstat(canonicalPath).catch(() => undefined);
+  if (!canonical?.isFile() || canonical.isSymbolicLink()) return false;
+  const destination = await lstat(path).catch(() => undefined);
+  if (!destination?.isSymbolicLink()) return false;
+  const [destinationPath, managedPath] = await Promise.all([
+    realpath(path).catch(() => undefined),
+    realpath(canonicalPath).catch(() => undefined),
+  ]);
+  return destinationPath !== undefined && managedPath !== undefined && destinationPath === managedPath;
+}
+
+// Physical identity of a file: its parent directory resolved, so a directory alias
+// names the same location while the file itself may still be a link.
+async function physicalPath(path: string) {
+  return join(await realpath(dirname(path)).catch(() => resolve(dirname(path))), basename(path));
+}
+
+/** Physical identities of every link this path passes through, after the path itself. */
+async function linkTargets(path: string) {
+  const chain = [await physicalPath(path)];
+  while (chain.length < 40) {
+    const current = chain[chain.length-1];
+    const pointer = await readlink(current).catch(() => undefined);
+    if (pointer === undefined) break;
+    const next = await physicalPath(resolve(dirname(current),pointer));
+    if (chain.includes(next)) break;
+    chain.push(next);
+  }
+  return chain.slice(1);
+}
+
+async function stageLink(path: string, target: string) {
+  const stage = path + '.equip-stage-' + randomUUID();
+  try {await symlink(process.platform === 'win32' ? target : relative(await realpath(dirname(path)),await realpath(target)),stage,'file');}
+  catch (error) {
+    if (!['EPERM','EACCES','ENOTSUP','EINVAL'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+    await cp(target,stage);
+  }
+  return {stage, pointer:(await lstat(stage)).isSymbolicLink() ? await readlink(stage) : undefined};
+}
+
+async function stageFile(path: string, file: SkillFile) {
+  const stage = path + '.equip-stage-' + randomUUID();
+  await writeFile(stage,file.content,{mode:file.mode ?? 0o644});
+  await chmod(stage,file.mode ?? 0o644);
+  return stage;
+}
+
+async function materialize(path: string, file: SkillFile) {
+  await rename(await stageFile(path,file),path);
+}
+
+async function instructionRemovalOrder(installs: Record<string, Entry>) {
+  const entries = Object.entries(installs);
+  const keysByPath = new Map<string,string[]>();
+  for (const [key,entry] of entries) {
+    const path = await physicalPath(entry.path);
+    keysByPath.set(path,[...(keysByPath.get(path) ?? []),key]);
+  }
+  const targets = new Map<string,string[]>();
+  const incoming = new Map(entries.map(([key]) => [key,0]));
+  for (const [key,entry] of entries) {
+    const targetKeys = [...new Set((await linkTargets(entry.path)).flatMap(path => keysByPath.get(path) ?? []))]
+      .filter(targetKey => targetKey !== key);
+    if (!targetKeys.length) continue;
+    targets.set(key,targetKeys);
+    for (const targetKey of targetKeys) incoming.set(targetKey,(incoming.get(targetKey) ?? 0)+1);
+  }
+  const pending = entries.filter(([key]) => incoming.get(key) === 0);
+  const ordered: Array<[string,Entry]> = [];
+  const added = new Set<string>();
+  while (pending.length) {
+    const item = pending.shift()!;
+    const [key] = item;
+    if (added.has(key)) continue;
+    added.add(key);ordered.push(item);
+    for (const targetKey of targets.get(key) ?? []) {
+      const remaining = (incoming.get(targetKey) ?? 0)-1;incoming.set(targetKey,remaining);
+      if (remaining === 0) pending.push(entries.find(([candidate]) => candidate === targetKey)!);
+    }
+  }
+  return [...ordered,...entries.filter(([key]) => !added.has(key))];
 }
 
 export async function discoverInstructionLocations(targets: AgentTarget[], options: ProfileDiscoveryOptions & { autoDetect?: boolean } = {}): Promise<InstructionLocation[]> {
@@ -168,22 +261,28 @@ async function recover(home: string, ledger: Ledger, archive?:RecoveryArchive) {
   await rm(p,{force:true});
 }
 
-async function replaceFile(home: string, ledger: Ledger, key: string, destination: string, stage: string, entry: Entry|Canonical, filename:InstructionFilename, skillId:string, archive:RecoveryArchive|undefined, canonical = false) {
+// expectedHash names the staged content, which differs from entry.hash when an
+// entry keeps an older baseline for local edits it still has to publish. shared
+// entries name the same physical file and commit with this replacement.
+async function replaceFile(home: string, ledger: Ledger, key: string, destination: string, stage: string, entry: Entry|Canonical, filename:InstructionFilename, skillId:string, archive:RecoveryArchive|undefined,
+  {canonical = false, expectedHash = entry.hash, shared = {}}: {canonical?: boolean; expectedHash?: string; shared?: Record<string,Entry>} = {}) {
   const transaction = randomUUID();
   const old = destination + '.equip-old-' + transaction;
   const hadOld = Boolean(await lstat(destination).catch(() => null));
-  const journal: Transaction = {path:destination,stage,old,hadOld,id:transaction,key,skillId,filename,expectedHash:entry.hash,canonical};
+  const journal: Transaction = {path:destination,stage,old,hadOld,id:transaction,key,skillId,filename,expectedHash,canonical};
   await atomicJson(join(home,'instructions-transaction.json'),journal);
   if (hadOld) await rename(destination,old);
   await rename(stage,destination);
+  const uncommitted = {installs:{...ledger.installs},canonicals:{...ledger.canonicals}};
   entry.transaction = transaction;
   if (canonical) ledger.canonicals[key] = entry as Canonical;
-  else ledger.installs[key] = entry as Entry;
+  else Object.assign(ledger.installs,shared,{[key]:entry as Entry});
   try {await atomicJson(ledgerPath(home),ledger);}
   catch (error) {
-    const persisted = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
-    await recover(home,persisted,archive);
-    ledger.installs = persisted.installs;ledger.canonicals = persisted.canonicals;
+    // Restore the in-memory ledger first: recovery must see this replacement as
+    // uncommitted even when rollback fails and a caller retries recovery.
+    ledger.installs = uncommitted.installs;ledger.canonicals = uncommitted.canonicals;
+    await recover(home,ledger,archive);
     throw error;
   }
   await recover(home,ledger,archive);
@@ -204,7 +303,8 @@ export async function syncLocalInstructions(home: string, locations: Instruction
         const current = await snapshot(location.path,doc.filename);
         const desiredPortableHash = portableFilesRevision(doc.files);
         if (!current.exists || current.portableHash === desiredPortableHash) continue;
-        if (!entry || entry.revision !== doc.revision || current.pointer !== entry.pointer) unknown = true;
+        const samePointer = entry?.pointer === current.pointer || await sameManagedInstruction(home,entry,current,location.path);
+        if (!entry || entry.revision !== doc.revision || !samePointer) unknown = true;
         else if (entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash)
           candidates.push(current.files);
       } catch (error) {errors.push((error as Error).message);unknown = true;}
@@ -231,7 +331,32 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
   try {
     await lock.writeFile(JSON.stringify({pid:process.pid}));
     const ledger = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
-    await recover(home,ledger,archive);
+    const targetsFor = (doc: Instructions) => locations.filter(l =>
+      !excludedDestination(desired, l) && instructionEnabled(doc,l,deviceId) &&
+      !Object.values(ledger.installs).some(entry => entry.skillId === doc.id &&
+        entry.path === l.path && excludedDestination(desired,entry)));
+    // One journal file records an interrupted replacement. Until it is recovered,
+    // change nothing (a new journal would overwrite it) and fail every location
+    // and pending removal, so callers such as disconnect never treat the pass as done.
+    try {await recover(home,ledger,archive);}
+    catch (error) {
+      const journal = await json<Transaction|undefined>(join(home,'instructions-transaction.json'),undefined).catch(() => undefined);
+      const path = journal?.path ?? join(home,'instructions-transaction.json');
+      const message = `A previous replacement at ${path} could not be recovered: ${(error as Error).message}; Equip will retry on the next sync.`;
+      const timestamp = new Date().toISOString();
+      const keys = new Set<string>();
+      const receipts: Receipt[] = [];
+      for (const doc of desired.instructions ?? []) for (const location of targetsFor(doc)) {
+        const key = instructionKey(doc.id,location);keys.add(key);
+        receipts.push({kind:'instructions',skillId:doc.id,agent:location.agent,profile:location.profile,project:location.project,
+          path:location.path,revision:ledger.installs[key]?.revision ?? '',status:'failed',message,timestamp});
+      }
+      for (const [key,entry] of Object.entries(ledger.installs)) if (!keys.has(key) && !excludedDestination(desired,entry))
+        receipts.push({kind:'instructions',skillId:entry.skillId,agent:entry.agent,profile:entry.profile,project:entry.project,
+          path:entry.path,revision:entry.revision,status:'failed',message,timestamp});
+      if (!receipts.length) receipts.push({kind:'instructions',skillId:journal?.skillId ?? '',agent:'',path,revision:'',status:'failed',message,timestamp});
+      return receipts;
+    }
     // Retained destinations share one immutable snapshot for each old revision.
     for (const [key,entry] of Object.entries(ledger.installs)) {
       if (!excludedDestination(desired,entry) || !entry.pointer) continue;
@@ -243,13 +368,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         await writeFile(retainedStage,current.files[0].content,{mode:current.files[0].mode ?? 0o644});
         await rename(retainedStage,retained).catch(async error=>{await rm(retainedStage,{force:true});if(!await lstat(retained).catch(()=>null))throw error;});
       }
-      const stage = entry.path+'.equip-retained-'+randomUUID();
-      try {await symlink(process.platform==='win32'?retained:relative(await realpath(dirname(entry.path)),await realpath(retained)),stage,'file');}
-      catch (error) {
-        if (!['EPERM','EACCES','ENOTSUP','EINVAL'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-        await cp(retained,stage);
-      }
-      const stagedPointer=(await lstat(stage)).isSymbolicLink()?await readlink(stage):undefined;
+      const {stage,pointer:stagedPointer}=await stageLink(entry.path,retained);
       const retainedEntry={...entry,pointer:stagedPointer,hash:current.hash,portableHash:current.portableHash};
       if (process.platform==='win32' || !stagedPointer)
         await replaceFile(home,ledger,key,entry.path,stage,retainedEntry,entry.filename,entry.skillId,archive);
@@ -257,6 +376,47 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
     }
     const receipts: Receipt[] = [];
     const wanted = new Set<string>();
+    const released: Array<{path:string; filename:InstructionFilename}> = [];
+    // Set when a failed replacement could not be rolled back: its journal is the
+    // only record of the moved-aside file, so nothing else may change this pass.
+    let halted: Error|undefined;
+    const haltedMessage = () => `Instructions were not changed because an interrupted replacement could not be recovered: ${halted!.message}`;
+    // Locations reported earlier in this pass that name an unrecovered file, through
+    // any directory alias, no longer have it.
+    const failReceiptsAt = async (path: string) => {
+      const physical = await physicalPath(path);
+      for (const receipt of receipts)
+        if (receipt.kind === 'instructions' && receipt.path && await physicalPath(receipt.path) === physical)
+          Object.assign(receipt,{status:'failed',message:haltedMessage()});
+    };
+    // Removing a location must not leave a surviving link to it dangling: enabled
+    // managed locations link straight to the store, released ones keep a copy.
+    const detachFrom = async (removedKey: string, removedPath: string) => {
+      const removed = await physicalPath(removedPath);
+      for (const [key,entry] of Object.entries(ledger.installs)) {
+        if (key === removedKey || !wanted.has(key) || !(await linkTargets(entry.path)).includes(removed)) continue;
+        const current = await snapshot(entry.path,entry.filename);
+        const canonicalPath = join(home,'instructions',entry.skillId,entry.filename);
+        // Compare with the store as it is now, so a local store edit never reaches this location.
+        const canonical = await snapshot(canonicalPath,entry.filename).catch(() => undefined);
+        const relink = canonical?.exists && !canonical.pointer && current.portableHash === canonical.portableHash;
+        // A materialized copy keeps the entry's baseline so its local edits stay publishable.
+        const {stage,pointer} = relink ? await stageLink(entry.path,canonicalPath) : {stage:await stageFile(entry.path,current.files[0]),pointer:undefined};
+        // Directory aliases of this file change with it; each keeps its own baseline.
+        const physical = await physicalPath(entry.path);
+        const shared: Record<string,Entry> = {};
+        for (const [otherKey,other] of Object.entries(ledger.installs))
+          if (otherKey !== key && !other.observed && await physicalPath(other.path) === physical) shared[otherKey] = {...other,pointer};
+        try {await replaceFile(home,ledger,key,entry.path,stage,{...entry,pointer},entry.filename,entry.skillId,archive,{expectedHash:relink ? canonical!.hash : current.hash,shared});}
+        catch (error) {
+          try {await recover(home,ledger,archive);await rm(stage,{force:true});}
+          catch (recoveryError) {halted = recoveryError as Error;await failReceiptsAt(entry.path);}
+          throw error;
+        }
+      }
+      for (const {path,filename} of released)
+        if ((await linkTargets(path)).includes(removed)) await materialize(path,(await snapshot(path,filename)).files[0]);
+    };
     const selectedPaths = new Map<string,string>();
     const canonicalConflicts = new Map<string,SkillFile[]>();
     const docs = desired.instructions ?? [];
@@ -265,11 +425,16 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           doc.files.length !== 1 || doc.files[0].path !== doc.filename || doc.files[0].encoding ||
           Buffer.byteLength(doc.files[0].content) > limit || doc.files[0].content.includes('\0'))
         throw new Error('Invalid instruction document in desired state');
-      const targets = locations.filter(l =>
-        !excludedDestination(desired, l) && instructionEnabled(doc,l,deviceId) &&
-        !Object.values(ledger.installs).some(entry => entry.skillId === doc.id &&
-          entry.path === l.path && excludedDestination(desired,entry)));
+      const targets = targetsFor(doc);
       if (!targets.length) continue;
+      if (halted) {
+        for (const location of targets) {
+          const key = instructionKey(doc.id,location);wanted.add(key);
+          receipts.push({kind:'instructions',skillId:doc.id,agent:location.agent,profile:location.profile,project:location.project,
+            path:location.path,revision:ledger.installs[key]?.revision ?? '',status:'failed',message:haltedMessage(),timestamp:new Date().toISOString()});
+        }
+        continue;
+      }
       const canonicalPath = join(home,'instructions',doc.id,doc.filename);
       const desiredHash = skillRevision(doc.files);
       const desiredPortableHash = portableFilesRevision(doc.files);
@@ -311,7 +476,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         const stage = canonicalPath + '.equip-stage-' + randomUUID();
         await writeFile(stage,doc.files[0].content,{mode:doc.files[0].mode ?? 0o644});
         await chmod(stage,doc.files[0].mode ?? 0o644);
-        await replaceFile(home,ledger,doc.id,canonicalPath,stage,{path:canonicalPath,hash:desiredHash,portableHash:desiredPortableHash,revision:doc.revision},doc.filename,doc.id,archive,true);
+        await replaceFile(home,ledger,doc.id,canonicalPath,stage,{path:canonicalPath,hash:desiredHash,portableHash:desiredPortableHash,revision:doc.revision},doc.filename,doc.id,archive,{canonical:true});
       } else {
         ledger.canonicals[doc.id] = {...previousCanonical,path:canonicalPath,hash:currentCanonical.hash,portableHash:desiredPortableHash,revision:doc.revision};
       }
@@ -320,6 +485,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         wanted.add(key);
         const previous = ledger.installs[key] ?? Object.values(ledger.installs).find(e => e.skillId === doc.id && e.path === location.path && !e.observed);
         const base = {kind:'instructions' as const,skillId:doc.id,agent:location.agent,profile:location.profile,project:location.project,path:location.path,timestamp:new Date().toISOString()};
+        if (halted) {receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:haltedMessage()});continue;}
         try {
           if (selectedPaths.has(location.path) && selectedPaths.get(location.path) !== doc.id) throw new Error('Two instruction documents select the same file. Disable one or change its destinations.');
           selectedPaths.set(location.path,doc.id);
@@ -331,14 +497,15 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           }
           const canonicalConflict = canonicalConflicts.get(doc.id);
           if (action === 'preserve' || action === 'import') {
-            delete ledger.installs[key];
+            delete ledger.installs[key];released.push({path:location.path,filename:doc.filename});
             receipts.push({...base,instructionResolution:action,revision:previous?.revision ?? '',status:'conflicted',message:action === 'import' ? 'Imported local instructions and released management' : 'Preserved local instructions and released management',localFiles:current.files});continue;
           }
           if (canonicalConflict) {
             receipts.push({...base,revision:previous?.revision ?? '',status:'conflicted',message:'Equip instruction store changed locally and was preserved.',localFiles:canonicalConflict});continue;
           }
           const currentDesired = current.portableHash === desiredPortableHash;
-          const samePointer = !previous || previous.path === location.path && previous.pointer === current.pointer;
+          const samePointer = !previous || previous.path === location.path &&
+            (previous.pointer === current.pointer || await sameManagedInstruction(home,previous,current,location.path));
           const clean = previous && samePointer && (previous.portableHash
             ? current.portableHash === previous.portableHash
             : current.hash === previous.hash || currentDesired);
@@ -353,13 +520,8 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
             await mkdir(dirname(location.path),{recursive:true});
             if (current.exists && !currentDesired && !clean)
               await archiveFiles(archive,doc.id,current.files,location.path);
-            const stage = location.path + '.equip-stage-' + randomUUID();
-            try {await symlink(process.platform === 'win32' ? canonicalPath : relative(await realpath(dirname(location.path)),await realpath(canonicalPath)),stage,'file');}
-            catch (error) {
-              if (!['EPERM','EACCES','ENOTSUP','EINVAL'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-              await cp(canonicalPath,stage);
-            }
-            entry.pointer = (await lstat(stage)).isSymbolicLink() ? await readlink(stage) : undefined;
+            const {stage,pointer} = await stageLink(location.path,canonicalPath);
+            entry.pointer = pointer;
             entry.hash = desiredHash;
             await replaceFile(home,ledger,key,location.path,stage,entry,doc.filename,doc.id,archive);
           }
@@ -368,27 +530,45 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           receipts.push({...base,revision:doc.revision,status:shadowed ? 'failed' : 'synchronized',managed:!entry.observed,
             ...(action === 'replace' ? {instructionResolution:action} : {}),
             ...(shadowed ? {message:'Installed, but AGENTS.override.md takes precedence. Move or edit the override to use Equip instructions.'} : location.warning ? {message:location.warning} : {})});
-        } catch (error) {await recover(home,ledger,archive);receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:(error as Error).message});}
+        } catch (error) {
+          await recover(home,ledger,archive).catch(recoveryError => {halted = recoveryError as Error;});
+          if (halted) await failReceiptsAt(location.path);
+          receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:(error as Error).message});}
       }
     }
+    // Files that stay (wanted, excluded, preserved, or imported) can be another
+    // entry's file through a directory alias; that entry is released, not unlinked.
+    const kept: Array<[string,string]> = [];
+    for (const {path} of released) kept.push(['',await physicalPath(path)]);
     for (const [key,entry] of Object.entries(ledger.installs)) {
+      const action = desired.instructionResolutions?.[key];
+      if (wanted.has(key) || excludedDestination(desired,entry) || action === 'preserve' || action === 'import')
+        kept.push([key,await physicalPath(entry.path)]);
+    }
+    for (const [key,entry] of await instructionRemovalOrder(ledger.installs)) {
       if (wanted.has(key)) continue;
       if (excludedDestination(desired, entry)) continue;
       const base = {kind:'instructions' as const,skillId:entry.skillId,agent:entry.agent,profile:entry.profile,project:entry.project,path:entry.path,revision:entry.revision,timestamp:new Date().toISOString()};
+      if (halted) {receipts.push({...base,status:'failed',message:haltedMessage()});continue;}
       try {
-        if (Object.entries(ledger.installs).some(([k,e]) => k !== key && wanted.has(k) && e.path === entry.path)) {delete ledger.installs[key];continue;}
+        const physical = await physicalPath(entry.path);
+        if (kept.some(([k,path]) => k !== key && path === physical)) {delete ledger.installs[key];continue;}
         const current = await snapshot(entry.path,entry.filename);
         const action = desired.instructionResolutions?.[key];
         const checked = desired.instructionResolutionChecks?.[key];
+        const samePointer = current.pointer === entry.pointer || await sameManagedInstruction(home,entry,current,entry.path);
         if (checked && action && current.hash !== checked) {
           receipts.push({...base,status:'conflicted',localFiles:current.files,message:'Local instructions changed after review. Review the new version.'});continue;
         }
         if (!current.exists || entry.observed || action === 'preserve' || action === 'import') {
           delete ledger.installs[key];
+          if (action === 'preserve' || action === 'import') released.push({path:entry.path,filename:entry.filename});
           receipts.push({...base,status:action === 'preserve' || action === 'import' ? 'conflicted' : 'synchronized',...(action ? {instructionResolution:action} : {}),localFiles:action ? current.files : undefined,message:'Released instructions; preexisting or preserved files retained.'});
-        } else if ((entry.portableHash ? current.portableHash === entry.portableHash : current.hash === entry.hash) && current.pointer === entry.pointer || action === 'replace') {
-          if ((entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash) || current.pointer !== entry.pointer)
+        } else if ((entry.portableHash ? current.portableHash === entry.portableHash : current.hash === entry.hash) && samePointer || action === 'replace') {
+          if ((entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash) ||
+              !samePointer)
             await archiveFiles(archive,entry.skillId,current.files,entry.path);
+          await detachFrom(key,entry.path);
           await rm(entry.path,{force:true});
           delete ledger.installs[key];
           receipts.push({...base,status:'synchronized',...(action ? {instructionResolution:action} : {}),message:'Removed managed instructions.'});
@@ -396,6 +576,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
       } catch (error) {receipts.push({...base,status:'failed',message:(error as Error).message});}
     }
     await atomicJson(ledgerPath(home),ledger);
+    if (halted) return receipts;
     const retainedRoot=join(home,'retained','instructions');
     const referenced=new Set(await Promise.all(Object.values(ledger.installs).map(entry=>realpath(entry.path).catch(()=>''))));
     for(const documentDir of await readdir(retainedRoot,{withFileTypes:true}).catch(()=>[])) if(documentDir.isDirectory())

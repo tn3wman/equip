@@ -1,7 +1,8 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import type { DesiredState, Receipt } from "../shared/types.ts";
+import { renameReplacing } from "./atomic.ts";
 
 export interface ReceiptBatch {
   deviceId?: string;
@@ -41,5 +42,5 @@ export async function queueReceiptBatch(path: string, batch: ReceiptBatch) {
   await mkdir(dirname(path), { recursive: true });
   const stage = `${path}.${process.pid}.tmp`;
   await writeFile(stage, JSON.stringify(batch), { mode: 0o600 });
-  await rename(stage, path);
+  await renameReplacing(stage, path);
 }

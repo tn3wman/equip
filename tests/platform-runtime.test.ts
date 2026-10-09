@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile, rename } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile, rename } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -109,7 +109,7 @@ test("native first installer recovers from an interrupted package install", { ti
   try {
     await mkdir(tools, { recursive: true });
     const fakeNpm = join(tools, "fake-npm.cjs");
-    await writeFile(fakeNpm, `
+    await writeFile(fakeNpm, `#!/usr/bin/env node
 const fs=require('node:fs'),path=require('node:path');
 const args=process.argv.slice(2);
 fs.appendFileSync(process.env.EQUIP_NPM_LOG,JSON.stringify(args)+'\\n');
@@ -126,8 +126,8 @@ process.exit(2);
       await writeFile(join(tools, "npm.cmd"), `@echo off\r\n"${process.execPath}" "${fakeNpm}" %*\r\n`);
     } else {
       const npm = join(tools, "npm");
-      await writeFile(npm, `#!${process.execPath}\nrequire(${JSON.stringify(fakeNpm)});\n`, { mode: 0o755 });
-      await chmod(npm, 0o755);
+      await chmod(fakeNpm, 0o755);
+      await symlink(fakeNpm, npm);
     }
     const script = join(root, process.platform === "win32" ? "install.ps1" : "install.sh");
     await writeFile(script, process.platform === "win32" ? powershellInstaller(origin, "unused") : shellInstaller(origin, "unused"));
@@ -163,6 +163,16 @@ process.exit(2);
     const launches = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line));
     assert.deepEqual(launches.at(-1), { args: ["connect", "--headless", "--no-service"], server: origin });
     assert.ok((await stat(launcher)).isFile());
+    if (process.platform !== "win32") {
+      const launcherText = await readFile(launcher, "utf8");
+      const recordedNpm = launcherText.match(/^export EQUIP_NPM_CLI='([^']+)'$/m)?.[1];
+      assert.equal(recordedNpm, await realpath(fakeNpm));
+      const restrictedPath = join(root, "restricted-path");await mkdir(restrictedPath);
+      const result = await runNpmCommand(recordedNpm!, ["view", "skills@1.7.0", "dist.integrity", "--json"], {
+        env: {...process.env, PATH:restrictedPath, EQUIP_NPM_LOG:join(root,"restricted-npm.log")},
+      });
+      assert.equal(JSON.parse(result.stdout),integrity);
+    }
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });

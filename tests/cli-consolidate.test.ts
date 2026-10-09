@@ -67,6 +67,30 @@ test('the standard managed skill root becomes one canonical link and archives ge
   assert.equal((await readdir(agentHome,{recursive:true})).some(name=>String(name).includes('.equip-old-')),false);
 });
 
+async function legacyManagedRoot(t:any,withStore=true) {
+  const {home,agentHome}=await fixture(t);const item=skill();
+  const shared=join(agentHome,'.agents','skills',item.name),canonical=join(home,'skills',item.name);
+  await mkdir(shared,{recursive:true});await writeFile(join(shared,'SKILL.md'),item.files[0].content);
+  if (withStore) {await mkdir(canonical,{recursive:true});await writeFile(join(canonical,'SKILL.md'),item.files[0].content);}
+  await writeFile(join(home,'ledger.json'),JSON.stringify({installs:{managed:{skillId:item.id,path:shared,canonicalPath:canonical,revision:item.revision,files:{}}}}));
+  return {home,agentHome,item,shared};
+}
+
+for (const journal of ['transaction.json','instructions-transaction.json'])
+test(`consolidation waits while ${journal} records an unresolved replacement`,async t=>{
+  const {home,agentHome,item,shared}=await legacyManagedRoot(t);await writeFile(join(home,journal),'{}');
+  const result=await consolidate(home,agentHome,desired(item),async()=>{});
+  assert.equal(result.linked,0);assert.match(result.errors[0]??'',new RegExp(`waiting until the interrupted replacement recorded in .*${journal.replace('.','\\.')} is recovered`));
+  assert.equal((await lstat(shared)).isDirectory(),true);assert.equal(await readFile(join(shared,'SKILL.md'),'utf8'),item.files[0].content);
+});
+
+test('consolidation keeps a legacy directory when the Equip store is missing',async t=>{
+  const {home,agentHome,item,shared}=await legacyManagedRoot(t,false);
+  const result=await consolidate(home,agentHome,desired(item),async()=>{});
+  assert.equal(result.linked,0);assert.match(result.errors[0]??'',/Equip skill store is unavailable/);
+  assert.equal((await lstat(shared)).isDirectory(),true);assert.equal(await readFile(join(shared,'SKILL.md'),'utf8'),item.files[0].content);
+});
+
 test('unmanaged directories and redirected standard roots remain untouched',async t=>{
   const unmanaged=await fixture(t);const item=skill();
   const local=join(unmanaged.agentHome,'.agents','skills',item.name);

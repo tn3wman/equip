@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DesiredState } from "../shared/types.ts";
+import { renameReplacing } from "./atomic.ts";
 
 /** Cache is private to one connection. Unchanged polls never download skill files. */
 export async function getDesired(home: string, server: string, token: string) {
@@ -18,6 +19,6 @@ export async function getDesired(home: string, server: string, token: string) {
   await mkdir(home, { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify({ identity, etag: response.headers.get("etag"), desired }), { mode: 0o600 });
-  await rename(temporary, path);
+  await renameReplacing(temporary, path);
   return desired;
 }
