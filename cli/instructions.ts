@@ -8,6 +8,7 @@ import { portableFilesRevision } from './file-state.ts';
 import { discoverConfigurationRoots, type ProfileDiscoveryOptions } from './profiles.ts';
 import type { RecoveryArchive } from './recovery.ts';
 import type { AgentTarget } from './sync.ts';
+import { renameReplacing } from './atomic.ts';
 
 const limit = 256 * 1024;
 interface Entry { skillId: string; agent: string; profile?: string; project?: string; path: string; filename: InstructionFilename; revision: string; hash: string; portableHash?: string; pointer?: string; observed?: boolean; originalBackup?: string; transaction?: string }
@@ -30,7 +31,7 @@ async function atomicJson(path: string, value: unknown) {
   await mkdir(dirname(path), { recursive: true });
   const temp = path + '.' + randomUUID() + '.tmp';
   await writeFile(temp, JSON.stringify(value, null, 2), {mode:0o600});
-  await rename(temp,path);
+  await renameReplacing(temp,path);
 }
 async function snapshot(path: string, filename: InstructionFilename) {
   const info = await lstat(path).catch(e => { if (e.code === 'ENOENT') return undefined; throw e; });

@@ -4,6 +4,7 @@ import { dirname, join, relative } from 'node:path';
 import type { DesiredState, SkillFile } from '../shared/types.ts';
 import { portableFilesRevision } from './file-state.ts';
 import type { RecoveryArchive } from './recovery.ts';
+import { renameReplacing } from './atomic.ts';
 
 // Unlike import, recovery keeps generated files too. Never flatten nested links.
 async function filesAt(root: string, filename?: string): Promise<SkillFile[]> {
@@ -75,7 +76,7 @@ export async function consolidate(home: string, agentHome: string, desired: Desi
       for (const e of Object.values(instructionLedger.installs) as any[]) if(e.originalBackup === folder) {delete e.originalBackup;changed=true;}
       if (changed) {
         const temp = instructionLedgerPath+'.'+randomUUID()+'.tmp';
-        await writeFile(temp,JSON.stringify(instructionLedger),{mode:0o600});await rename(temp,instructionLedgerPath);
+        await writeFile(temp,JSON.stringify(instructionLedger),{mode:0o600});await renameReplacing(temp,instructionLedgerPath);
       }
       await rm(folder,{recursive:true});result.archived++;result.removedBackups++;
     } catch(error) {result.errors.push(`${folder}: ${(error as Error).message}`);}

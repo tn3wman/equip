@@ -24,6 +24,7 @@ import type {
   SkillFile,
 } from "../shared/types.ts";
 import type { RecoveryArchive } from "./recovery.ts";
+import { renameReplacing } from "./atomic.ts";
 
 export interface AgentTarget {
   id: string;
@@ -118,7 +119,7 @@ async function saveJsonAtomic(path: string, value: unknown, mode = 0o600) {
   await mkdir(dirname(path), { recursive: true });
   const temp = `${path}.${randomUUID()}.tmp`;
   await writeFile(temp, JSON.stringify(value, null, 2), { mode });
-  await rename(temp, path);
+  await renameReplacing(temp, path);
 }
 
 async function snapshot(

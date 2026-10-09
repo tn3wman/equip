@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -29,6 +29,7 @@ import { getDesired } from "./desired.ts";
 import { consolidate } from "./consolidate.ts";
 import type { RecoveryArchive } from "./recovery.ts";
 import { discoverInstructionLocations, supportedInstructionLocations, synchronizeInstructions, syncLocalInstructions } from "./instructions.ts";
+import { renameReplacing } from "./atomic.ts";
 
 const exec = promisify(execFile);
 const run = (file: string, commandArgs: string[]) => exec(file, commandArgs);
@@ -77,7 +78,7 @@ async function save(value: State) {
   const temporary = `${statePath}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, JSON.stringify(value, null, 2), { mode: 0o600 });
-    await rename(temporary, statePath);
+    await renameReplacing(temporary, statePath);
   } catch (error) {
     await rm(temporary, { force: true }).catch(() => {});
     throw error;
@@ -144,7 +145,7 @@ async function flushReceipts(s: State, base: string) {
     if (!batch.fingerprint) return;
     const temporary = `${receiptAckPath}.${randomUUID()}.tmp`;
     await writeFile(temporary, JSON.stringify({ fingerprint: batch.fingerprint }), { mode: 0o600 });
-    await rename(temporary, receiptAckPath);
+    await renameReplacing(temporary, receiptAckPath);
   });
 }
 async function postReceipts(
