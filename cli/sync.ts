@@ -214,13 +214,14 @@ async function createManagedLink(source: string, destination: string) {
 // transaction journal so recovery can restore it; the caller records the
 // returned transactionId in the ledger and then removes oldPath (and obsoletePath,
 // which recovery also removes once the ledger shows the replacement committed).
+// POSIX replaces atomically, journaling only a migration's obsolete old root.
 async function promoteManagedLink(
   home: string,
   stage: string,
   destination: string,
   journal: Pick<Journal, "revision" | "skillId" | "expectedFiles" | "obsoletePath">,
 ): Promise<{ oldPath?: string; transactionId?: string }> {
-  if (process.platform !== "win32") {
+  if (process.platform !== "win32" && !journal.obsoletePath) {
     await rename(stage, destination);
     return {};
   }
@@ -234,6 +235,10 @@ async function promoteManagedLink(
     transactionId,
     ...journal,
   } satisfies Journal);
+  if (process.platform !== "win32") {
+    await rename(stage, destination);
+    return { transactionId };
+  }
   await rename(destination, oldPath);
   try {
     await rename(stage, destination);
@@ -946,6 +951,11 @@ export async function synchronize(
       if (process.platform === "win32") await recover(home,archive);
     }
     const receipts: Receipt[] = [];
+    // Set when an interrupted replacement could not be recovered: its journal is
+    // the only record of the moved-aside files, so nothing else may change this pass.
+    let halted: Error | undefined;
+    const haltedMessage = () =>
+      `Skills were not changed because an interrupted replacement could not be recovered: ${halted!.message}`;
     const canonicals = new Map<string, Promise<CanonicalState>>();
     const canonicalSnapshots = new Map<
       string,
@@ -960,6 +970,12 @@ export async function synchronize(
         if (Object.values(ledger.installs).some(entry => entry.skillId === skill.id &&
           entry.path === destination && excludedDestination(desired, entry))) continue;
         const key = keyFor(skill, target);
+        if (halted) {
+          receipts.push({ skillId: skill.id, agent: target.id, profile: target.profile,
+            project: target.project, revision: ledger.installs[key]?.revision ?? "", status: "failed",
+            message: haltedMessage(), path: ledger.installs[key]?.path, timestamp: new Date().toISOString() });
+          continue;
+        }
         try {
           let canonical = canonicals.get(skill.id);
           if (!canonical) {
@@ -1006,12 +1022,16 @@ export async function synchronize(
               await rm(result.oldPath, { recursive: true, force: true }).catch(
                 () => {},
               );
+            let obsoleteRemoved = true;
             if (result.obsoletePath)
               await rm(result.obsoletePath, {
                 recursive: true,
                 force: true,
-              }).catch(() => {});
-            if (result.oldPath || result.obsoletePath)
+              }).catch(() => { obsoleteRemoved = false; });
+            // A stranded old root stays journaled until recovery removes it.
+            if (!obsoleteRemoved)
+              await recover(home, archive).catch((error) => { halted = error; });
+            else if (result.oldPath || result.obsoletePath)
               await rm(join(home, "transaction.json"), { force: true }).catch(
                 () => {},
               );
@@ -1020,7 +1040,7 @@ export async function synchronize(
         } catch (error) {
           if (ledger.installs[key]) next.installs[key] = ledger.installs[key];
           else delete next.installs[key];
-          await recover(home, archive).catch(() => {});
+          await recover(home, archive).catch((recoveryError) => { halted = recoveryError; });
           receipts.push({
             skillId: skill.id,
             agent: target.id,
@@ -1035,7 +1055,7 @@ export async function synchronize(
         }
       }
     }
-    await recover(home, archive);
+    if (!halted) await recover(home, archive);
     const wanted = new Set(
       targets.flatMap((t) =>
         desired.skills
@@ -1052,6 +1072,12 @@ export async function synchronize(
     for (const [key, old] of Object.entries(ledger.installs))
       if (!wanted.has(key)) {
         if (excludedDestination(desired, old)) continue;
+        if (halted) {
+          receipts.push({ skillId: old.skillId, agent: old.agent, profile: old.profile,
+            project: old.project, revision: old.revision, status: "failed",
+            message: haltedMessage(), path: old.path, timestamp: new Date().toISOString() });
+          continue;
+        }
         // Several upstream agents can intentionally use the same directory.
         // Release this destination rule without deleting another agent's link.
         if (Object.entries(next.installs).some(([otherKey, entry]) => otherKey !== key && wanted.has(otherKey) && entry.path === old.path)) {
@@ -1182,6 +1208,7 @@ export async function synchronize(
           });
         }
       }
+    if (halted) return receipts;
     next.generation = desired.generation;
     await saveJsonAtomic(join(home, "ledger.json"), next);
     // Different spellings can refer to the same store (e.g. /var and

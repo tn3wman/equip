@@ -1539,13 +1539,14 @@ test("on Windows a root migration replaces the duplicate alias junction through 
   assert.equal(entry.revision, "r2");
 });
 
-test("on Windows recovery removes the old root when a root migration stops after its ledger commit", async t => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "equip-win-root-crash-")));
+for (const platform of ["win32", "linux"] as const)
+test(`on ${platform === "win32" ? "Windows" : "POSIX"} recovery removes the old root when a root migration stops after its ledger commit`, async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "equip-root-crash-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
   const obsolete = join(oldRoot, "demo"), store = join(home, "skills/demo");
   let journalAtCommit: string | undefined;
-  await watchRenames(t, "win32", (_from, to) => {
+  await watchRenames(t, platform, (_from, to) => {
     if (to === join(home, "ledger.json") && existsSync(join(home, "transaction.json")))
       journalAtCommit = readFileSync(join(home, "transaction.json"), "utf8");
     return false;
@@ -1554,13 +1555,15 @@ test("on Windows recovery removes the old root when a root migration stops after
   await mkdir(newRoot);
   await symlink(store, join(newRoot, "demo"), "junction");
   const next = { ...desired([skill("two", "r2")]), generation: 2 };
+  journalAtCommit = undefined;
   assert.equal((await synchronize(next, [{ id: "pi", path: newRoot }], home))[0].status, "synchronized");
 
   // Recreate the state of a pass that stopped right after the ledger commit.
   assert.ok(journalAtCommit);
   await writeFile(join(home, "transaction.json"), journalAtCommit);
   await symlink(store, obsolete, "junction");
-  await symlink(store, JSON.parse(journalAtCommit).oldPath, "junction");
+  // Only Windows moves the replaced link aside.
+  if (platform === "win32") await symlink(store, JSON.parse(journalAtCommit).oldPath, "junction");
 
   const receipts = await synchronize(next, [{ id: "pi", path: newRoot }], home);
 
@@ -1569,6 +1572,73 @@ test("on Windows recovery removes the old root when a root migration stops after
   assert.deepEqual(await equipLeftovers(oldRoot, newRoot), []);
   await assert.rejects(lstat(join(home, "transaction.json")), /ENOENT/);
   assert.equal(await readFile(join(newRoot, "demo/SKILL.md"), "utf8"), "two");
+});
+
+test("a failed old-root deletion keeps the migration journal until recovery removes the old root", async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "equip-root-cleanup-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  const obsolete = join(oldRoot, "demo");
+  await watchRenames(t, "linux");
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  await mkdir(newRoot);
+  await symlink(join(home, "skills/demo"), join(newRoot, "demo"));
+  const realRm = fsPromises.rm;
+  let busy = true;
+  t.mock.method(fsPromises, "rm", async (path: string, options?: Parameters<typeof realRm>[1]) => {
+    if (busy && String(path) === obsolete)
+      throw Object.assign(new Error(`EBUSY: resource busy or locked, rm '${path}'`), { code: "EBUSY" });
+    return realRm(path, options);
+  });
+  syncBuiltinESMExports();
+  const next = { ...desired([skill("two", "r2")]), generation: 2 };
+
+  assert.equal((await synchronize(next, [{ id: "pi", path: newRoot }], home))[0].status, "synchronized");
+  assert.ok(await lstat(obsolete));
+  assert.equal(JSON.parse(await readFile(join(home, "transaction.json"), "utf8")).obsoletePath, obsolete);
+
+  busy = false;
+  const receipts = await synchronize(next, [{ id: "pi", path: newRoot }], home);
+
+  assert.equal(receipts[0].status, "synchronized", JSON.stringify(receipts));
+  await assert.rejects(lstat(obsolete), /ENOENT/);
+  await assert.rejects(lstat(join(home, "transaction.json")), /ENOENT/);
+});
+
+test("on Windows an unrecoverable junction promotion halts the pass and keeps its journal", async t => {
+  const fixture = await chainedAlias("equip-win-alias-halt-");
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const piPath = join(fixture.root, ".pi/skills"), piDestination = join(piPath, "demo");
+  const targets = [...fixture.targets, { id: "pi", path: piPath }];
+  let failures = 0;
+  await watchRenames(t, "win32", (from, to) => to === fixture.destination && failures > 0 &&
+    (from.includes(".equip-stage-") || from.includes(".equip-old-")) && failures-- > 0);
+  await synchronize(desired([skill("one")]), targets, fixture.home);
+  for (const destination of [fixture.destination, piDestination]) {
+    await rm(destination);
+    await symlink(fixture.intermediate, destination, "junction");
+  }
+  // Promotion, its immediate restore, and journal recovery all fail.
+  failures = 3;
+
+  const receipts = await synchronize(desired([skill("two", "r2")]), targets, fixture.home);
+
+  assert.equal(failures, 0);
+  assert.equal(receipts.find(receipt => receipt.agent === "claude-code")?.status, "failed", JSON.stringify(receipts));
+  const halted = receipts.find(receipt => receipt.agent === "pi");
+  assert.equal(halted?.status, "failed", JSON.stringify(receipts));
+  assert.match(halted?.message ?? "", /could not be recovered/);
+  assert.equal(await readlink(piDestination), fixture.intermediate, "no change after an unrecovered failure");
+  const journal = JSON.parse(await readFile(join(fixture.home, "transaction.json"), "utf8"));
+  assert.equal(journal.destination, fixture.destination);
+
+  const retried = await synchronize(desired([skill("two", "r2")]), targets, fixture.home);
+
+  assert.ok(retried.every(receipt => receipt.status === "synchronized"), JSON.stringify(retried));
+  for (const destination of [fixture.destination, piDestination])
+    assert.equal(await readlink(destination), join(fixture.home, "skills/demo"));
+  assert.deepEqual(await equipLeftovers(fixture.agentsPath, fixture.claudePath, piPath), []);
+  await assert.rejects(lstat(join(fixture.home, "transaction.json")), /ENOENT/);
 });
 
 test("on Windows an update normalizes a chained managed junction through the transaction journal", async t => {
