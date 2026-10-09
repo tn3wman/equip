@@ -115,6 +115,50 @@ test('removal deletes managed alias chains before their targets and preserves fo
  assert.equal(await lstat(b.path).catch(()=>null),null);assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await readlink(c.path),foreign);assert.equal(await readFile(foreign,'utf8'),'Original\n');
 });
 
+test('disabling one managed location re-points enabled aliases that link through it',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};const c={...a,profile:'third',path:join(root,'third/AGENTS.md')};
+ await mkdir(join(root,'other'));await mkdir(join(root,'third'));const policy=doc();await synchronizeInstructions(desired(policy),[a,b,c],state);
+ await symlink(join(root,'config'),join(root,'alias-root'));await rm(b.path);await symlink(a.path,b.path);await rm(c.path);await symlink(join(root,'alias-root/AGENTS.md'),c.path);
+ assert.ok((await synchronizeInstructions(desired(policy),[a,b,c],state)).every(receipt=>receipt.status==='synchronized'));
+ policy.targets=[{deviceId:'device',agent:a.agent,enabled:false},{deviceId:'device',agent:a.agent,profile:'other',enabled:true},{deviceId:'device',agent:a.agent,profile:'third',enabled:true}];
+ let receipts=await synchronizeInstructions(desired(policy),[a,b,c],state,'device');
+ assert.equal(receipts.length,3);assert.ok(receipts.every(receipt=>receipt.status==='synchronized'),JSON.stringify(receipts));
+ assert.equal(await lstat(a.path).catch(()=>null),null);
+ const canonical=await realpath(join(state,'instructions',policy.id,'AGENTS.md'));
+ for(const path of [b.path,c.path]){assert.equal(await readFile(path,'utf8'),policy.files[0].content);assert.equal(await realpath(path),canonical);}
+ receipts=await synchronizeInstructions(desired(policy),[a,b,c],state,'device');
+ assert.deepEqual(receipts.map(receipt=>[receipt.profile,receipt.status,receipt.revision]),[['other','synchronized',policy.revision],['third','synchronized',policy.revision]]);
+});
+
+test('a preserved alias keeps readable instructions when the location it links through is removed',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();
+ await synchronizeInstructions(desired(policy),[a,b],state);await rm(b.path);await symlink(a.path,b.path);await synchronizeInstructions(desired(policy),[a,b],state);
+ const receipts=await synchronizeInstructions({...desired(policy,{[instructionKey(policy.id,b)]:'preserve'}),instructions:[]},[a,b],state);
+ assert.equal(receipts.find(receipt=>receipt.profile==='other')?.instructionResolution,'preserve');assert.equal(receipts.find(receipt=>!receipt.profile)?.status,'synchronized');
+ assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await readFile(b.path,'utf8'),policy.files[0].content);
+ assert.deepEqual(JSON.parse(await readFile(join(state,'instructions-ledger.json'),'utf8')).installs,{});
+});
+
+test('removal deletes aliases that link through a directory alias before their targets',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();
+ await synchronizeInstructions(desired(policy),[a,b],state);await symlink(join(root,'config'),join(root,'alias-root'));await rm(b.path);await symlink(join(root,'alias-root/AGENTS.md'),b.path);
+ assert.ok((await synchronizeInstructions(desired(policy),[a,b],state)).every(receipt=>receipt.status==='synchronized'));
+ const receipts=await synchronizeInstructions({...desired(policy),instructions:[]},[a,b],state);
+ assert.equal(receipts.length,2);assert.ok(receipts.every(receipt=>receipt.status==='synchronized'),JSON.stringify(receipts));
+ assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await lstat(b.path).catch(()=>null),null);
+ assert.deepEqual(JSON.parse(await readFile(join(state,'instructions-ledger.json'),'utf8')).installs,{});
+});
+
+test('disabling a location keeps the file an enabled location reaches through a directory alias',async t=>{
+ const {root,state,a}=await fixture(t);await symlink(join(root,'config'),join(root,'config-alias'));const b={...a,profile:'alias',path:join(root,'config-alias/AGENTS.md')};const policy=doc();
+ await synchronizeInstructions(desired(policy),[a,b],state);
+ policy.targets=[{deviceId:'device',agent:a.agent,enabled:false},{deviceId:'device',agent:a.agent,profile:'alias',enabled:true}];
+ let receipts=await synchronizeInstructions(desired(policy),[a,b],state,'device');
+ assert.ok(receipts.every(receipt=>receipt.status==='synchronized'),JSON.stringify(receipts));assert.equal(await readFile(b.path,'utf8'),policy.files[0].content);
+ receipts=await synchronizeInstructions(desired(policy),[a,b],state,'device');
+ assert.deepEqual(receipts.map(receipt=>[receipt.profile,receipt.status]),[['alias','synchronized']]);
+});
+
 test('local publishing rejects a foreign link even when its content matches a managed edit',async t=>{
  const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();await synchronizeInstructions(desired(policy),[a,b],state);
  await writeFile(a.path,'Local\n');const foreign=join(root,'foreign.md');await writeFile(foreign,'Local\n');await rm(b.path);await symlink(foreign,b.path);let calls=0;
