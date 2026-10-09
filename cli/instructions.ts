@@ -273,14 +273,16 @@ async function replaceFile(home: string, ledger: Ledger, key: string, destinatio
   await atomicJson(join(home,'instructions-transaction.json'),journal);
   if (hadOld) await rename(destination,old);
   await rename(stage,destination);
+  const uncommitted = {installs:{...ledger.installs},canonicals:{...ledger.canonicals}};
   entry.transaction = transaction;
   if (canonical) ledger.canonicals[key] = entry as Canonical;
   else Object.assign(ledger.installs,shared,{[key]:entry as Entry});
   try {await atomicJson(ledgerPath(home),ledger);}
   catch (error) {
-    const persisted = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
-    await recover(home,persisted,archive);
-    ledger.installs = persisted.installs;ledger.canonicals = persisted.canonicals;
+    // Restore the in-memory ledger first: recovery must see this replacement as
+    // uncommitted even when rollback fails and a caller retries recovery.
+    ledger.installs = uncommitted.installs;ledger.canonicals = uncommitted.canonicals;
+    await recover(home,ledger,archive);
     throw error;
   }
   await recover(home,ledger,archive);
@@ -378,6 +380,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
     // Set when a failed replacement could not be rolled back: its journal is the
     // only record of the moved-aside file, so nothing else may change this pass.
     let halted: Error|undefined;
+    const haltedMessage = () => `Instructions were not changed because an interrupted replacement could not be recovered: ${halted!.message}`;
     // Removing a location must not leave a surviving link to it dangling: enabled
     // managed locations link straight to the store, released ones keep a copy.
     const detachFrom = async (removedKey: string, removedPath: string) => {
@@ -399,7 +402,12 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         try {await replaceFile(home,ledger,key,entry.path,stage,{...entry,pointer},entry.filename,entry.skillId,archive,{expectedHash:relink ? canonical!.hash : current.hash,shared});}
         catch (error) {
           try {await recover(home,ledger,archive);await rm(stage,{force:true});}
-          catch (recoveryError) {halted = recoveryError as Error;}
+          catch (recoveryError) {
+            halted = recoveryError as Error;
+            // These locations reported success earlier in this pass, but their file is now unrecovered.
+            for (const receipt of receipts) if (receipt.kind === 'instructions' && [key,...Object.keys(shared)].includes(instructionKey(receipt.skillId,receipt)))
+              Object.assign(receipt,{status:'failed',message:haltedMessage()});
+          }
           throw error;
         }
       }
@@ -416,6 +424,14 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         throw new Error('Invalid instruction document in desired state');
       const targets = targetsFor(doc);
       if (!targets.length) continue;
+      if (halted) {
+        for (const location of targets) {
+          const key = instructionKey(doc.id,location);wanted.add(key);
+          receipts.push({kind:'instructions',skillId:doc.id,agent:location.agent,profile:location.profile,project:location.project,
+            path:location.path,revision:ledger.installs[key]?.revision ?? '',status:'failed',message:haltedMessage(),timestamp:new Date().toISOString()});
+        }
+        continue;
+      }
       const canonicalPath = join(home,'instructions',doc.id,doc.filename);
       const desiredHash = skillRevision(doc.files);
       const desiredPortableHash = portableFilesRevision(doc.files);
@@ -466,6 +482,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         wanted.add(key);
         const previous = ledger.installs[key] ?? Object.values(ledger.installs).find(e => e.skillId === doc.id && e.path === location.path && !e.observed);
         const base = {kind:'instructions' as const,skillId:doc.id,agent:location.agent,profile:location.profile,project:location.project,path:location.path,timestamp:new Date().toISOString()};
+        if (halted) {receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:haltedMessage()});continue;}
         try {
           if (selectedPaths.has(location.path) && selectedPaths.get(location.path) !== doc.id) throw new Error('Two instruction documents select the same file. Disable one or change its destinations.');
           selectedPaths.set(location.path,doc.id);
@@ -510,7 +527,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           receipts.push({...base,revision:doc.revision,status:shadowed ? 'failed' : 'synchronized',managed:!entry.observed,
             ...(action === 'replace' ? {instructionResolution:action} : {}),
             ...(shadowed ? {message:'Installed, but AGENTS.override.md takes precedence. Move or edit the override to use Equip instructions.'} : location.warning ? {message:location.warning} : {})});
-        } catch (error) {await recover(home,ledger,archive);receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:(error as Error).message});}
+        } catch (error) {await recover(home,ledger,archive).catch(recoveryError => {halted = recoveryError as Error;});receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:(error as Error).message});}
       }
     }
     // Files that stay (wanted, excluded, preserved, or imported) can be another
@@ -526,7 +543,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
       if (wanted.has(key)) continue;
       if (excludedDestination(desired, entry)) continue;
       const base = {kind:'instructions' as const,skillId:entry.skillId,agent:entry.agent,profile:entry.profile,project:entry.project,path:entry.path,revision:entry.revision,timestamp:new Date().toISOString()};
-      if (halted) {receipts.push({...base,status:'failed',message:`Instructions were not changed because an interrupted replacement could not be recovered: ${halted.message}`});continue;}
+      if (halted) {receipts.push({...base,status:'failed',message:haltedMessage()});continue;}
       try {
         const physical = await physicalPath(entry.path);
         if (kept.some(([k,path]) => k !== key && path === physical)) {delete ledger.installs[key];continue;}

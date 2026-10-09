@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import type { DesiredState, SkillFile } from '../shared/types.ts';
 import { portableFilesRevision } from './file-state.ts';
@@ -28,6 +28,12 @@ async function filesAt(root: string, filename?: string): Promise<SkillFile[]> {
 /** Migrate only Equip backups and the standard local skill store, never repositories. */
 export async function consolidate(home: string, agentHome: string, desired: DesiredState, archive: RecoveryArchive) {
   const result = {linked:0, archived:0, removedBackups:0, errors:[] as string[]};
+  // An unresolved skill or instruction replacement can leave the Equip store incomplete.
+  for (const name of ['transaction.json','instructions-transaction.json'])
+    if (await lstat(join(home,name)).catch(() => null)) {
+      result.errors.push(`Consolidation is waiting until the interrupted replacement recorded in ${join(home,name)} is recovered.`);
+      return result;
+    }
   const journalPath = join(home,'consolidation-transaction.json');
   const journal = JSON.parse(await readFile(journalPath,'utf8').catch(e => {if(e.code==='ENOENT') return 'null';throw e;}));
   if (journal) {
@@ -94,6 +100,9 @@ export async function consolidate(home: string, agentHome: string, desired: Desi
     const entries = Object.values(ledger.installs).filter((e:any) => e.skillId === skill.id) as any[];
     if (!entries.length || entries.some(e => e.observed || e.canonicalPath !== canonical)) continue;
     try {
+      // Never replace a readable local copy with a link to a missing or unreadable store.
+      if (!(await stat(canonical).catch(() => null))?.isDirectory() || !await readdir(canonical).then(() => true, () => false))
+        throw new Error('The Equip skill store is unavailable; the local skill was retained.');
       const files = await filesAt(path);
       const before = portableFilesRevision(files);
       // Every variant is saved, including generated files omitted by an import.

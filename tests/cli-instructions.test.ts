@@ -237,6 +237,39 @@ test(`a failed survivor replacement is recovered before another removal${recover
  assert.deepEqual((await readdir(dirname(b.path))).filter(name=>name.includes('.equip-')),[]);
 });
 
+test('a failed ledger commit with a failed rollback halts without committing the replacement',async t=>{
+ const {root,state,a}=await fixture(t);await mkdir(join(root,'other'));await symlink(join(root,'other'),join(root,'other-alias'));const policy=doc();
+ const b={...a,profile:'other',path:join(root,'other/AGENTS.md')},c={...a,profile:'third',path:join(root,'other-alias/AGENTS.md')};
+ await synchronizeInstructions(desired(policy),[a,b,c],state);await rm(b.path);await symlink(a.path,b.path);await synchronizeInstructions(desired(policy),[a,b,c],state);
+ policy.targets=[{deviceId:'device',agent:a.agent,enabled:false},...['other','third'].map(profile=>({deviceId:'device',agent:a.agent,profile,enabled:true}))];
+ const ledgerPath=join(state,'instructions-ledger.json');
+ let ledgerFailures=1,blocked=true;const realRename=fsPromises.rename;
+ t.mock.method(fsPromises,'rename',async (from:string,to:string)=>{
+   if ((to===ledgerPath && ledgerFailures-- > 0) || (blocked && to===b.path && from.includes('.equip-old-')))
+     throw Object.assign(new Error('EBUSY: resource busy'),{code:'EBUSY'});
+   return realRename(from,to);
+ });
+ syncBuiltinESMExports();
+ t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+
+ const receipts=await synchronizeInstructions(desired(policy),[a,b,c],state,'device');
+
+ assert.deepEqual(receipts.map(receipt=>[receipt.profile,receipt.status]),[['other','failed'],['third','failed'],[undefined,'failed']],JSON.stringify(receipts));
+ assert.ok(await lstat(join(state,'instructions-transaction.json')),'the journal is kept');
+ assert.equal((await readdir(join(root,'other'))).filter(name=>name.includes('.equip-old-')).length,1,'the original link is kept for recovery');
+ const persisted=JSON.parse(await readFile(ledgerPath,'utf8')).installs;
+ for (const location of [b,c]) assert.equal(persisted[instructionKey(policy.id,location)].pointer,a.path,'the replacement is not committed');
+
+ blocked=false;
+ const retried=await synchronizeInstructions(desired(policy),[a,b,c],state,'device');
+
+ assert.ok(retried.every(receipt=>receipt.status==='synchronized'),JSON.stringify(retried));
+ for (const location of [b,c]) assert.equal(await readFile(location.path,'utf8'),policy.files[0].content);
+ assert.equal(await lstat(a.path).catch(()=>null),null);
+ await assert.rejects(lstat(join(state,'instructions-transaction.json')),/ENOENT/);
+ assert.deepEqual((await readdir(join(root,'other'))).filter(name=>name.includes('.equip-')),[]);
+});
+
 test('an instruction journal whose recovery keeps failing fails every location without changes until it recovers',async t=>{
  const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));
  const v1=doc();await synchronizeInstructions(desired(v1),[a,b],state);
