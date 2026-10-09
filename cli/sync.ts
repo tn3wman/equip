@@ -1000,6 +1000,9 @@ export async function synchronize(
     let halted: Error | undefined;
     const haltedMessage = () =>
       `Skills were not changed because an interrupted replacement could not be recovered: ${halted!.message}`;
+    // Old canonical folders left behind by a rename, with the content each
+    // installation last verified there.
+    const renamedCanonicals = new Map<string, Record<string, string>[]>();
     const canonicals = new Map<string, Promise<CanonicalState>>();
     const canonicalSnapshots = new Map<
       string,
@@ -1039,7 +1042,13 @@ export async function synchronize(
           const shared = Object.values(next.installs).find(entry =>
             entry.skillId === skill.id && entry.path === destination && entry.canonicalPath && !entry.observed);
           const previous = ledger.installs[key];
-          const sharedPrevious = shared && (!previous || previous.observed && previous.canonicalPath === shared.canonicalPath)
+          // Agents can share one skill root. When a sibling already owns the
+          // renamed folder and this agent's old folder is gone (the sibling
+          // moved it), adopt the sibling's installation instead of reporting
+          // the new name as occupied.
+          const siblingRenamed = !!shared && !!previous && !previous.observed && previous.path !== destination &&
+            !(await lstat(previous.path).catch(() => null));
+          const sharedPrevious = shared && (!previous || siblingRenamed || previous.observed && previous.canonicalPath === shared.canonicalPath)
             ? { ...shared, agent: target.id, profile: target.profile, project: target.project }
             : previous;
           const result = await install(
@@ -1057,8 +1066,19 @@ export async function synchronize(
             delete next.installs[key];
             await saveJsonAtomic(join(home, "ledger.json"), next);
           } else if (result.entry) {
-            const changed = JSON.stringify(next.installs[key]) !== JSON.stringify(result.entry);
-            next.installs[key] = result.entry;
+            const synchronized = result.receipt.status === "synchronized";
+            // An adoption that conflicts must not replace this agent's own record.
+            const entry = siblingRenamed && !synchronized ? previous! : result.entry;
+            const changed = JSON.stringify(next.installs[key]) !== JSON.stringify(entry);
+            next.installs[key] = entry;
+            // A completed rename leaves the old canonical folder behind. Only
+            // folders Equip created in its own store qualify: an observed or
+            // locally owned canonical path can be the user's source checkout.
+            if (synchronized && previous?.canonicalPath && !previous.observed && !previous.localOwned &&
+              dirname(resolve(previous.canonicalPath)) === resolve(home, "skills") &&
+              resolve(previous.canonicalPath) !== resolve(entry.canonicalPath ?? previous.canonicalPath))
+              renamedCanonicals.set(previous.canonicalPath,
+                [...(renamedCanonicals.get(previous.canonicalPath) ?? []), previous.files]);
             // A receipt is needed on each pass, but an unchanged installation
             // does not need another full ledger write for every agent.
             if (changed) await saveJsonAtomic(join(home, "ledger.json"), next);
@@ -1273,6 +1293,40 @@ export async function synchronize(
         !referenced.has(source) &&
         !protectedSources.has(source)
       )
+        await rm(path, { recursive: true, force: true });
+    }
+    // A released (preserved or imported) installation can still be a link to
+    // the old folder on a later sync, as can links Equip never managed. Treat
+    // anything that cannot be inspected as a link: only a missing agent
+    // directory is proof that nothing there uses the folder.
+    const linkedFromTarget = async (path: string, source: string) => {
+      for (const target of targets) {
+        let entries;
+        try { entries = await readdir(target.path, { withFileTypes: true }); }
+        catch (error: any) {
+          if (error?.code === "ENOENT" || error?.code === "ENOTDIR") continue;
+          return true;
+        }
+        for (const entry of entries) {
+          if (!entry.isSymbolicLink()) continue;
+          const link = join(target.path, entry.name);
+          const pointer = await readlink(link).catch(() => undefined);
+          if (pointer === undefined) return true;
+          const direct = resolve(target.path, pointer);
+          if (direct === resolve(path) || direct === source) return true;
+          const real = await realpath(link).catch((error) => error?.code === "ENOENT" ? undefined : null);
+          if (real === null || real === source) return true;
+        }
+      }
+      return false;
+    };
+    for (const [path, baselines] of renamedCanonicals) {
+      const source = await identity(path);
+      if (referenced.has(source) || protectedSources.has(source) || await linkedFromTarget(path, source)) continue;
+      // Keep anything edited since Equip last verified it; only an untouched
+      // copy of the previous revision is safe to delete without archiving.
+      const current = await snapshot(path).catch(() => null);
+      if (current && baselines.every((baseline) => !differs(current.hashes, baseline)))
         await rm(path, { recursive: true, force: true });
     }
     const retainedRoot = join(home,"retained","skills");

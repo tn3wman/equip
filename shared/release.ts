@@ -1,5 +1,5 @@
 export const RELEASE_MANIFEST_SCHEMA = 1 as const;
-export const CLI_RELEASE_VERSION = "1.1.6";
+export const CLI_RELEASE_VERSION = "1.1.7";
 export const CLI_NODE_REQUIREMENT = ">=22.20.0";
 
 export type ReleaseManifestPayload = {
