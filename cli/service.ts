@@ -1,7 +1,7 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, platform as hostPlatform } from "node:os";
 import { dirname, join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 
 const xml = (value: string) =>
@@ -13,6 +13,30 @@ const xml = (value: string) =>
     .replace(/'/g, "&apos;");
 const systemd = (value: string) => `"${value.replace(/([\\"])/g, "\\$1")}"`;
 const windows = (value: string) => `"${value.replace(/"/g, '""')}"`;
+// PowerShell also treats typographic single quotes as quote characters.
+const powershell = (value: string) => `'${value.replace(/['\u2018-\u201b]/g, "$&$&")}'`;
+// Older Windows installs registered this script. Remove once no recorded
+// service path ends with it (every such install has upgraded or reconnected).
+const legacyWindowsScript = "equip-worker.cmd";
+/** Whether the worker starts at boot without a login, or only at logon. */
+export type ServiceMode = "startup" | "logon";
+export interface ServiceRecord {
+  path: string;
+  label: string;
+  mode?: ServiceMode;
+}
+export interface ServiceDefinition {
+  os: NodeJS.Platform;
+  label: string;
+  path: string;
+  content: string;
+  /** Required registration; failure means no worker. */
+  enableCommands: string[][];
+  /** Makes the worker start at boot; platforms without them record no mode. */
+  bootCommands?: string[][];
+  /** Logon-only registration when bootCommands are refused (Windows refuses S4U to some non-elevated users). */
+  fallbackCommands?: string[][];
+}
 export interface ServiceOptions {
   platform?: NodeJS.Platform;
   home?: string;
@@ -43,7 +67,7 @@ export async function serviceDefinition(
   equipHome: string,
   server: string,
   options: ServiceOptions = {},
-) {
+): Promise<ServiceDefinition> {
   const os = options.platform ?? hostPlatform();
   const home = options.home ?? homedir();
   const node = options.nodePath ?? process.execPath;
@@ -109,33 +133,51 @@ export async function serviceDefinition(
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", unit],
       ],
+      // Lingering keeps the user manager, and this unit, running across reboots without a login.
+      bootCommands: [["loginctl", "enable-linger"]],
     };
   }
   if (os === "win32") {
     const task = `Equip Sync ${suffix}`;
-    const path = join(equipHome, "equip-worker.cmd");
+    // New name: upgrades must never rewrite the legacy script, because a
+    // running cmd.exe rereads its batch file by byte offset.
+    const path = join(equipHome, "equip-service.cmd");
     const optional = optionalEnvironment
       .filter((entry) => entry[1])
       .map(([key, value]) => `set "${key}=${value}"\r\n`)
       .join("");
-    const content = `@echo off\r\nset "EQUIP_HOME=${equipHome}"\r\nset "EQUIP_SERVER=${server}"\r\nset "EQUIP_SKILLS_ROOT=${skillsRoot}"\r\n${optional}${windows(node)} ${windows(command)} worker\r\n`;
+    // Git credential helpers must fail fast when the worker has no interactive session.
+    const content = `@echo off\r\nset "EQUIP_HOME=${equipHome}"\r\nset "EQUIP_SERVER=${server}"\r\nset "EQUIP_SKILLS_ROOT=${skillsRoot}"\r\nset "GCM_INTERACTIVE=never"\r\nset "GIT_TERMINAL_PROMPT=0"\r\n${optional}${windows(node)} ${windows(command)} worker\r\n`;
+    // S4U with an AtStartup trigger runs the worker after a reboot with nobody logged on.
+    const script = [
+      "$ErrorActionPreference='Stop'",
+      "$me=[Security.Principal.WindowsIdentity]::GetCurrent().Name",
+      `$action=New-ScheduledTaskAction -Execute ${powershell(windows(path))}`,
+      "$triggers=@((New-ScheduledTaskTrigger -AtStartup),(New-ScheduledTaskTrigger -AtLogOn -User $me))",
+      "$principal=New-ScheduledTaskPrincipal -UserId $me -LogonType S4U -RunLevel Limited",
+      "$settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)",
+      `Register-ScheduledTask -TaskName ${powershell(task)} -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null`,
+      // Registration is the commitment; a failed start waits for the next boot or logon.
+      `try { Start-ScheduledTask -TaskName ${powershell(task)} } catch {}`,
+    ].join("\n");
     return {
       os,
       label,
       path,
       content,
-      enableCommands: [
+      // The boot task and the logon task are alternatives; there is no base registration.
+      enableCommands: [],
+      bootCommands: [
         [
-          "schtasks",
-          "/Create",
-          "/F",
-          "/SC",
-          "ONLOGON",
-          "/TN",
-          task,
-          "/TR",
-          path,
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-EncodedCommand",
+          Buffer.from(script, "utf16le").toString("base64"),
         ],
+      ],
+      fallbackCommands: [
+        ["schtasks", "/Create", "/F", "/SC", "ONLOGON", "/TN", task, "/TR", windows(path)],
         ["schtasks", "/Run", "/TN", task],
       ],
     };
@@ -143,28 +185,180 @@ export async function serviceDefinition(
   throw new Error(`Background service is unsupported on ${os}`);
 }
 
-export async function writeService(
-  command: string,
+type Run = (file: string, args: string[]) => Promise<unknown>;
+async function runAll(commands: string[][], run: Run) {
+  for (const [file, ...args] of commands) await run(file, args);
+}
+/** Registers and starts the worker; returns undefined where boot start does not apply. */
+export async function enableService(
+  definition: ServiceDefinition,
+  run: Run,
+): Promise<ServiceMode | undefined> {
+  await runAll(definition.enableCommands, run);
+  if (!definition.bootCommands) return undefined;
+  try {
+    await runAll(definition.bootCommands, run);
+    return "startup";
+  } catch {
+    if (definition.fallbackCommands)
+      await runAll(definition.fallbackCommands, run);
+    return "logon";
+  }
+}
+/**
+ * Serializes service lifecycle changes (install, upgrade, disconnect) across
+ * processes through `service.lock`. With `wait`, polls until the lock is free;
+ * otherwise returns undefined without running `work` while another live
+ * process holds it. A lock file stays empty for a moment after creation, so
+ * an empty one counts as held until it is stale. Each holder releases only the
+ * lock carrying its own token.
+ */
+export async function withServiceLock<T>(
   equipHome: string,
-  server: string,
+  work: () => Promise<T>,
+  wait = false,
+): Promise<T | undefined> {
+  const path = join(equipHome, "service.lock");
+  const token = randomUUID();
+  await mkdir(equipHome, { recursive: true });
+  const deadline = Date.now() + 120_000;
+  let lock;
+  while (!lock) {
+    lock = await open(path, "wx", 0o600).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+      return undefined;
+    });
+    if (lock) break;
+    // The holder may release between the failed open and these reads; retry.
+    const observed = await Promise.all([readFile(path, "utf8"), stat(path)]).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      },
+    );
+    if (!observed) continue;
+    const [owner, info] = observed;
+    // Empty or partial contents mean unknown ownership: held until stale.
+    let pid = 0;
+    try {
+      pid = Number(JSON.parse(owner).pid) || 0;
+    } catch {}
+    if (!(pid ? isAlive(pid) : Date.now() - info.mtimeMs < 60_000)) {
+      // Reclaim only the stale file observed above. Two processes reclaiming
+      // a crashed holder's lock in the same instant could still both proceed.
+      const current = await stat(path).catch(() => undefined);
+      if (current?.ino === info.ino && current.mtimeMs === info.mtimeMs)
+        await rm(path, { force: true });
+      continue;
+    }
+    if (!wait) return undefined;
+    if (Date.now() > deadline)
+      throw new Error("Another Equip service change is still running; try again.");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  try {
+    await lock.writeFile(JSON.stringify({ pid: process.pid, token }));
+    return await work();
+  } finally {
+    await lock.close();
+    const holder = await readFile(path, "utf8").catch(() => "");
+    if (holder.includes(token)) await rm(path, { force: true });
+  }
+}
+function isAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/**
+ * Moves a recorded service to boot-time start by running only the boot
+ * commands. The worker tries once for services recorded before modes existed;
+ * `retryLogon` (used by `equip connect`, which runs in a login session that
+ * Linux lingering may require) also retries services recorded as logon-only.
+ *
+ * Runs under the service lifecycle lock (skipping while another change holds
+ * it) and reads the record inside it. A Windows
+ * task still pointing at an older script is re-pointed at a new script that is
+ * published once and never rewritten, since a registered task or a running
+ * cmd.exe may be using it. The older script stays until disconnect removes
+ * both, so a stale record naming it still identifies an owned service.
+ * When `save` rejects the record (the computer was disconnected meanwhile),
+ * `remove` unregisters what this attempt registered.
+ */
+export async function upgradeRecordedService(options: {
+  equipHome: string;
+  definition: () => Promise<ServiceDefinition>;
+  load: () => Promise<ServiceRecord | undefined>;
+  save: (record: ServiceRecord) => Promise<boolean>;
+  remove: () => Promise<void>;
+  run: Run;
+  retryLogon?: boolean;
+}): Promise<ServiceRecord | undefined> {
+  return withServiceLock(options.equipHome, async () => {
+    const current = await options.load();
+    if (!current || current.mode === "startup") return current;
+    if (current.mode === "logon" && !options.retryLogon) return current;
+    const definition = await options.definition();
+    if (!definition.bootCommands) return current;
+    if (definition.os === "win32" && definition.path !== current.path)
+      await publishService(definition, options.equipHome);
+    let record: ServiceRecord;
+    try {
+      await runAll(definition.bootCommands, options.run);
+      record = { path: definition.path, label: current.label, mode: "startup" };
+    } catch {
+      record = { ...current, mode: "logon" };
+    }
+    if (await options.save(record)) return record;
+    if (record.mode === "startup") await options.remove();
+    return undefined;
+  });
+}
+
+/**
+ * Publishes the service script atomically unless a complete, owned one
+ * already exists; an existing script is never rewritten.
+ */
+async function publishService(definition: ServiceDefinition, equipHome: string) {
+  await mkdir(dirname(definition.path), { recursive: true });
+  const temporary = `${definition.path}.${randomUUID()}.tmp`;
+  await writeFile(temporary, definition.content, { mode: 0o700 });
+  try {
+    await link(temporary, definition.path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const existing = await readFile(definition.path, "utf8");
+    if (!existing.includes(equipHome) || !existing.trimEnd().endsWith(" worker"))
+      throw new Error(`Refusing to use incomplete or unowned service ${definition.path}`);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+export async function writeService(
+  definition: ServiceDefinition,
+  equipHome: string,
 ) {
-  const definition = await serviceDefinition(command, equipHome, server);
   const existing = await readFile(definition.path, "utf8").catch(() => "");
   if (existing && !existing.includes(equipHome))
     throw new Error(`Refusing to overwrite unowned service ${definition.path}`);
   await mkdir(dirname(definition.path), { recursive: true });
   await writeFile(definition.path, definition.content, { mode: 0o700 });
-  return definition;
 }
 export async function serviceRemoval(
   command: string,
   equipHome: string,
   server: string,
+  options: ServiceOptions = {},
 ) {
-  const definition = await serviceDefinition(command, equipHome, server);
+  const definition = await serviceDefinition(command, equipHome, server, options);
   if (definition.os === "darwin")
     return {
-      path: definition.path,
+      paths: [definition.path],
       label: definition.label,
       commands: [
         ["launchctl", "bootout", `gui/${process.getuid?.()}`, definition.path],
@@ -172,7 +366,7 @@ export async function serviceRemoval(
     };
   if (definition.os === "linux")
     return {
-      path: definition.path,
+      paths: [definition.path],
       label: definition.label,
       commands: [
         [
@@ -186,7 +380,8 @@ export async function serviceRemoval(
       ],
     };
   return {
-    path: definition.path,
+    // The task name is unchanged, so one delete removes either registration.
+    paths: [definition.path, join(dirname(definition.path), legacyWindowsScript)],
     label: definition.label,
     commands: [
       [

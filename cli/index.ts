@@ -16,7 +16,7 @@ import {
   getDetectedAgents,
   resolveSkill,
 } from "../shared/upstream.ts";
-import { serviceRemoval, writeService } from "./service.ts";
+import { enableService, serviceDefinition, serviceRemoval, upgradeRecordedService, withServiceLock, writeService, type ServiceRecord } from "./service.ts";
 import { flushReceiptOutbox, queueReceiptBatch, receiptBatchFingerprint } from "./outbox.ts";
 import { synchronize, type AgentTarget } from "./sync.ts";
 import { retainedConfiguredTargets, selectAgentTargets } from "./targets.ts";
@@ -31,6 +31,7 @@ import type { RecoveryArchive } from "./recovery.ts";
 import { discoverInstructionLocations, supportedInstructionLocations, synchronizeInstructions, syncLocalInstructions } from "./instructions.ts";
 
 const exec = promisify(execFile);
+const run = (file: string, commandArgs: string[]) => exec(file, commandArgs);
 const args = process.argv.slice(2);
 const command = args.shift() ?? "status";
 const option = (name: string) => {
@@ -60,7 +61,7 @@ type State = {
   name?: string;
   targets?: AgentTarget[];
   autoDetect?: boolean;
-  service?: { path: string; label: string };
+  service?: ServiceRecord;
   profile?: string;
   project?: string;
   lastSync?: string;
@@ -83,12 +84,15 @@ async function save(value: State) {
 }
 async function saveWorkerFields(
   basis: State,
-  fields: Pick<State, "lastSync" | "lastError" | "lastUpdateCheck">,
+  fields: Pick<State, "lastSync" | "lastError" | "lastUpdateCheck" | "service">,
 ) {
   const latest = await state();
-  if (latest.deviceId !== basis.deviceId || latest.token !== basis.token)
-    return;
+  if (!sameConnection(latest, basis)) return false;
   await save({ ...latest, ...fields });
+  return true;
+}
+function sameConnection(a: State, b: State) {
+  return a.deviceId === b.deviceId && a.token === b.token;
 }
 async function acknowledgedReceiptFingerprint() {
   return readFile(receiptAckPath, "utf8")
@@ -217,19 +221,23 @@ async function stopService(s: State) {
     equipHome,
     s.server || server,
   ).catch(() => null);
+  const path = s.service.path;
   if (
     !removal ||
-    removal.path !== s.service.path ||
+    !removal.paths.includes(path) ||
     removal.label !== s.service.label
   )
     return;
-  const owned = await readFile(removal.path, "utf8")
-    .then((content) => content.includes(equipHome))
-    .catch(() => false);
-  if (!owned) return;
+  const owned = (file: string) =>
+    readFile(file, "utf8")
+      .then((content) => content.includes(equipHome))
+      .catch(() => false);
+  if (!(await owned(path))) return;
   for (const command of removal.commands)
     await exec(command[0], command.slice(1)).catch(() => {});
-  await rm(removal.path, { force: true });
+  // Windows keeps the pre-upgrade script beside the current one until here.
+  for (const file of removal.paths)
+    if (await owned(file)) await rm(file, { force: true });
   delete s.service;
 }
 class Disconnected extends Error {}
@@ -489,8 +497,14 @@ async function applyState(s: State) {
       s.token,
       base,
     );
-    await rm(statePath, { force: true });
-    await stopService(s);
+    await withServiceLock(equipHome, async () => {
+      const latest = await state();
+      if (!sameConnection(latest, s)) return;
+      s.service = latest.service;
+      // State goes first: stopping the service may end this worker process.
+      await rm(statePath, { force: true });
+      await stopService(s);
+    }, true);
     throw new Disconnected(`Disconnected (${desired.disconnect})`);
   }
   const receipts = await synchronize(desired, targets, equipHome,archive);
@@ -545,23 +559,63 @@ async function ensureService(s: State) {
     has("--once")
   )
     return;
-  const def = await writeService(
+  await withServiceLock(equipHome, () => installService(s), true);
+}
+async function installService(s: State) {
+  // While this connect waited, the connection may have changed or another
+  // connect may have installed the service.
+  const latest = await state();
+  if (!sameConnection(latest, s)) return;
+  if (latest.service) {
+    s.service = latest.service;
+    return;
+  }
+  const def = await serviceDefinition(
     process.argv[1],
     equipHome,
     s.server || server,
   );
-  s.service = { path: def.path, label: def.label };
-  await save(s);
+  await writeService(def, equipHome);
+  // Merge only the service field, and only into this connection's state, so a
+  // connect that replaced this one while it registered keeps its own state.
+  const record: ServiceRecord = { path: def.path, label: def.label };
+  if (!(await saveWorkerFields(s, { service: record }))) return;
+  s.service = record;
   try {
-    for (const serviceCommand of def.enableCommands)
-      await exec(serviceCommand[0], serviceCommand.slice(1));
+    const mode = await enableService(def, run);
+    if (mode) {
+      s.service = { ...record, mode };
+      await saveWorkerFields(s, { service: s.service });
+    }
   } catch (error) {
     delete s.service;
-    await save(s);
+    await saveWorkerFields(s, { service: undefined });
     await rm(def.path, { force: true });
     throw error;
   }
   console.log(`Background worker started: ${def.path}`);
+}
+// macOS launch agents have no boot mode; see upgradeRecordedService.
+async function upgradeExistingService(s: State, retryLogon = false) {
+  if (!s.service || platform() === "darwin") return;
+  const record = await upgradeRecordedService({
+    equipHome,
+    definition: () => serviceDefinition(process.argv[1], equipHome, s.server || server),
+    load: async () => {
+      const latest = await state();
+      return sameConnection(latest, s) ? latest.service : undefined;
+    },
+    // Saving against the original connection fails once the computer disconnects.
+    save: (service) => saveWorkerFields(s, { service }),
+    remove: async () => {
+      const removal = await serviceRemoval(process.argv[1], equipHome, s.server || server);
+      for (const command of removal.commands)
+        await exec(command[0], command.slice(1)).catch(() => {});
+    },
+    run,
+    retryLogon,
+  });
+  if (record) s.service = record;
 }
 
 async function main() {
@@ -625,6 +679,7 @@ async function main() {
         `Connected and synchronized ${receipts.filter((r) => r.status === "synchronized").length} installation(s).`,
       );
       try {
+        await upgradeExistingService(existing, true);
         await ensureService(existing);
       } catch (error) {
         console.error(
@@ -740,6 +795,7 @@ async function main() {
     return;
   }
   if (command === "worker") {
+    await upgradeExistingService(await state()).catch(() => {});
     let delay = 2_000;
     for (;;)
       try {
@@ -787,8 +843,12 @@ async function main() {
         s.server || server,
       ).catch(() => {});
     }
-    await stopService(s);
-    await rm(statePath, { force: true });
+    // Waits for any in-flight service upgrade, then removes against current state.
+    await withServiceLock(equipHome, async () => {
+      s.service = (await state()).service;
+      await stopService(s);
+      await rm(statePath, { force: true });
+    }, true);
     console.log(
       `Disconnected; managed skills and instructions ${mode === "remove" ? "removed where unchanged" : "retained"}.`,
     );

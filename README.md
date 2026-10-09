@@ -6,7 +6,7 @@ Discovery and agent compatibility build on [Vercel Skills](https://github.com/ve
 
 ## Connect a computer
 
-Create an account on your Equip instance, choose skills, then open **Connect computer** and copy its installation command. The macOS/Linux shell installer and Windows PowerShell installer install the CLI, runtime when needed, and background service, then start authorization.
+Create an account on your Equip instance, choose skills, then open **Connect computer** and copy its installation command. The macOS/Linux shell installer and Windows PowerShell installer install the CLI, runtime when needed, and background service, then start authorization. The background worker starts at boot on Windows and Linux when the system permits it (a boot-time scheduled task on Windows, user lingering on Linux) and otherwise at logon. When Windows runs the worker as a boot-time task, it can't use credentials Windows protects with your password, such as Git Credential Manager logins, so private sources resolve on another connected computer or when you run `equip sync` while logged on.
 
 Press Enter to open the browser and approve the computer. Headless connections show a URL and device code. Once installed:
 
