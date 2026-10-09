@@ -45,6 +45,61 @@ async function snapshot(path: string, filename: InstructionFilename) {
   return {exists:true, files, hash:skillRevision(files), portableHash:portableFilesRevision(files), pointer:info.isSymbolicLink() ? await readlink(path) : undefined};
 }
 
+async function sameManagedInstruction(
+  home: string,
+  entry: Entry | undefined,
+  current: { pointer?: string },
+  path: string,
+) {
+  if (!entry || entry.observed || entry.path !== path || !entry.pointer || !current.pointer) return false;
+  const canonicalPath = join(home, 'instructions', entry.skillId, entry.filename);
+  const canonical = await lstat(canonicalPath).catch(() => undefined);
+  if (!canonical?.isFile() || canonical.isSymbolicLink()) return false;
+  const destination = await lstat(path).catch(() => undefined);
+  if (!destination?.isSymbolicLink()) return false;
+  const [destinationPath, managedPath] = await Promise.all([
+    realpath(path).catch(() => undefined),
+    realpath(canonicalPath).catch(() => undefined),
+  ]);
+  return destinationPath !== undefined && managedPath !== undefined && destinationPath === managedPath;
+}
+
+async function instructionRemovalOrder(installs: Record<string, Entry>) {
+  const entries = Object.entries(installs);
+  const keysByPath = new Map<string,string[]>();
+  for (const [key,entry] of entries) {
+    const path = resolve(entry.path);
+    keysByPath.set(path,[...(keysByPath.get(path) ?? []),key]);
+  }
+  const targets = new Map<string,string[]>();
+  const incoming = new Map(entries.map(([key]) => [key,0]));
+  for (const [key,entry] of entries) {
+    const info = await lstat(entry.path).catch(() => undefined);
+    if (!info?.isSymbolicLink()) continue;
+    const pointer = await readlink(entry.path).catch(() => undefined);
+    if (!pointer) continue;
+    const targetPath = resolve(dirname(entry.path),pointer);
+    const targetKeys = (keysByPath.get(targetPath) ?? []).filter(targetKey => targetKey !== key);
+    if (!targetKeys.length) continue;
+    targets.set(key,targetKeys);
+    for (const targetKey of targetKeys) incoming.set(targetKey,(incoming.get(targetKey) ?? 0)+1);
+  }
+  const pending = entries.filter(([key]) => incoming.get(key) === 0);
+  const ordered: Array<[string,Entry]> = [];
+  const added = new Set<string>();
+  while (pending.length) {
+    const item = pending.shift()!;
+    const [key] = item;
+    if (added.has(key)) continue;
+    added.add(key);ordered.push(item);
+    for (const targetKey of targets.get(key) ?? []) {
+      const remaining = (incoming.get(targetKey) ?? 0)-1;incoming.set(targetKey,remaining);
+      if (remaining === 0) pending.push(entries.find(([candidate]) => candidate === targetKey)!);
+    }
+  }
+  return [...ordered,...entries.filter(([key]) => !added.has(key))];
+}
+
 export async function discoverInstructionLocations(targets: AgentTarget[], options: ProfileDiscoveryOptions & { autoDetect?: boolean } = {}): Promise<InstructionLocation[]> {
   const roots = await discoverConfigurationRoots(options);
   const locations: InstructionLocation[] = [];
@@ -204,7 +259,8 @@ export async function syncLocalInstructions(home: string, locations: Instruction
         const current = await snapshot(location.path,doc.filename);
         const desiredPortableHash = portableFilesRevision(doc.files);
         if (!current.exists || current.portableHash === desiredPortableHash) continue;
-        if (!entry || entry.revision !== doc.revision || current.pointer !== entry.pointer) unknown = true;
+        const samePointer = entry?.pointer === current.pointer || await sameManagedInstruction(home,entry,current,location.path);
+        if (!entry || entry.revision !== doc.revision || !samePointer) unknown = true;
         else if (entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash)
           candidates.push(current.files);
       } catch (error) {errors.push((error as Error).message);unknown = true;}
@@ -338,7 +394,8 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
             receipts.push({...base,revision:previous?.revision ?? '',status:'conflicted',message:'Equip instruction store changed locally and was preserved.',localFiles:canonicalConflict});continue;
           }
           const currentDesired = current.portableHash === desiredPortableHash;
-          const samePointer = !previous || previous.path === location.path && previous.pointer === current.pointer;
+          const samePointer = !previous || previous.path === location.path &&
+            (previous.pointer === current.pointer || await sameManagedInstruction(home,previous,current,location.path));
           const clean = previous && samePointer && (previous.portableHash
             ? current.portableHash === previous.portableHash
             : current.hash === previous.hash || currentDesired);
@@ -371,7 +428,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         } catch (error) {await recover(home,ledger,archive);receipts.push({...base,revision:previous?.revision ?? '',status:'failed',message:(error as Error).message});}
       }
     }
-    for (const [key,entry] of Object.entries(ledger.installs)) {
+    for (const [key,entry] of await instructionRemovalOrder(ledger.installs)) {
       if (wanted.has(key)) continue;
       if (excludedDestination(desired, entry)) continue;
       const base = {kind:'instructions' as const,skillId:entry.skillId,agent:entry.agent,profile:entry.profile,project:entry.project,path:entry.path,revision:entry.revision,timestamp:new Date().toISOString()};
@@ -380,14 +437,16 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         const current = await snapshot(entry.path,entry.filename);
         const action = desired.instructionResolutions?.[key];
         const checked = desired.instructionResolutionChecks?.[key];
+        const samePointer = current.pointer === entry.pointer || await sameManagedInstruction(home,entry,current,entry.path);
         if (checked && action && current.hash !== checked) {
           receipts.push({...base,status:'conflicted',localFiles:current.files,message:'Local instructions changed after review. Review the new version.'});continue;
         }
         if (!current.exists || entry.observed || action === 'preserve' || action === 'import') {
           delete ledger.installs[key];
           receipts.push({...base,status:action === 'preserve' || action === 'import' ? 'conflicted' : 'synchronized',...(action ? {instructionResolution:action} : {}),localFiles:action ? current.files : undefined,message:'Released instructions; preexisting or preserved files retained.'});
-        } else if ((entry.portableHash ? current.portableHash === entry.portableHash : current.hash === entry.hash) && current.pointer === entry.pointer || action === 'replace') {
-          if ((entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash) || current.pointer !== entry.pointer)
+        } else if ((entry.portableHash ? current.portableHash === entry.portableHash : current.hash === entry.hash) && samePointer || action === 'replace') {
+          if ((entry.portableHash ? current.portableHash !== entry.portableHash : current.hash !== entry.hash) ||
+              !samePointer)
             await archiveFiles(archive,entry.skillId,current.files,entry.path);
           await rm(entry.path,{force:true});
           delete ledger.installs[key];

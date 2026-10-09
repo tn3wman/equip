@@ -19,6 +19,14 @@ equip sync
 
 Use the dashboard to inspect installation results, resolve local changes, publish instructions, and disconnect a computer with a choice to retain or remove managed files. Private repository credentials stay on each computer.
 
+When local publishing is enabled, editing a managed global instruction file publishes it to your other computers. Conflicting local versions stay preserved for review.
+
+Use `equip local remove <skill-name>` on a connected computer to delete a skill from Equip. Automatic sync removes unchanged managed installations on other computers as they reconnect. Edited and preexisting files remain preserved for review. This explicit command also works when automatic local publishing is disabled.
+
+If a CLI update fails, `equip status` reports `lastUpdateError`. Skills continue syncing with the installed CLI.
+
+`equip status` reports conflicted destinations in `lastError` and keeps `lastSync` at the last complete sweep. `equip sync` exits nonzero when any destination fails or conflicts.
+
 ## Develop locally
 
 Requires Node.js 22.20 or newer and npm.

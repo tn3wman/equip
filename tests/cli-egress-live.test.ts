@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { createApp } from "../server/app.ts";
 
-async function runCli(environment: Record<string, string>) {
+async function runCli(environment: Record<string, string>, expectedExit = 0) {
   const child = spawn(process.execPath, ["--import", "tsx", "cli/index.ts", "sync"], {
     cwd: process.cwd(),
     env: { ...process.env, ...environment },
@@ -21,7 +21,7 @@ async function runCli(environment: Record<string, string>) {
     child.once("exit", done);
     child.once("error", reject);
   });
-  assert.equal(exit, 0, output);
+  assert.equal(exit, expectedExit, output);
 }
 
 test("stable CLI syncs read no workspace blobs and do not repost receipts", { timeout: 30_000 }, async t => {
@@ -141,7 +141,7 @@ test("stable CLI syncs read no workspace blobs and do not repost receipts", { ti
   assert.equal(blobReads, 0, "stable syncs must not read workspace, device, or bundle blobs");
 
   await writeFile(join(target, "egress-test/SKILL.md"), `${files[0].content}\nlocal edit\n`);
-  await runCli(environment);
+  await runCli(environment, 1);
   await post(`/api/devices/${device.deviceId}/resolve`, {
     skillId: skill.id,
     agent: "codex",

@@ -65,6 +65,7 @@ type State = {
   project?: string;
   lastSync?: string;
   lastError?: string;
+  lastUpdateError?: string;
   lastUpdateCheck?: string;
 };
 async function state(): Promise<State> {
@@ -83,7 +84,7 @@ async function save(value: State) {
 }
 async function saveWorkerFields(
   basis: State,
-  fields: Pick<State, "lastSync" | "lastError" | "lastUpdateCheck">,
+  fields: Pick<State, "lastSync" | "lastError" | "lastUpdateError" | "lastUpdateCheck">,
 ) {
   const latest = await state();
   if (latest.deviceId !== basis.deviceId || latest.token !== basis.token)
@@ -273,14 +274,16 @@ async function maybeUpdate(s: State) {
     !process.argv[1].endsWith(".cjs")
   )
     return false;
+  s.lastUpdateCheck = new Date().toISOString();
+  await saveWorkerFields(s, { lastUpdateCheck: s.lastUpdateCheck });
   const base = s.server || server;
   if (new URL(base).protocol !== "https:") return false;
   const response = await fetch(`${base}/cli/manifest`, {
     signal: AbortSignal.timeout(15_000),
   });
-  if (!response.ok) return false;
+  if (!response.ok)
+    throw new Error(`CLI update check failed: ${response.status}`);
   const manifest = verifyReleaseManifest(await response.json(), base);
-  s.lastUpdateCheck = new Date().toISOString();
   const compatibility = await getCompatibility(agentHome);
   const executable = resolve(process.argv[1]);
   const current = await readFile(executable);
@@ -319,7 +322,11 @@ async function maybeUpdate(s: State) {
     await replaceCli();
     changed = true;
   }
-  await saveWorkerFields(s, { lastUpdateCheck: s.lastUpdateCheck });
+  s.lastUpdateError = undefined;
+  await saveWorkerFields(s, {
+    lastUpdateCheck: s.lastUpdateCheck,
+    lastUpdateError: undefined,
+  });
   return changed;
 }
 async function runSync(s: State) {
@@ -337,6 +344,19 @@ async function runSync(s: State) {
   }
   try {await lock.writeFile(JSON.stringify({pid:process.pid}));return await applyState(s);}
   finally {await lock.close();await rm(path,{force:true});}
+}
+function receiptFailureSummary(desired: DesiredState, receipts: Receipt[]) {
+  const names = new Map([
+    ...desired.skills.map(skill => [skill.id, skill.name] as const),
+    ...(desired.instructions ?? []).map(document => [document.id, document.title] as const),
+  ]);
+  return receipts
+    .filter(receipt => receipt.status !== "synchronized")
+    .map(receipt => {
+      const location = [receipt.agent, receipt.profile].filter(Boolean).join("/") +
+        (receipt.project ? ` (${receipt.project})` : "");
+      return `${names.get(receipt.skillId) ?? receipt.skillId} at ${location}: ${receipt.message ?? receipt.status}`;
+    });
 }
 async function applyState(s: State) {
   if (!s.token) throw new Error("Not connected. Run equip connect.");
@@ -502,7 +522,12 @@ async function applyState(s: State) {
   if (command === "tidy") console.log(JSON.stringify(migration,null,2));
   if (receipts.every((receipt) => receipt.status === "synchronized"))
     s.lastSync = new Date().toISOString();
-  s.lastError = [...local.errors,...localInstructions.errors,...migration.errors].join("\n") || undefined;
+  s.lastError = [
+    ...local.errors,
+    ...localInstructions.errors,
+    ...migration.errors,
+    ...receiptFailureSummary(desired, receipts),
+  ].join("\n") || undefined;
   await saveWorkerFields(s, {
     lastSync: s.lastSync,
     lastError: s.lastError,
@@ -607,7 +632,34 @@ async function main() {
       console.log(`Local publishing: ${desired.localSync ? "enabled" : "disabled"}. Skill folder: ${join(equipHome, "skills")}`);
       return;
     }
-    throw new Error("Use equip local add /path/to/skill or equip local status. Enable automatic local publishing in Computers.");
+    if (args[0] === "remove" && args[1]) {
+      const name = args[1];
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name))
+        throw new Error("Use equip local remove <skill-name>, not a folder path.");
+      const desired = await getDesired(equipHome, s.server || server, s.token);
+      const skill = (desired.localSkills ?? desired.skills).find(item => item.name === name);
+      if (!skill) throw new Error(`Skill ${name} was not found in Equip.`);
+      await request(`/api/device/skills/${encodeURIComponent(skill.id)}`, {
+        method: "DELETE", body: JSON.stringify({ expectedRevision: skill.revision }),
+      }, s.token, s.server || server);
+      console.log(`Deleted ${name} from Equip. Connected computers will remove its managed installations; edited and preexisting files stay preserved.`);
+      let receipts: Receipt[];
+      try { receipts = await runSync(s); }
+      catch (error) {
+        if (error instanceof Error && error.message === "Equip synchronization is already running.") {
+          console.log("The active sync worker will finish local removal. Check equip status for completion.");
+          return;
+        }
+        throw error;
+      }
+      const removed = receipts.filter(receipt => receipt.skillId === skill.id);
+      const blocked = removed.filter(receipt => receipt.status !== "synchronized");
+      if (blocked.length)
+        throw new Error(`${name} was deleted from Equip, but local removal needs review: ${blocked.map(receipt => `${receipt.agent}${receipt.profile ? `/${receipt.profile}` : ""}: ${receipt.message ?? receipt.status}`).join("; ")}`);
+      console.log(`${removed.length} local destination(s) synchronized. Other computers catch up through automatic sync.`);
+      return;
+    }
+    throw new Error("Use equip local add /path/to/skill, equip local remove <skill-name>, or equip local status. Enable automatic local publishing in Computers.");
   }
   if (command === "connect") {
     const existing = await state();
@@ -737,6 +789,8 @@ async function main() {
       console.log(
         `${r.status.padEnd(12)} ${r.agent}/${r.skillId}${r.message ? ` — ${r.message}` : ""}`,
       );
+    if (command === "sync" && receipts.some(receipt => receipt.status !== "synchronized"))
+      process.exitCode = 1;
     return;
   }
   if (command === "worker") {
@@ -744,7 +798,17 @@ async function main() {
     for (;;)
       try {
         const s = await state();
-        if (await maybeUpdate(s)) {
+        let updated = false;
+        try {
+          updated = await maybeUpdate(s);
+        } catch (error) {
+          s.lastUpdateError = error instanceof Error ? error.message : String(error);
+          await saveWorkerFields(s, {
+            lastUpdateCheck: s.lastUpdateCheck,
+            lastUpdateError: s.lastUpdateError,
+          });
+        }
+        if (updated) {
           if (platform() === "win32") {
             const child = spawn(
               process.execPath,
@@ -884,6 +948,7 @@ async function main() {
         targets: s.targets ?? [],
         lastSync: s.lastSync,
         lastError: s.lastError,
+        lastUpdateError: s.lastUpdateError,
       },
       null,
       2,

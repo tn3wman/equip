@@ -14,7 +14,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileHashes, sameInstalledFileHashes } from "./file-state.ts";
 import { portableFilesRevision } from "./file-state.ts";
 import type {
@@ -383,6 +383,7 @@ async function install(
         localFiles: canonical.conflict.files,
       },
     };
+  const desired = desiredHashes(skill.files);
   const obsoletePath =
     previous?.path !== destination ? previous?.path : undefined;
   if (obsoletePath) {
@@ -414,6 +415,60 @@ async function install(
     const destinationSnapshot = destinationInfo?.isSymbolicLink()
       ? { files: [], hashes: { ".": "symlink" } }
       : await snapshot(destination);
+    if (previous?.canonicalPath && !previous.copied && oldInfo?.isSymbolicLink() &&
+        destinationInfo?.isSymbolicLink() &&
+        await pointsTo(obsoletePath, previous.canonicalPath)) {
+      const [oldTarget, destinationTarget, previousCanonicalTarget, canonicalTarget] =
+        await Promise.all([
+          realpath(obsoletePath).catch(() => undefined),
+          realpath(destination).catch(() => undefined),
+          realpath(previous.canonicalPath).catch(() => undefined),
+          realpath(canonical.path).catch(() => undefined),
+        ]);
+      let canonicalSnapshot = canonicalSnapshots.get(canonical.path);
+      if (!canonicalSnapshot) {
+        canonicalSnapshot = snapshot(canonical.path);
+        canonicalSnapshots.set(canonical.path, canonicalSnapshot);
+      }
+      if (oldTarget && oldTarget === destinationTarget &&
+          oldTarget === previousCanonicalTarget && oldTarget === canonicalTarget &&
+          !differs((await canonicalSnapshot).hashes, desired)) {
+        const [oldParent, destinationParent] = await Promise.all([
+          realpath(dirname(obsoletePath)).catch(() => undefined),
+          realpath(dirname(destination)).catch(() => undefined),
+        ]);
+        const sameDirectoryEntry = !!oldParent && oldParent === destinationParent &&
+          basename(obsoletePath) === basename(destination);
+        const stage = `${destination}.equip-stage-${randomUUID()}`;
+        await createManagedLink(canonical.path, stage);
+        try {
+          const [stillOld, stillDestination] = await Promise.all([
+            realpath(obsoletePath).catch(() => undefined),
+            realpath(destination).catch(() => undefined),
+          ]);
+          if (stillOld !== oldTarget || stillDestination !== destinationTarget ||
+              !await pointsTo(obsoletePath, previous.canonicalPath))
+            throw new Error("Managed skill alias changed during synchronization and was preserved");
+          await rename(stage, destination);
+        } catch (error) {
+          await rm(stage, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
+        return {
+          entry: {
+            ...previous,
+            path: destination,
+            revision: skill.revision,
+            files: canonical.hashes,
+            canonicalPath: canonical.path,
+            retainedFromCanonical: undefined,
+            transactionId: canonical.transactionId ?? previous.transactionId,
+          },
+          ...(sameDirectoryEntry ? {} : { obsoletePath }),
+          receipt: { ...base, status: "synchronized" },
+        };
+      }
+    }
     if (oldChanged || destinationInfo) {
       const conflictPath = destinationInfo ? destination : obsoletePath;
       const localFiles = destinationInfo
@@ -460,7 +515,6 @@ async function install(
     }
   }
   const rootInfo = await lstat(destination).catch(() => null);
-  const desired = desiredHashes(skill.files);
   let migratingObserved = false;
   let replacingChangedPointer = false;
   if (previous?.observed) {
@@ -528,10 +582,35 @@ async function install(
     }
   }
   if (!migratingObserved && !replacingChangedPointer && previous?.canonicalPath && previous.path === destination) {
-    const intact = previous.copied
+    let intact = previous.copied
       ? !!rootInfo && !rootInfo.isSymbolicLink() &&
         !differs((await snapshot(destination)).hashes, previous.files)
       : await pointsTo(destination, previous.canonicalPath);
+    if (!intact && !previous.copied && rootInfo?.isSymbolicLink()) {
+      const [destinationTarget, previousCanonicalTarget] = await Promise.all([
+        realpath(destination).catch(() => undefined),
+        realpath(previous.canonicalPath).catch(() => undefined),
+      ]);
+      let canonicalSnapshot = canonicalSnapshots.get(previous.canonicalPath);
+      if (!canonicalSnapshot) {
+        canonicalSnapshot = snapshot(previous.canonicalPath);
+        canonicalSnapshots.set(previous.canonicalPath, canonicalSnapshot);
+      }
+      if (destinationTarget && destinationTarget === previousCanonicalTarget &&
+          !differs((await canonicalSnapshot).hashes, desired)) {
+        const stage = `${destination}.equip-stage-${randomUUID()}`;
+        await createManagedLink(canonical.path, stage);
+        try {
+          if (await realpath(destination).catch(() => undefined) !== previousCanonicalTarget)
+            throw new Error("Managed skill link changed during synchronization and was preserved");
+          await rename(stage, destination);
+        } catch (error) {
+          await rm(stage, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
+        intact = true;
+      }
+    }
     if (!intact) {
       if (action !== "replace")
         return {

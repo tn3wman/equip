@@ -98,6 +98,37 @@ test('optional local publishing requires known base and refuses divergent copies
  result=await syncLocalInstructions(state,[a],{...desired(v1),localSync:true},async p=>{calls++;assert.equal(p.baseRevision,v1.revision);assert.equal(p.files[0].content,'Local\n');});assert.equal(calls,1);assert.equal(result.changed,true);
 });
 
+test('local publishing accepts managed profile links rewired through another managed profile',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();await synchronizeInstructions(desired(policy),[a,b],state);
+ await rm(b.path);await symlink(a.path,b.path);await writeFile(a.path,'Local\n');let calls=0;
+ const result=await syncLocalInstructions(state,[a,b],{...desired(policy),localSync:true},async payload=>{calls++;assert.equal(payload.baseRevision,policy.revision);assert.equal(payload.files[0].content,'Local\n');});
+ assert.equal(calls,1);assert.deepEqual(result,{changed:true,errors:[]});
+ const published=doc('Local\n');const receipts=await synchronizeInstructions(desired(published),[a,b],state);
+ assert.ok(receipts.every(receipt=>receipt.status==='synchronized'&&receipt.revision===published.revision));assert.equal(await readlink(b.path),a.path);
+});
+
+test('removal deletes managed alias chains before their targets and preserves foreign aliases',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'alias',path:join(root,'alias/AGENTS.md')};const c={...a,profile:'foreign',path:join(root,'foreign-profile/AGENTS.md')};await mkdir(join(root,'alias'));await mkdir(join(root,'foreign-profile'));const policy=doc();await synchronizeInstructions(desired(policy),[a,b,c],state);
+ await rm(b.path);await symlink(a.path,b.path);const foreign=join(root,'foreign.md');await writeFile(foreign,'Original\n');await rm(c.path);await symlink(foreign,c.path);
+ const receipts=await synchronizeInstructions({...desired(policy),instructions:[]},[a,b,c],state);
+ assert.equal(receipts.find(receipt=>receipt.profile==='alias')?.status,'synchronized');assert.equal(receipts.find(receipt=>receipt.profile==='foreign')?.status,'conflicted');
+ assert.equal(await lstat(b.path).catch(()=>null),null);assert.equal(await lstat(a.path).catch(()=>null),null);assert.equal(await readlink(c.path),foreign);assert.equal(await readFile(foreign,'utf8'),'Original\n');
+});
+
+test('local publishing rejects a foreign link even when its content matches a managed edit',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();await synchronizeInstructions(desired(policy),[a,b],state);
+ await writeFile(a.path,'Local\n');const foreign=join(root,'foreign.md');await writeFile(foreign,'Local\n');await rm(b.path);await symlink(foreign,b.path);let calls=0;
+ const result=await syncLocalInstructions(state,[a,b],{...desired(policy),localSync:true},async()=>{calls++;});
+ assert.equal(calls,0);assert.equal(result.changed,false);assert.match(result.errors[0]??'',/different local versions need review/);
+});
+
+test('local publishing rejects a managed alias chain with a stale ledger revision',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();await synchronizeInstructions(desired(policy),[a,b],state);
+ await rm(b.path);await symlink(a.path,b.path);await writeFile(a.path,'Local\n');const ledgerPath=join(state,'instructions-ledger.json');const ledger=JSON.parse(await readFile(ledgerPath,'utf8'));ledger.installs[instructionKey(policy.id,b)].revision='stale';await writeFile(ledgerPath,JSON.stringify(ledger));let calls=0;
+ const result=await syncLocalInstructions(state,[a,b],{...desired(policy),localSync:true},async()=>{calls++;});
+ assert.equal(calls,0);assert.equal(result.changed,false);assert.match(result.errors[0]??'',/different local versions need review/);
+});
+
 test('local publishing accepts matching edits from managed copies with different read and write permissions',async t=>{
  const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));
  const policy=doc();await synchronizeInstructions(desired(policy),[a,b],state);
