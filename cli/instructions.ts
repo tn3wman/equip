@@ -328,7 +328,32 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
   try {
     await lock.writeFile(JSON.stringify({pid:process.pid}));
     const ledger = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
-    await recover(home,ledger,archive);
+    const targetsFor = (doc: Instructions) => locations.filter(l =>
+      !excludedDestination(desired, l) && instructionEnabled(doc,l,deviceId) &&
+      !Object.values(ledger.installs).some(entry => entry.skillId === doc.id &&
+        entry.path === l.path && excludedDestination(desired,entry)));
+    // One journal file records an interrupted replacement. Until it is recovered,
+    // change nothing (a new journal would overwrite it) and fail every location
+    // and pending removal, so callers such as disconnect never treat the pass as done.
+    try {await recover(home,ledger,archive);}
+    catch (error) {
+      const journal = await json<Transaction|undefined>(join(home,'instructions-transaction.json'),undefined).catch(() => undefined);
+      const path = journal?.path ?? join(home,'instructions-transaction.json');
+      const message = `A previous replacement at ${path} could not be recovered: ${(error as Error).message}; Equip will retry on the next sync.`;
+      const timestamp = new Date().toISOString();
+      const keys = new Set<string>();
+      const receipts: Receipt[] = [];
+      for (const doc of desired.instructions ?? []) for (const location of targetsFor(doc)) {
+        const key = instructionKey(doc.id,location);keys.add(key);
+        receipts.push({kind:'instructions',skillId:doc.id,agent:location.agent,profile:location.profile,project:location.project,
+          path:location.path,revision:ledger.installs[key]?.revision ?? '',status:'failed',message,timestamp});
+      }
+      for (const [key,entry] of Object.entries(ledger.installs)) if (!keys.has(key) && !excludedDestination(desired,entry))
+        receipts.push({kind:'instructions',skillId:entry.skillId,agent:entry.agent,profile:entry.profile,project:entry.project,
+          path:entry.path,revision:entry.revision,status:'failed',message,timestamp});
+      if (!receipts.length) receipts.push({kind:'instructions',skillId:journal?.skillId ?? '',agent:'',path,revision:'',status:'failed',message,timestamp});
+      return receipts;
+    }
     // Retained destinations share one immutable snapshot for each old revision.
     for (const [key,entry] of Object.entries(ledger.installs)) {
       if (!excludedDestination(desired,entry) || !entry.pointer) continue;
@@ -388,10 +413,7 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
           doc.files.length !== 1 || doc.files[0].path !== doc.filename || doc.files[0].encoding ||
           Buffer.byteLength(doc.files[0].content) > limit || doc.files[0].content.includes('\0'))
         throw new Error('Invalid instruction document in desired state');
-      const targets = locations.filter(l =>
-        !excludedDestination(desired, l) && instructionEnabled(doc,l,deviceId) &&
-        !Object.values(ledger.installs).some(entry => entry.skillId === doc.id &&
-          entry.path === l.path && excludedDestination(desired,entry)));
+      const targets = targetsFor(doc);
       if (!targets.length) continue;
       const canonicalPath = join(home,'instructions',doc.id,doc.filename);
       const desiredHash = skillRevision(doc.files);

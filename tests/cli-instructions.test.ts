@@ -237,6 +237,35 @@ test(`a failed survivor replacement is recovered before another removal${recover
  assert.deepEqual((await readdir(dirname(b.path))).filter(name=>name.includes('.equip-')),[]);
 });
 
+test('an instruction journal whose recovery keeps failing fails every location without changes until it recovers',async t=>{
+ const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));
+ const v1=doc();await synchronizeInstructions(desired(v1),[a,b],state);
+ const old=a.path+'.equip-old-stuck';await fsPromises.rename(a.path,old);
+ await writeFile(join(state,'instructions-transaction.json'),JSON.stringify({path:a.path,stage:a.path+'.equip-stage-stuck',old,hadOld:true,id:'stuck',key:instructionKey(v1.id,a),skillId:v1.id,filename:v1.filename,expectedHash:v1.revision}));
+ let blocked=true;const realRename=fsPromises.rename;
+ t.mock.method(fsPromises,'rename',async (from:string,to:string)=>{
+   if (blocked && from===old) throw Object.assign(new Error('EBUSY: resource busy'),{code:'EBUSY'});
+   return realRename(from,to);
+ });
+ syncBuiltinESMExports();
+ t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+ const [ledgerBefore,journalBefore]=await Promise.all(['instructions-ledger.json','instructions-transaction.json'].map(name=>readFile(join(state,name),'utf8')));
+ const v2=doc('New\n');
+ for (let pass=0;pass<2;pass++) {
+   const receipts=await synchronizeInstructions(desired(v2),[a,b],state);
+   assert.deepEqual(receipts.map(receipt=>[receipt.profile,receipt.status]),[[undefined,'failed'],['other','failed']]);
+   for (const receipt of receipts) assert.equal(receipt.message,`A previous replacement at ${a.path} could not be recovered: EBUSY: resource busy; Equip will retry on the next sync.`);
+   assert.equal(await readFile(join(state,'instructions-ledger.json'),'utf8'),ledgerBefore);
+   assert.equal(await readFile(join(state,'instructions-transaction.json'),'utf8'),journalBefore);
+   assert.equal(await readFile(b.path,'utf8'),'Original\n');
+ }
+ blocked=false;
+ const receipts=await synchronizeInstructions(desired(v2),[a,b],state);
+ assert.ok(receipts.every(receipt=>receipt.status==='synchronized'),JSON.stringify(receipts));
+ for (const path of [a.path,b.path]) assert.equal(await readFile(path,'utf8'),'New\n');
+ await assert.rejects(lstat(join(state,'instructions-transaction.json')),/ENOENT/);
+});
+
 test('local publishing rejects a foreign link even when its content matches a managed edit',async t=>{
  const {root,state,a}=await fixture(t);const b={...a,profile:'other',path:join(root,'other/AGENTS.md')};await mkdir(join(root,'other'));const policy=doc();await synchronizeInstructions(desired(policy),[a,b],state);
  await writeFile(a.path,'Local\n');const foreign=join(root,'foreign.md');await writeFile(foreign,'Local\n');await rm(b.path);await symlink(foreign,b.path);let calls=0;

@@ -643,8 +643,50 @@ test("journal recovery archives unexpected destination edits before rollback", a
     revision: "r3", transactionId: "interrupted-again", skillId: "s1",
     expectedFiles: { "SKILL.md": `420:${createHash("sha256").update("staged again").digest("hex")}` },
   }));
-  await assert.rejects(synchronizeRaw(desired([skill("original")]), agents, home), /require recovery archiving/);
+  const stuck = await synchronizeRaw(desired([skill("original")]), agents, home);
+  assert.equal(stuck[0].status, "failed");
+  assert.ok(stuck[0].message?.startsWith(`A previous replacement at ${destination} could not be recovered`), JSON.stringify(stuck));
+  assert.match(stuck[0].message ?? "", /require recovery archiving/);
   assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "preserve without archive");
+});
+
+test("a journal whose recovery keeps failing fails every installation without changes until it recovers", async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "equip-stuck-journal-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), first = join(root, "first"), second = join(root, "second");
+  const targets = [{ id: "codex", path: first }, { id: "pi", path: second }];
+  const destination = join(first, "demo"), oldPath = `${destination}.equip-old-stuck`;
+  let blocked = true;
+  await watchRenames(t, "linux", (from) => blocked && from === oldPath);
+  await synchronize(desired([skill("one")]), targets, home);
+  // A replacement moved the installation aside and stopped before promotion.
+  await rename(destination, oldPath);
+  await writeFile(join(home, "transaction.json"), JSON.stringify({
+    destination, stage: `${destination}.equip-stage-stuck`, oldPath, hadOld: true,
+    revision: "r2", transactionId: "stuck", skillId: "s1", expectedFiles: {},
+  }));
+  const [ledgerBefore, journalBefore] = await Promise.all(
+    ["ledger.json", "transaction.json"].map(name => readFile(join(home, name), "utf8")));
+  const next = { ...desired([skill("two", "r2")]), generation: 2 };
+
+  for (let pass = 0; pass < 2; pass++) {
+    const receipts = await synchronize(next, targets, home);
+    assert.deepEqual(receipts.map(receipt => [receipt.agent, receipt.status]), [["codex", "failed"], ["pi", "failed"]]);
+    for (const receipt of receipts)
+      assert.match(receipt.message ?? "",
+        new RegExp(`^A previous replacement at ${destination.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} could not be recovered: EBUSY.*; Equip will retry on the next sync\\.$`));
+    assert.equal(await readFile(join(home, "ledger.json"), "utf8"), ledgerBefore);
+    assert.equal(await readFile(join(home, "transaction.json"), "utf8"), journalBefore);
+    assert.equal(await readFile(join(second, "demo/SKILL.md"), "utf8"), "one");
+  }
+
+  blocked = false;
+  const receipts = await synchronize(next, targets, home);
+
+  assert.ok(receipts.every(receipt => receipt.status === "synchronized"), JSON.stringify(receipts));
+  for (const target of [first, second]) assert.equal(await readFile(join(target, "demo/SKILL.md"), "utf8"), "two");
+  await assert.rejects(lstat(join(home, "transaction.json")), /ENOENT/);
+  assert.deepEqual(await equipLeftovers(first, second), []);
 });
 
 test("legacy journal recovery preserves an unverifiable destination", async t => {
@@ -659,10 +701,9 @@ test("legacy journal recovery preserves an unverifiable destination", async t =>
   await writeFile(join(home, "transaction.json"), JSON.stringify({
     destination, oldPath, stage: `${destination}.equip-stage-test`, hadOld: true, revision: "r2",
   }));
-  await assert.rejects(
-    synchronizeRaw(desired([skill("original")]), agents, home, async () => {}),
-    /legacy skill update requires manual recovery/,
-  );
+  const receipts = await synchronizeRaw(desired([skill("original")]), agents, home, async () => {});
+  assert.equal(receipts[0].status, "failed");
+  assert.match(receipts[0].message ?? "", /legacy skill update requires manual recovery; destination was preserved; Equip will retry on the next sync/);
   assert.equal(await readFile(join(destination, "SKILL.md"), "utf8"), "unverifiable");
   assert.ok(await lstat(join(home, "transaction.json")));
 });

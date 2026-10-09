@@ -883,6 +883,45 @@ async function install(
   };
 }
 
+// One journal file records an interrupted replacement. Until it is recovered,
+// change nothing (a new journal would overwrite it) and fail every installation
+// and pending removal, so callers such as disconnect never treat the pass as done.
+async function unrecoveredReceipts(
+  desired: DesiredState,
+  targets: AgentTarget[],
+  home: string,
+  error: unknown,
+): Promise<Receipt[]> {
+  const journalPath = join(home, "transaction.json");
+  const journal = await readFile(journalPath, "utf8")
+    .then((text) => JSON.parse(text) as Journal).catch(() => undefined);
+  const path = journal?.destination ?? journalPath;
+  const message = `A previous replacement at ${path} could not be recovered: ${
+    error instanceof Error ? error.message : String(error)}; Equip will retry on the next sync.`;
+  const ledger = await loadLedger(home).catch((): Ledger => ({ generation: 0, installs: {} }));
+  const timestamp = new Date().toISOString();
+  const receipts: Receipt[] = [];
+  const keys = new Set<string>();
+  for (const target of targets) {
+    if (excludedDestination(desired, target)) continue;
+    for (const skill of desired.skills.filter((s) => s.enabled && enabledFor(s, target))) {
+      const key = keyFor(skill, target);
+      keys.add(key);
+      receipts.push({ skillId: skill.id, agent: target.id, profile: target.profile,
+        project: target.project, revision: ledger.installs[key]?.revision ?? "", status: "failed",
+        message, path: ledger.installs[key]?.path ?? join(target.path, skill.name), timestamp });
+    }
+  }
+  for (const [key, entry] of Object.entries(ledger.installs))
+    if (!keys.has(key) && !excludedDestination(desired, entry))
+      receipts.push({ skillId: entry.skillId, agent: entry.agent, profile: entry.profile,
+        project: entry.project, revision: entry.revision, status: "failed", message, path: entry.path, timestamp });
+  if (!receipts.length)
+    receipts.push({ skillId: journal?.skillId ?? "", agent: "", revision: journal?.revision ?? "",
+      status: "failed", message, path, timestamp });
+  return receipts;
+}
+
 export async function synchronize(
   desired: DesiredState,
   targets: AgentTarget[],
@@ -912,7 +951,11 @@ export async function synchronize(
     await lock.writeFile(
       JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
     );
-    await recover(home, archive);
+    try {
+      await recover(home, archive);
+    } catch (error) {
+      return await unrecoveredReceipts(desired, targets, home, error);
+    }
     const ledger = await loadLedger(home);
     const next: Ledger = {
       generation: ledger.generation,
