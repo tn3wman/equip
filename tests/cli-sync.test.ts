@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import fsPromises, { mkdtemp, readFile, readdir, stat, writeFile, mkdir, symlink, lstat, rename, rm, cp, chmod, readlink, realpath } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -1536,6 +1537,38 @@ test("on Windows a root migration replaces the duplicate alias junction through 
   const entry = Object.values(JSON.parse(await readFile(join(home, "ledger.json"), "utf8")).installs)[0] as any;
   assert.equal(entry.path, destination);
   assert.equal(entry.revision, "r2");
+});
+
+test("on Windows recovery removes the old root when a root migration stops after its ledger commit", async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "equip-win-root-crash-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "state"), oldRoot = join(root, "old"), newRoot = join(root, "new");
+  const obsolete = join(oldRoot, "demo"), store = join(home, "skills/demo");
+  let journalAtCommit: string | undefined;
+  await watchRenames(t, "win32", (_from, to) => {
+    if (to === join(home, "ledger.json") && existsSync(join(home, "transaction.json")))
+      journalAtCommit = readFileSync(join(home, "transaction.json"), "utf8");
+    return false;
+  });
+  await synchronize(desired([skill("one")]), [{ id: "pi", path: oldRoot }], home);
+  await mkdir(newRoot);
+  await symlink(store, join(newRoot, "demo"), "junction");
+  const next = { ...desired([skill("two", "r2")]), generation: 2 };
+  assert.equal((await synchronize(next, [{ id: "pi", path: newRoot }], home))[0].status, "synchronized");
+
+  // Recreate the state of a pass that stopped right after the ledger commit.
+  assert.ok(journalAtCommit);
+  await writeFile(join(home, "transaction.json"), journalAtCommit);
+  await symlink(store, obsolete, "junction");
+  await symlink(store, JSON.parse(journalAtCommit).oldPath, "junction");
+
+  const receipts = await synchronize(next, [{ id: "pi", path: newRoot }], home);
+
+  assert.equal(receipts[0].status, "synchronized", JSON.stringify(receipts));
+  await assert.rejects(lstat(obsolete), /ENOENT/);
+  assert.deepEqual(await equipLeftovers(oldRoot, newRoot), []);
+  await assert.rejects(lstat(join(home, "transaction.json")), /ENOENT/);
+  assert.equal(await readFile(join(newRoot, "demo/SKILL.md"), "utf8"), "two");
 });
 
 test("on Windows an update normalizes a chained managed junction through the transaction journal", async t => {

@@ -212,12 +212,13 @@ async function createManagedLink(source: string, destination: string) {
 // Windows rename (MoveFileExW) refuses an existing directory destination, and
 // managed links there are junctions. Move the old link aside under the
 // transaction journal so recovery can restore it; the caller records the
-// returned transactionId in the ledger and then removes oldPath.
+// returned transactionId in the ledger and then removes oldPath (and obsoletePath,
+// which recovery also removes once the ledger shows the replacement committed).
 async function promoteManagedLink(
   home: string,
   stage: string,
   destination: string,
-  journal: Pick<Journal, "revision" | "skillId" | "expectedFiles">,
+  journal: Pick<Journal, "revision" | "skillId" | "expectedFiles" | "obsoletePath">,
 ): Promise<{ oldPath?: string; transactionId?: string }> {
   if (process.platform !== "win32") {
     await rename(stage, destination);
@@ -486,7 +487,8 @@ async function install(
           if (stillOld !== oldTarget || stillDestination !== destinationTarget ||
               !await pointsTo(obsoletePath, previous.canonicalPath))
             throw new Error("Managed skill alias changed during synchronization and was preserved");
-          replaced = await promoteManagedLink(home, stage, destination, linkJournal);
+          replaced = await promoteManagedLink(home, stage, destination,
+            sameDirectoryEntry ? linkJournal : { ...linkJournal, obsoletePath });
         } catch (error) {
           await rm(stage, { recursive: true, force: true }).catch(() => {});
           throw error;
