@@ -25,7 +25,8 @@ export async function conditionalGet<T>(
 ): Promise<{ data?: T; etag?: string; unchanged: boolean }> {
   const response = await fetch(`/api${path}`, {
     credentials: "include",
-    headers: etag ? { "If-None-Match": etag } : undefined,
+    // Vercel's /api rewrite strips If-None-Match before the origin, so repeat it.
+    headers: etag ? { "If-None-Match": etag, "X-Equip-If-None-Match": etag } : undefined,
   });
   if (response.status === 304)
     return { etag: response.headers.get("etag") ?? etag, unchanged: true };
