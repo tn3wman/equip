@@ -152,6 +152,22 @@ test("local publishing is opt-in and revision exports and cached device state st
     const raw = await fetch(`${base}/api/device/desired`, { headers: device.headers });
     const unchanged = await fetch(`${base}/api/device/desired`, { headers: { ...device.headers, "if-none-match": raw.headers.get("etag")! } });
     assert.equal(unchanged.status, 304);
+    const etag = raw.headers.get("etag")!;
+    for (const validator of [etag, `"stale", W/${etag}`, "*"]) {
+      const custom = await fetch(`${base}/api/device/desired`, { headers: { ...device.headers, "x-equip-if-none-match": validator } });
+      assert.equal(custom.status, 304);
+      assert.equal(custom.headers.get("etag"), etag);
+      assert.equal(await custom.text(), "");
+      const vary = custom.headers.get("vary")!.toLowerCase().split(/,\s*/);
+      for (const header of ["authorization", "cookie", "if-none-match", "x-equip-if-none-match", "accept-encoding"]) assert.ok(vary.includes(header));
+    }
+    const mismatched = await fetch(`${base}/api/device/desired`, { headers: { ...device.headers, "x-equip-if-none-match": '"stale"' } });
+    assert.equal(mismatched.status, 200);
+    assert.equal(mismatched.headers.get("etag"), etag);
+    assert.equal((await mismatched.json()).skills.length, 1);
+    const either = await fetch(`${base}/api/device/desired`, { headers: { ...device.headers, "if-none-match": '"stale"', "x-equip-if-none-match": etag } });
+    assert.equal(either.status, 304);
+    assert.equal(await either.text(), "");
     await call(`/api/devices/${device.deviceId}/local-sync`, { method: "PATCH", body: JSON.stringify({ enabled: false }) }, cookie);
     assert.equal((await getDesired(home, base, token)).localSync, false);
     assert.equal((await getDesired(home, base, other.headers.authorization.slice(7))).skills.length, 0);
