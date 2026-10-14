@@ -10,7 +10,7 @@ export async function getDesired(home: string, server: string, token: string) {
   const identity = createHash("sha256").update(`${server}\0${token}`).digest("hex");
   const cached = await readFile(path, "utf8").then(value => JSON.parse(value) as { identity: string; etag?: string; desired: DesiredState }).catch(error => { if (error.code === "ENOENT" || error instanceof SyntaxError) return undefined; throw error; });
   const response = await fetch(`${server}/api/device/desired`, {
-    headers: { authorization: `Bearer ${token}`, ...(cached?.identity === identity && cached.etag ? { "if-none-match": cached.etag } : {}) },
+    headers: { authorization: `Bearer ${token}`, ...(cached?.identity === identity && cached.etag ? { "if-none-match": cached.etag, "x-equip-if-none-match": cached.etag } : {}) },
     signal: AbortSignal.timeout(30_000),
   });
   if (response.status === 304 && cached?.identity === identity) return cached.desired;

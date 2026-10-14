@@ -31,13 +31,17 @@ test("stable CLI syncs read no workspace blobs and do not repost receipts", { ti
   await new Promise<void>(done => listener.once("listening", done));
   const upstream = `http://127.0.0.1:${(listener.address() as AddressInfo).port}`;
   let receiptUploads = 0;
+  const desiredPolls: Array<{ validator?: string; status: number; bytes: number }> = [];
   const proxy = createServer(async (request, response) => {
     if (request.url === "/api/device/receipts") receiptUploads++;
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const forwardedHeaders = { ...request.headers };
+    // Match Vercel's external rewrite rather than forwarding every header verbatim.
+    delete forwardedHeaders["if-none-match"];
     const forwarded = await fetch(`${upstream}${request.url}`, {
       method: request.method,
-      headers: request.headers as Record<string, string>,
+      headers: forwardedHeaders as Record<string, string>,
       body: request.method === "GET" || request.method === "HEAD" ? undefined : Buffer.concat(chunks),
     });
     const headers = Object.fromEntries(forwarded.headers.entries());
@@ -45,7 +49,12 @@ test("stable CLI syncs read no workspace blobs and do not repost receipts", { ti
     delete headers["content-length"];
     delete headers["transfer-encoding"];
     response.writeHead(forwarded.status, headers);
-    response.end(Buffer.from(await forwarded.arrayBuffer()));
+    const body = Buffer.from(await forwarded.arrayBuffer());
+    if (request.url === "/api/device/desired") {
+      const validator = request.headers["x-equip-if-none-match"];
+      desiredPolls.push({ validator: typeof validator === "string" ? validator : undefined, status: forwarded.status, bytes: body.length });
+    }
+    response.end(body);
   });
   proxy.listen(0, "127.0.0.1");
   await new Promise<void>(done => proxy.once("listening", done));
@@ -135,8 +144,15 @@ test("stable CLI syncs read no workspace blobs and do not repost receipts", { ti
   await runCli(environment);
   receiptUploads = 0;
   blobReads = 0;
+  desiredPolls.length = 0;
   await runCli(environment);
   await runCli(environment);
+  assert.equal(desiredPolls.length, 4, "each sync still polls before and after its heartbeat");
+  for (const poll of desiredPolls) {
+    assert.ok(poll.validator, "cached polls must forward the custom validator");
+    assert.equal(poll.status, 304, "unchanged polls must return 304 at the origin");
+    assert.equal(poll.bytes, 0, "origin 304 responses must have no body");
+  }
   assert.equal(receiptUploads, 0, "stable syncs must not upload identical receipts");
   assert.equal(blobReads, 0, "stable syncs must not read workspace, device, or bundle blobs");
 
