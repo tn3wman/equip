@@ -668,7 +668,11 @@ export async function createApp(
   };
   const conditional = (req: Request, res: Response, etag: string) => {
     res.set({ ETag: etag, "Cache-Control": "private, no-cache" });
-    const matches = req.get("if-none-match")?.split(",").some(tag => tag.trim().replace(/^W\//, "") === etag.replace(/^W\//, "") || tag.trim() === "*");
+    // Compression skips bodyless 304s, so preserve its Vary field here too.
+    res.vary("Authorization, Cookie, If-None-Match, X-Equip-If-None-Match, Accept-Encoding");
+    // Vercel external rewrites strip If-None-Match before forwarding to the origin.
+    const matches = [req.get("if-none-match"), req.get("x-equip-if-none-match")].some(validator =>
+      validator?.split(",").some(tag => tag.trim().replace(/^W\//, "") === etag.replace(/^W\//, "") || tag.trim() === "*"));
     if (matches) { res.status(304).end(); return true; }
     return false;
   };
