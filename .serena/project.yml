@@ -173,3 +173,8 @@ read_only_memory_patterns: []
 # Extends the list from the global configuration, merging the two lists.
 # Example: ["_archive/.*", "_episodes/.*"]
 ignored_memory_patterns: []
+
+# Explicit Serena 2.0 defaults also load unchanged in Serena 1.7.
+agent_interface:
+excluded_apis: []
+included_apis: []
