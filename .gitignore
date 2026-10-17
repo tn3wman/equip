@@ -16,3 +16,10 @@ coverage/
 *.pfx
 *.log
 .DS_Store
+
+# Serena shares project settings and reviewed memories, not runtime data.
+!/.serena/
+/.serena/*
+!/.serena/.gitignore
+!/.serena/project.yml
+!/.serena/memories/
