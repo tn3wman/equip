@@ -1,0 +1,5 @@
+# Share project configuration and reviewed memories; keep generated state local.
+/*
+!/.gitignore
+!/project.yml
+!/memories/
