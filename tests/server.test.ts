@@ -694,6 +694,29 @@ test("device authorization is account-bound, single-use, and receipts drive stat
   assert.equal(requestedAgain.body.disconnectedAt, undefined);
 });
 
+test("heartbeats record the reporting CLI version and reject malformed versions", async () => {
+  const cookie = await register("cli-version@example.com");
+  const device = await connectDevice(cookie, "Version laptop");
+  const heartbeat = (body: unknown) =>
+    call("/api/device/heartbeat", { method: "POST", headers: device.headers, body: JSON.stringify(body) });
+  const reported = async () =>
+    (await call("/api/workspace", {}, cookie)).body.devices.find((item: any) => item.id === device.deviceId).cliVersion;
+
+  assert.equal(await reported(), undefined);
+  assert.equal((await heartbeat({ cliVersion: "1.1.9" })).response.status, 200);
+  assert.equal(await reported(), "1.1.9");
+  assert.equal((await heartbeat({ name: "Version laptop" })).response.status, 200);
+  assert.equal(await reported(), "1.1.9", "a heartbeat without cliVersion keeps the last report");
+  for (const cliVersion of [119, "latest", "1.1", `1.1.9-${"x".repeat(64)}`]) {
+    const rejected = await heartbeat({ cliVersion });
+    assert.equal(rejected.response.status, 400);
+    assert.equal(rejected.body.error, "cliVersion must be a release version.");
+  }
+  assert.equal(await reported(), "1.1.9");
+  assert.equal((await heartbeat({ cliVersion: "1.2.0" })).response.status, 200);
+  assert.equal(await reported(), "1.2.0");
+});
+
 test("target exceptions remain overrides, stale receipts do not sync, and import consumes a conflict", async () => {
   const cookie = await register("conflicts@example.com");
   const files = [

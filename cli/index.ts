@@ -287,7 +287,7 @@ async function maybeUpdate(s: State) {
   await saveWorkerFields(s, { lastUpdateCheck: s.lastUpdateCheck });
   const base = s.server || server;
   if (new URL(base).protocol !== "https:") return false;
-  const response = await fetch(`${base}/cli/manifest`, {
+  const response = await fetch(`${base}/cli/manifest/v2`, {
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok)
@@ -435,6 +435,7 @@ async function applyState(s: State) {
         name: s.name || hostname(),
         os: platform(),
         arch: process.arch,
+        cliVersion: CLI_RELEASE_VERSION,
         localSyncPath: join(equipHome, "skills"),
         localSyncError: [...local.errors,...localInstructions.errors].join("\n"),
         instructionLocations,

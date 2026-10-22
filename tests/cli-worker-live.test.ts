@@ -109,8 +109,8 @@ test("a rejected worker update stays visible without blocking skill installation
         buildApi.onLoad({ filter: /[\\/]cli[\\/]update\.ts$/ }, async args => {
           const source = await readFile(args.path, "utf8");
           const contents = source.replace(
-            /export const RELEASE_PUBLIC_KEY = `[^`]+`;/,
-            `export const RELEASE_PUBLIC_KEY = ${JSON.stringify(publicKeyPem)};`,
+            /export const RELEASE_PUBLIC_KEYS: readonly string\[\] = \[[^\]]+\];/,
+            `export const RELEASE_PUBLIC_KEYS: readonly string[] = [${JSON.stringify(publicKeyPem)}];`,
           );
           assert.notEqual(contents, source, "the bundled worker must use the test release key");
           return { contents, loader: "ts" };
@@ -131,7 +131,7 @@ test("a rejected worker update stays visible without blocking skill installation
     key: await readFile(certificateKey),
     cert: await readFile(certificate),
   }, async (request, response) => {
-    if (request.url === "/cli/manifest") {
+    if (request.url === "/cli/manifest/v2") {
       manifestRequests++;
       const origin = `https://127.0.0.1:${(secureProxy.address() as AddressInfo).port}`;
       const payload = {

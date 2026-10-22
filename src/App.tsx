@@ -1711,7 +1711,8 @@ function Devices({
                         : device.os === "linux"
                           ? "Linux"
                           : device.os}{" "}
-                    · {device.arch} · {configurations} configurations across{" "}
+                    · {device.arch}
+                    {device.cliVersion && ` · Equip ${device.cliVersion}`} · {configurations} configurations across{" "}
                     {agentTypes} {agentTypes === 1 ? "agent type" : "agent types"}
                   </p>
                 </div>

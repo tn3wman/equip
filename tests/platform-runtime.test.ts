@@ -81,7 +81,7 @@ test("native first installer recovers from an interrupted package install", { ti
   const integrity = `sha512-${Buffer.alloc(64, 9).toString("base64")}`;
   const server = createServer((request, response) => {
     const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    if (request.url === "/cli/manifest") {
+    if (request.url === "/cli/manifest/v2") {
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({
         schema: 1,
