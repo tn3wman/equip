@@ -35,7 +35,8 @@ export async function createReleaseManifest(input: {
   origin: string;
   skillsVersion: string;
   skillsIntegrity: string;
-  privateKey?: string;
+  /** PKCS#8 PEM Ed25519 key. Undefined yields an unsigned manifest that every CLI rejects. */
+  privateKey: string | undefined;
 }): Promise<SignedReleaseManifest> {
   const origin = new URL(input.origin).origin;
   const payload = {
@@ -48,12 +49,7 @@ export async function createReleaseManifest(input: {
     url: `${origin}/cli/equip.cjs`,
     origin,
   } as const;
-  const privateKey = input.privateKey ?? process.env.EQUIP_RELEASE_PRIVATE_KEY;
-  if (!privateKey) {
-    if (process.env.NODE_ENV === "production")
-      throw new Error("EQUIP_RELEASE_PRIVATE_KEY is required in production.");
-    return { ...payload, signature: "development-unsigned" };
-  }
-  const signature = sign(null, Buffer.from(releasePayload(payload)), createPrivateKey(privateKey));
+  if (!input.privateKey) return { ...payload, signature: "development-unsigned" };
+  const signature = sign(null, Buffer.from(releasePayload(payload)), createPrivateKey(input.privateKey));
   return { ...payload, signature: signature.toString("base64") };
 }

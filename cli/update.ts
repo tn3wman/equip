@@ -14,14 +14,22 @@ import {
 
 const exec = promisify(execFile);
 
-export const RELEASE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA3DDYsvr1wWjlesnP9hKvaaLz1ssv13GOeCtxkYjyqik=
------END PUBLIC KEY-----`;
+// Manifests from /cli/manifest/v2 are signed with the primary key. The backup key's
+// private half is kept offline so a future rotation does not strand installed CLIs.
+// The pre-1.1.9 key leaked and must never be trusted again.
+export const RELEASE_PUBLIC_KEYS: readonly string[] = [
+  `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAfLCDpuNEx4LyU4WgqY7XDaMiScpZz6EoGjbSTsqzSf4=
+-----END PUBLIC KEY-----`,
+  `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAbGKWQ2wk5BuCTGG7nGMlQnUDF/hfADjeMXCnJh6EssY=
+-----END PUBLIC KEY-----`,
+];
 
 export function verifyReleaseManifest(
   input: unknown,
   expectedOrigin: string,
-  publicKey = RELEASE_PUBLIC_KEY,
+  publicKeys: readonly string[] = RELEASE_PUBLIC_KEYS,
 ): SignedReleaseManifest {
   if (!input || typeof input !== "object") throw new Error("Invalid release manifest.");
   const manifest = input as Record<string, unknown>;
@@ -45,15 +53,12 @@ export function verifyReleaseManifest(
     throw new Error("Automatic updates require HTTPS.");
   if (origin.origin !== expected.origin || artifact.origin !== expected.origin || artifact.pathname !== "/cli/equip.cjs" || artifact.search || artifact.hash)
     throw new Error("Release manifest origin mismatch.");
-  if (!publicKey) throw new Error("This CLI has no pinned release key.");
+  if (publicKeys.length === 0) throw new Error("This CLI has no pinned release key.");
   const signed = manifest as SignedReleaseManifest;
-  const valid = verify(
-    null,
-    Buffer.from(releasePayload(signed)),
-    createPublicKey(publicKey),
-    Buffer.from(signed.signature, "base64"),
-  );
-  if (!valid) throw new Error("Release manifest signature is invalid.");
+  const payload = Buffer.from(releasePayload(signed));
+  const signature = Buffer.from(signed.signature, "base64");
+  if (!publicKeys.some(key => verify(null, payload, createPublicKey(key), signature)))
+    throw new Error("Release manifest signature is invalid.");
   return signed;
 }
 

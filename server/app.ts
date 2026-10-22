@@ -49,6 +49,7 @@ import { PollCache } from "./poll-cache.ts";
 import { updateHeartbeat } from "./heartbeat.ts";
 import { PersistentRateLimiter, rateLimitKey } from "./rate-limit.ts";
 import { hasMergeMarkers } from "../shared/merge.ts";
+import { isReleaseVersion } from "../shared/release.ts";
 import { registerAccountRoutes } from "./account.ts";
 import { createReleaseManifest, npmPackageIntegrity } from "./release.ts";
 
@@ -584,6 +585,8 @@ export async function createApp(
     databaseCa?: string;
     emailAuthEnabled?: boolean;
     sendSignIn?: SendSignIn;
+    /** Built CLI bundle served by /cli/equip.cjs and described by release manifests. */
+    cliArtifact?: string;
   } = {},
 ) {
   const registrationEmail = (
@@ -2407,6 +2410,12 @@ export async function createApp(
             ...(agent.detectionPath ? {detectionPath:agent.detectionPath} : {}),
           }));
         }
+        if (req.body?.cliVersion !== undefined) {
+          const cliVersion = req.body.cliVersion;
+          if (typeof cliVersion !== "string" || cliVersion.length > 64 || !isReleaseVersion(cliVersion))
+            throw httpError(400, "cliVersion must be a release version.");
+          patch.cliVersion = cliVersion;
+        }
         if (req.body?.instructionLocations !== undefined)
           patch.instructionLocations = validateInstructionLocations(req.body.instructionLocations);
         if (req.body?.instructionUnavailable !== undefined)
@@ -2729,26 +2738,36 @@ export async function createApp(
     }),
   );
 
+  const cliArtifact = options.cliArtifact ?? path.resolve("dist/equip.cjs");
   app.get("/cli/equip.cjs", (_req, res) => {
-    const artifact = path.resolve("dist/equip.cjs");
-    if (!fs.existsSync(artifact))
+    if (!fs.existsSync(cliArtifact))
       return res
         .status(404)
         .json({ error: "CLI artifact has not been built." });
-    res.type("application/octet-stream").sendFile(artifact);
+    res.type("application/octet-stream").sendFile(cliArtifact);
   });
-  app.get("/cli/manifest", async (req, res, next) => {
-    try {
-      const artifact = path.resolve("dist/equip.cjs");
-      if (!fs.existsSync(artifact))
-        throw httpError(404, "CLI artifact has not been built.");
-      const compatibility = await (await upstream()).getCompatibility();
-      const skillsIntegrity = await npmPackageIntegrity("skills", compatibility.version);
-      res.json(await createReleaseManifest({artifact, origin:publicOrigin(req), skillsVersion:compatibility.version, skillsIntegrity}));
-    } catch (error) {
-      next(error);
-    }
-  });
+  // Each manifest route signs with its own key, read per request, so a missing
+  // key fails only its route.
+  const releaseManifest = (keyVariable: "EQUIP_RELEASE_PRIVATE_KEY" | "EQUIP_RELEASE_PRIVATE_KEY_V2") =>
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const privateKey = process.env[keyVariable] || undefined;
+        if (!privateKey && process.env.NODE_ENV === "production")
+          throw new Error(`${keyVariable} is required in production.`);
+        if (!fs.existsSync(cliArtifact))
+          throw httpError(404, "CLI artifact has not been built.");
+        const compatibility = await (await upstream()).getCompatibility();
+        const skillsIntegrity = await npmPackageIntegrity("skills", compatibility.version);
+        res.json(await createReleaseManifest({artifact:cliArtifact, origin:publicOrigin(req), skillsVersion:compatibility.version, skillsIntegrity, privateKey}));
+      } catch (error) {
+        next(error);
+      }
+    };
+  // Legacy: CLIs <= 1.1.8 pin the leaked pre-rotation key and only fetch this route,
+  // so it exists solely to move them to 1.1.9. Remove it and EQUIP_RELEASE_PRIVATE_KEY
+  // once every device heartbeat reports cliVersion >= 1.1.9.
+  app.get("/cli/manifest", releaseManifest("EQUIP_RELEASE_PRIVATE_KEY"));
+  app.get("/cli/manifest/v2", releaseManifest("EQUIP_RELEASE_PRIVATE_KEY_V2"));
   app.get("/cli/skills-version", async (_req, res, next) => {
     try {
       res.json({

@@ -3,7 +3,7 @@ const NODE_VERSION = "22.20.0";
 export function shellInstaller(origin: string, _skillsVersion: string) {
   return `#!/bin/sh
 # The first install trusts this HTTPS origin and its artifact hash. The installed
-# CLI pins Equip's release key and requires signed manifests for later updates.
+# CLI pins Equip's release keys and requires signed manifests for later updates.
 set -eu
 install_root="${"$"}{EQUIP_INSTALL_ROOT:-${"$"}HOME/.equip}"
 runtime="${"$"}install_root/runtime"
@@ -42,7 +42,7 @@ else
 fi
 
 mkdir -p "${"$"}runtime" "${"$"}bin_dir"
-curl -fsSL "${origin}/cli/manifest" -o "${"$"}runtime/manifest.json"
+curl -fsSL "${origin}/cli/manifest/v2" -o "${"$"}runtime/manifest.json"
 "${"$"}node_bin" -e "const fs=require('fs');const m=JSON.parse(fs.readFileSync(process.argv[1]));const o=new URL(process.argv[2]);if(m.origin!==o.origin||new URL(m.url).origin!==o.origin||new URL(m.url).pathname!=='/cli/equip.cjs'){console.error('Equip release origin mismatch.');process.exit(1)}" "${"$"}runtime/manifest.json" "${origin}"
 curl -fsSL "${origin}/cli/equip.cjs" -o "${"$"}runtime/equip.cjs.download"
 "${"$"}node_bin" -e "const fs=require('fs'),c=require('crypto');const m=JSON.parse(fs.readFileSync(process.argv[1]));const actual=c.createHash('sha256').update(fs.readFileSync(process.argv[2])).digest('hex');if(actual!==m.sha256){console.error('Equip CLI checksum mismatch.');process.exit(1)}" "${"$"}runtime/manifest.json" "${"$"}runtime/equip.cjs.download"
@@ -87,7 +87,7 @@ if [ "${"$"}{EQUIP_HEADLESS:-0}" = 1 ] || ! (: < /dev/tty) 2>/dev/null; then "${
 
 export function powershellInstaller(origin: string, _skillsVersion: string) {
   return `# The first install trusts this HTTPS origin and its artifact hash. The installed
-# CLI pins Equip's release key and requires signed manifests for later updates.
+# CLI pins Equip's release keys and requires signed manifests for later updates.
 $ErrorActionPreference = 'Stop'
 $installRoot = if ($env:EQUIP_INSTALL_ROOT) { $env:EQUIP_INSTALL_ROOT } else { Join-Path $HOME '.equip' }
 $runtime = Join-Path $installRoot 'runtime'
@@ -118,7 +118,7 @@ if (-not $node -or $useBundled) {
   $nodePath = Join-Path $nodeDir 'node.exe'
 } else { $nodePath = $node.Source }
 New-Item -ItemType Directory -Force -Path $runtime,$binDir | Out-Null
-Invoke-WebRequest '${origin}/cli/manifest' -UseBasicParsing -OutFile (Join-Path $runtime 'manifest.json')
+Invoke-WebRequest '${origin}/cli/manifest/v2' -UseBasicParsing -OutFile (Join-Path $runtime 'manifest.json')
 Invoke-WebRequest '${origin}/cli/equip.cjs' -UseBasicParsing -OutFile (Join-Path $runtime 'equip.cjs.download')
 $manifest = Get-Content (Join-Path $runtime 'manifest.json') | ConvertFrom-Json
 if ($manifest.origin -ne '${origin}' -or ([Uri]$manifest.url).GetLeftPart([UriPartial]::Authority) -ne '${origin}' -or ([Uri]$manifest.url).AbsolutePath -ne '/cli/equip.cjs') { throw 'Equip release origin mismatch.' }

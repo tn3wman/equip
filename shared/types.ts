@@ -113,6 +113,8 @@ export interface Device {
   name: string;
   os: string;
   arch: string;
+  /** Equip CLI release reported by the device's latest heartbeat. */
+  cliVersion?: string;
   online: boolean;
   lastSeen: string;
   lastSync?: string;
