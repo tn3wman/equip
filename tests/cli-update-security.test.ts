@@ -103,7 +103,7 @@ test("a manifest verifies against any trusted key and is rejected by every other
     assert.throws(() => verifyReleaseManifest(unknown.manifest, "https://equip.example", trusted), /signature is invalid/);
     assert.throws(() => verifyReleaseManifest(primary.manifest, "https://equip.example", []), /no pinned release key/);
     // Shipped CLIs reject manifests signed by any key outside the pinned list,
-    // including the leaked key served on the legacy /cli/manifest route.
+    // including the leaked pre-rotation key.
     assert.throws(() => verifyReleaseManifest(unknown.manifest, "https://equip.example"), /signature is invalid/);
     assert.throws(
       () => verifyReleaseManifest(primary.manifest, "https://equip.example", [LEAKED_RELEASE_PUBLIC_KEY]),
