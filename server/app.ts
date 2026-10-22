@@ -2746,28 +2746,23 @@ export async function createApp(
         .json({ error: "CLI artifact has not been built." });
     res.type("application/octet-stream").sendFile(cliArtifact);
   });
-  // Each manifest route signs with its own key, read per request, so a missing
-  // key fails only its route.
-  const releaseManifest = (keyVariable: "EQUIP_RELEASE_PRIVATE_KEY" | "EQUIP_RELEASE_PRIVATE_KEY_V2") =>
-    async (req: Request, res: Response, next: NextFunction) => {
-      try {
-        const privateKey = process.env[keyVariable] || undefined;
-        if (!privateKey && process.env.NODE_ENV === "production")
-          throw new Error(`${keyVariable} is required in production.`);
-        if (!fs.existsSync(cliArtifact))
-          throw httpError(404, "CLI artifact has not been built.");
-        const compatibility = await (await upstream()).getCompatibility();
-        const skillsIntegrity = await npmPackageIntegrity("skills", compatibility.version);
-        res.json(await createReleaseManifest({artifact:cliArtifact, origin:publicOrigin(req), skillsVersion:compatibility.version, skillsIntegrity, privateKey}));
-      } catch (error) {
-        next(error);
-      }
-    };
-  // Legacy: CLIs <= 1.1.8 pin the leaked pre-rotation key and only fetch this route,
-  // so it exists solely to move them to 1.1.9. Remove it and EQUIP_RELEASE_PRIVATE_KEY
-  // once every device heartbeat reports cliVersion >= 1.1.9.
-  app.get("/cli/manifest", releaseManifest("EQUIP_RELEASE_PRIVATE_KEY"));
-  app.get("/cli/manifest/v2", releaseManifest("EQUIP_RELEASE_PRIVATE_KEY_V2"));
+  // Signed with the key matching the CLI's primary pinned key, read per request.
+  // The /cli/manifest route for CLIs <= 1.1.8 was signed with the leaked
+  // pre-rotation key; it and that key are retired, so the path now returns 404.
+  app.get("/cli/manifest/v2", async (req, res, next) => {
+    try {
+      const privateKey = process.env.EQUIP_RELEASE_PRIVATE_KEY_V2 || undefined;
+      if (!privateKey && process.env.NODE_ENV === "production")
+        throw new Error("EQUIP_RELEASE_PRIVATE_KEY_V2 is required in production.");
+      if (!fs.existsSync(cliArtifact))
+        throw httpError(404, "CLI artifact has not been built.");
+      const compatibility = await (await upstream()).getCompatibility();
+      const skillsIntegrity = await npmPackageIntegrity("skills", compatibility.version);
+      res.json(await createReleaseManifest({artifact:cliArtifact, origin:publicOrigin(req), skillsVersion:compatibility.version, skillsIntegrity, privateKey}));
+    } catch (error) {
+      next(error);
+    }
+  });
   app.get("/cli/skills-version", async (_req, res, next) => {
     try {
       res.json({
