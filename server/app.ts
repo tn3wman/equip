@@ -2813,8 +2813,9 @@ export async function createApp(
   });
 
   let updating = false;
+  let closed = false;
   const runAutoUpdates = async () => {
-    if (updating) return;
+    if (updating || closed) return;
     updating = true;
     try {
       await limiter.cleanup();
@@ -2933,10 +2934,17 @@ export async function createApp(
   const intervalMs = options.autoUpdateIntervalMs ?? 15 * 60_000;
   const updateTimer =
     intervalMs > 0
-      ? setInterval(() => void runAutoUpdates(), intervalMs)
+      ? setInterval(() => {
+          void runAutoUpdates().catch(() => {
+            // Database errors can contain credentials. Keep the background
+            // failure visible without logging the raw error or its stack.
+            console.error("Automatic update tick failed. Will retry on the next scheduled tick.");
+          });
+        }, intervalMs)
       : undefined;
   updateTimer?.unref();
   const close = async () => {
+    closed = true;
     if (updateTimer) clearInterval(updateTimer);
     await db.close();
   };
