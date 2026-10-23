@@ -118,9 +118,10 @@ export class ImprovementStore {
       return e;
     });
     return this.transaction(()=>{
-      const previousFeedback=new Set(this.all<FeedbackInput>('feedback').map(f=>f.id));
+      const previousFeedback=new Set<string>();
       for(const e of entries.sort((a,b)=>order.indexOf(a.kind)-order.indexOf(b.kind))) {
         const existed=this.get(e.kind,e.id);
+        if(existed && e.kind==='feedback') previousFeedback.add(e.id);
         switch(e.kind) {
           case 'configuration': if(this.recordConfiguration(e.data)!==e.id) throw new Error('Configuration digest mismatch.'); break;
           case 'run': { const run=runInput(e.data); if(run.id!==e.id) throw new Error('Run id mismatch.'); this.require('configuration',digest(run.configuration)); this.put('run',run.id,run); break; }
@@ -139,16 +140,16 @@ export class ImprovementStore {
       const sourceGroups = new Map<string,string[]>();
       for (const e of incoming) {
         const key=canonical([e.data.runId,new Date(e.createdAt).toISOString()]);
-        sourceGroups.set(key,[...(sourceGroups.get(key)??[]),e.id]);
+        const group=sourceGroups.get(key)??[];group.push(e.id);sourceGroups.set(key,group);
       }
-      const destinationGroups = new Map<string,string[]>();
-      for (const row of this.db.prepare("SELECT id,data,created_at FROM entries WHERE kind='feedback' ORDER BY created_at,rowid").iterate()) {
-        const key=canonical([JSON.parse(row.data as string).runId,row.created_at]);
-        if(sourceGroups.has(key)) destinationGroups.set(key,[...(destinationGroups.get(key)??[]),row.id as string]);
-      }
+      // Inspect only the incoming timestamp/run groups. Chunked restores must
+      // not parse every prior feedback body again for each incoming chunk.
+      const tiedFeedback=this.db.prepare("SELECT id FROM entries WHERE kind='feedback' AND created_at=? AND json_extract(data,'$.runId')=? ORDER BY rowid");
       for(const [key,ids] of sourceGroups) {
-        const actual=destinationGroups.get(key)??[];
-        if(canonical(actual.filter(id=>sourceIds.has(id)))!==canonical(ids) || (ids.some(id=>!previousFeedback.has(id)) && actual.some((id,index)=>!sourceIds.has(id)&&(!precedingFeedback.has(id)||index>actual.findIndex(item=>sourceIds.has(item)))))) throw new Error('Ambiguous feedback ordering in overlapping import; restore to a new ledger or reconcile the source ordering.');
+        const [runId,createdAt]=JSON.parse(key) as [string,string];
+        const actual=(tiedFeedback.all(createdAt,runId) as Array<{id:string}>).map(row=>row.id);
+        const firstIncoming=actual.findIndex(id=>sourceIds.has(id));
+        if(canonical(actual.filter(id=>sourceIds.has(id)))!==canonical(ids) || (ids.some(id=>!previousFeedback.has(id)) && actual.some((id,index)=>!sourceIds.has(id)&&(!precedingFeedback.has(id)||index>firstIncoming)))) throw new Error('Ambiguous feedback ordering in overlapping import; restore to a new ledger or reconcile the source ordering.');
       }
       return { imported:entries.length };
     });
