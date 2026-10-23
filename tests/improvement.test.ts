@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -137,8 +137,9 @@ test('snapshot hashes exact declared instruction bytes and skill contents withou
   const input = { provider: 'fixture', model: 'fixture-model', harness: 'offline-test', settings: {}, instructions: [instruction], skills: [skill] };
   const first = await snapshot(input);
   assert.equal(first.basis, 'declared');
-  assert.deepEqual(first.instructions, [{ path: instruction, sha256: createHash('sha256').update(bytes).digest('hex') }]);
+  assert.deepEqual(first.instructions, [{ path: await realpath(instruction), sha256: createHash('sha256').update(bytes).digest('hex') }]);
   assert.equal(first.skills[0].name, 'fixture-skill');
+  assert.equal(first.skills[0].path, await realpath(skill));
   await writeFile(join(skill, 'reference.txt'), 'Changed evidence\n');
   assert.notEqual((await snapshot(input)).skills[0].revision, first.skills[0].revision);
   await writeFile(instruction, bytes.toString().replaceAll('\r\n', '\n'));
@@ -190,24 +191,27 @@ test('evaluation makes three paired repetitions with pinned configurations and s
 
 test('a reservation survives reopen before execution and uncertain work cannot be replayed', async t => {
   const root = await directory(t), path = await runnerFile(t), store = await ImprovementStore.open(root);
-  const e = seed(store);
-  let id = '';
-  await evaluate(store, e.id, path, { repetitions: 1, execute: async (_runner, request) => {
-    id = digest([e.id, request.case.id, request.arm, request.replicate]);
-    const observer = await ImprovementStore.open(root);
-    try { assert.equal(observer.require<Trial>('trial', id).state, 'running'); }
-    finally { observer.close(); }
-    return { grade: 'unknown', evidence: ['Execution interrupted fixture'] };
-  } });
-  store.close();
-  const reopened = await ImprovementStore.open(root); t.after(() => reopened.close());
-  assert.equal(reopened.require<Trial>('trial', id).state, 'finished');
-  const experiment = reopened.require<ExperimentInput>('experiment', e.id);
-  const trial: Trial = { id: digest([e.id, 'case-1', 'candidate', 2]), experimentId: e.id, caseId: 'case-1', arm: 'candidate', replicate: 2, configurationId: experiment.candidate, runnerSha256: createHash('sha256').update(await readFile(path)).digest('hex'), state: 'running', grade: 'unknown', evidence: [] };
-  reopened.reserveTrial(trial);
-  let invoked = false;
-  await assert.rejects(evaluate(reopened, e.id, path, { execute: async () => { invoked = true; return { grade: 'pass', evidence: ['Unexpected'] }; } }), /uncertain execution/);
-  assert.equal(invoked, false);
+  let experimentId = '', id = '';
+  try {
+    const e = seed(store); experimentId = e.id;
+    await evaluate(store, e.id, path, { repetitions: 1, execute: async (_runner, request) => {
+      id = digest([e.id, request.case.id, request.arm, request.replicate]);
+      const observer = await ImprovementStore.open(root);
+      try { assert.equal(observer.require<Trial>('trial', id).state, 'running'); }
+      finally { observer.close(); }
+      return { grade: 'unknown', evidence: ['Execution interrupted fixture'] };
+    } });
+  } finally { store.close(); }
+  const reopened = await ImprovementStore.open(root);
+  try {
+    assert.equal(reopened.require<Trial>('trial', id).state, 'finished');
+    const experiment = reopened.require<ExperimentInput>('experiment', experimentId);
+    const trial: Trial = { id: digest([experimentId, 'case-1', 'candidate', 2]), experimentId, caseId: 'case-1', arm: 'candidate', replicate: 2, configurationId: experiment.candidate, runnerSha256: createHash('sha256').update(await readFile(path)).digest('hex'), state: 'running', grade: 'unknown', evidence: [] };
+    reopened.reserveTrial(trial);
+    let invoked = false;
+    await assert.rejects(evaluate(reopened, experimentId, path, { execute: async () => { invoked = true; return { grade: 'pass', evidence: ['Unexpected'] }; } }), /uncertain execution/);
+    assert.equal(invoked, false);
+  } finally { reopened.close(); }
 });
 
 for (const failure of ['Runner failed', 'Runner timed out; execution was not retried.']) test(`evaluation stops after ${failure} and retains the consumed slot`, async t => {
