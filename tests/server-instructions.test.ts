@@ -47,6 +47,45 @@ async function device(cookie: string) {
 
 const files = (filename: "CLAUDE.md" | "AGENTS.md", content: string) => [{ path: filename, content }];
 
+test("instruction publication atomically preserves an intervening draft", async () => {
+  const cookie = await account("instruction-draft-precondition@example.com");
+  const initial = files("AGENTS.md", "Published baseline\n");
+  const created = await call("/api/instructions", "POST", {
+    title: "Draft precondition", filename: "AGENTS.md", scope: "global", files: initial,
+  }, { cookie });
+  const route = `/api/instructions/${created.body.id}`;
+  const published = await call(`${route}/publish`, "POST", {
+    expectedRevision: "", expectedDraft: initial,
+  }, { cookie });
+  assert.equal(published.response.status, 200);
+  const revision = published.body.revision;
+  const draft = files("AGENTS.md", "Another editor's saved draft\n");
+  const saved = await call(route, "PATCH", { expectedRevision: revision, draft }, { cookie });
+  assert.equal(saved.body.revision, revision, "Draft saves do not advance the published revision");
+  const rejected = await call(`${route}/publish`, "POST", {
+    expectedRevision: revision, expectedDraft: null, files: files("AGENTS.md", "Automation candidate\n"),
+  }, { cookie });
+  assert.equal(rejected.response.status, 409);
+  const retained = await call(route, "GET", undefined, { cookie });
+  assert.deepEqual(retained.body.draft, draft);
+  assert.deepEqual(retained.body.files, initial);
+  assert.equal(retained.body.revision, revision);
+  const malformed = await call(`${route}/publish`, "POST", {
+    expectedRevision: revision, expectedDraft: [],
+  }, { cookie });
+  assert.equal(malformed.response.status, 400);
+  const accepted = await call(`${route}/publish`, "POST", {
+    expectedRevision: revision, expectedDraft: draft,
+  }, { cookie });
+  assert.equal(accepted.response.status, 200);
+  assert.deepEqual(accepted.body.files, draft);
+  assert.equal(accepted.body.draft, undefined);
+  const absent = await call(`${route}/publish`, "POST", {
+    expectedRevision: accepted.body.revision, expectedDraft: null, files: initial,
+  }, { cookie });
+  assert.equal(absent.response.status, 200);
+});
+
 test("instruction documents validate, publish, conflict, and roll back", async () => {
   const cookie = await account("instruction-crud@example.com");
   const invalid = await call("/api/instructions", "POST", {

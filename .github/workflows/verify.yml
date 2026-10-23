@@ -50,7 +50,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run build:cli
       - name: Test native install, update, and device authorization
-        run: npx tsx --test tests/platform-runtime.test.ts tests/cli-update-security.test.ts tests/cli-live.test.ts tests/cli-worker-live.test.ts
+        run: npx tsx --test tests/platform-runtime.test.ts tests/cli-update-security.test.ts tests/cli-live.test.ts tests/cli-worker-live.test.ts tests/improvement.test.ts tests/cli-improvement.test.ts tests/server-instructions.test.ts
 
   cli-release-version:
     name: Check CLI release version

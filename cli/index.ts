@@ -646,6 +646,11 @@ async function upgradeExistingService(s: State, retryLogon = false) {
 }
 
 async function main() {
+  if (command === "improve") {
+    const { improvementCommand } = await import("./improvement/index.ts");
+    console.log(JSON.stringify(await improvementCommand(args, equipHome), null, 2));
+    return;
+  }
   if (command === "library") {
     const operation = args[0] ?? "status";
     const s = await state();

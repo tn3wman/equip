@@ -29,6 +29,23 @@ If a CLI update fails, `equip status` reports `lastUpdateError`. Skills continue
 
 `equip status` reports conflicted destinations in `lastError` and keeps `lastSync` at the last complete sweep. `equip sync` exits nonzero when any destination fails or conflicts.
 
+## Local improvement loop
+
+CLI release 1.1.10 adds a local evidence ledger for task outcomes, explicit user feedback, and repeated baseline/candidate evaluations. It requires Node.js 22.20.0 or newer and uses built-in `node:sqlite` without new dependencies. Run `equip improve help` and confirm `feature: "improvement-loop"` before use; older CLIs may return status output instead.
+
+```sh
+equip improve help
+equip improve record --file run.json
+equip improve feedback --file feedback.json
+equip improve summary --days 7
+equip improve evaluate <experiment-id> --runner /absolute/trusted-runner.mjs --repetitions 3
+equip improve compare <experiment-id>
+```
+
+The ledger lives at `$EQUIP_HOME/improvement/ledger.sqlite`, defaulting to `~/.equip/improvement/ledger.sqlite`. Evidence stays local and separate from account sync. Missing user feedback stays unknown. Configuration snapshots identify declared inputs, not proof that a model loaded them. Evaluation runs only an explicitly supplied trusted runner in an environment you isolate; it provides no OS sandbox, automatic model calls, or recurring schedule.
+
+Use the discoverable [improve skill](skills/improve/SKILL.md) for the full loop. Its [payload and runner examples](skills/improve/references/ledger.md) cover recording, case creation, experiment setup, and keep/revert decisions. Payloads follow [the CLI types](cli/improvement/types.ts). All commands return JSON; payload commands also accept `--file -` for stdin. Use `equip improve export --directory <new-private-directory>` and `equip improve import --directory <private-directory>` for chunked backups beyond single JSON input limits. Keep private payloads and exports outside the repository.
+
 ## Develop locally
 
 Requires Node.js 22.20 or newer and npm.
