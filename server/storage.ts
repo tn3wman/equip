@@ -110,12 +110,22 @@ function postgresSql(sql: string) {
 
 class PostgresStore implements Store {
   readonly dialect = "postgres" as const;
+  private clientError?: Error;
   constructor(
     private readonly pool: Pool,
     private readonly client?: PoolClient,
   ) {}
-  private query(sql: string, values: unknown[]) {
-    return (this.client ?? this.pool).query(postgresSql(sql), values);
+  private async query(sql: string, values: unknown[]) {
+    if (!this.client) return this.pool.query(postgresSql(sql), values);
+    if (this.clientError) throw this.clientError;
+    try {
+      return await this.client.query(postgresSql(sql), values);
+    } catch (error) {
+      // pg's non-pipeline read timeout leaves the active query on the connection.
+      // Discard after any query failure rather than risk reusing an uncertain session.
+      this.clientError = error as Error;
+      throw error;
+    }
   }
   async get<T>(sql: string, ...values: unknown[]) {
     return (await this.query(sql, values)).rows[0] as T | undefined;
@@ -129,16 +139,24 @@ class PostgresStore implements Store {
   }
   async transaction<T>(work: (store: Store) => Promise<T>, options: { readOnly?: boolean } = {}) {
     const client = await this.pool.connect();
+    const transaction = new PostgresStore(this.pool, client);
+    const onError = (error: Error) => { transaction.clientError ??= error; };
+    // Checked-out clients no longer have the pool's idle error listener.
+    client.on("error", onError);
     try {
-      await client.query(options.readOnly ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : "BEGIN");
-      const result = await work(new PostgresStore(this.pool, client));
-      await client.query("COMMIT");
+      await transaction.query(options.readOnly ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : "BEGIN", []);
+      const result = await work(transaction);
+      await transaction.query("COMMIT", []);
       return result;
     } catch (error) {
-      await client.query("ROLLBACK");
+      if (!transaction.clientError) {
+        try { await transaction.query("ROLLBACK", []); }
+        catch { /* Preserve the original failure; query marks this client for disposal. */ }
+      }
       throw error;
     } finally {
-      client.release();
+      client.release(transaction.clientError);
+      client.removeListener("error", onError);
     }
   }
   async close() {
@@ -310,6 +328,9 @@ export async function openStore(options: {
       connectionString: options.databaseUrl,
       max: 5,
       connectionTimeoutMillis: 10_000,
+      // Allow large workspace reads, but bound SQL and rollback waits so stalled
+      // sessions cannot hold the five pool slots indefinitely. Never retry writes.
+      query_timeout: 30_000,
       ssl: {
         rejectUnauthorized: true,
         ...(options.databaseCa ? { ca: options.databaseCa } : {}),

@@ -51,6 +51,8 @@ npm run build
 
 The hosted setup uses Vercel for the dashboard, Railway for the API, Supabase PostgreSQL for persistence, and Resend for email. The Vercel build requires `EQUIP_API_URL` pointing to the API's HTTPS origin. The API uses `EQUIP_DATABASE_URL` for PostgreSQL and `EQUIP_PUBLIC_URL` for its public dashboard origin. Production CLI releases require `EQUIP_RELEASE_PRIVATE_KEY_V2`, an Ed25519 key matching the primary public key in `RELEASE_PUBLIC_KEYS` in [cli/update.ts](cli/update.ts); it signs `/cli/manifest/v2`, which the CLI and installers fetch. Self-hosted releases need their own signing key and corresponding CLI trust keys. Configure secrets in your hosting environment; keep credentials and local data out of Git.
 
+PostgreSQL queries have a 30-second client deadline, separate from the 10-second pool acquisition limit. Failed transaction connections are discarded without replaying writes. Health reports database readiness; a background update failure is logged and retried at the next scheduled tick.
+
 Vercel deployments from `main` are disabled for now; preview branches remain enabled. The existing hosted preview is restricted to personal access. A public repository does not make that instance a public registration service.
 
 Connecting a computer installs into local agent destinations. Separately hosted agent sessions and account skill libraries require their supported import or publishing mechanism; unavailable integrations and native instruction limits are shown explicitly. Account uploads remain manual where no supported publishing API exists.
