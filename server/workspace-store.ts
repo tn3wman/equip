@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Device, SkillFile, Workspace } from "../shared/types.ts";
 import type { Store } from "./storage.ts";
+import { packDeviceFiles, deviceFileReferences, saveFileBundles, hydrateDeviceFiles, discardDeviceFileReferences } from "./device-files.ts";
 
 type StoredFiles = { files: SkillFile[]; filesBundle?: string; draft?: SkillFile[]; draftBundle?: string };
 
@@ -27,23 +28,20 @@ export async function writeWorkspace(store: Store, accountId: string, workspace:
     item.versions.forEach(pack);
     if ("proposal" in item && item.proposal) pack(item.proposal);
   }
-  const entries = [...bundles];
-  for (let offset = 0; offset < entries.length; offset += 200) {
-    const batch = entries.slice(offset, offset + 200);
-    await store.run(`INSERT INTO skill_bundles(account_id,hash,files) VALUES ${batch.map(() => "(?,?,?)").join(",")} ON CONFLICT DO NOTHING`, ...batch.flatMap(([hash,files]) => [accountId,hash,files]));
-  }
+  for (const device of metadata.devices) packDeviceFiles(device, bundles);
+  await saveFileBundles(store, accountId, bundles);
   const deviceRows: unknown[] = [];
   for (const device of metadata.devices) {
-    const payload = JSON.stringify(device);
-    deviceRows.push(accountId, device.id, payload, device.lastSeen ?? "", device.disconnectedAt ? 1 : 0);
+    const { receipts, ...details } = device;
+    deviceRows.push(accountId, device.id, JSON.stringify(details), JSON.stringify(receipts), device.lastSeen ?? "", device.disconnectedAt ? 1 : 0);
   }
   let devicesChanged = 0;
   if (deviceRows.length) {
     const payloadChanged = store.dialect === "postgres"
-      ? "workspace_devices.payload::jsonb IS DISTINCT FROM excluded.payload::jsonb"
-      : "workspace_devices.payload<>excluded.payload";
+      ? "workspace_devices.payload::jsonb IS DISTINCT FROM excluded.payload::jsonb OR workspace_devices.receipts<>excluded.receipts"
+      : "workspace_devices.payload<>excluded.payload OR workspace_devices.receipts<>excluded.receipts";
     const result = await store.run(
-      `INSERT INTO workspace_devices(account_id,device_id,payload,version,desired_version,last_seen,disconnected) VALUES ${metadata.devices.map(() => "(?,?,?,1,1,?,?)").join(",")} ON CONFLICT(account_id,device_id) DO UPDATE SET payload=excluded.payload,version=workspace_devices.version+1,desired_version=workspace_devices.desired_version+1,last_seen=excluded.last_seen,disconnected=excluded.disconnected WHERE ${payloadChanged}`,
+      `INSERT INTO workspace_devices(account_id,device_id,payload,receipts,version,desired_version,last_seen,disconnected) VALUES ${metadata.devices.map(() => "(?,?,?,?,1,1,?,?)").join(",")} ON CONFLICT(account_id,device_id) DO UPDATE SET payload=excluded.payload,receipts=excluded.receipts,version=workspace_devices.version+1,desired_version=workspace_devices.desired_version+1,last_seen=excluded.last_seen,disconnected=excluded.disconnected WHERE ${payloadChanged}`,
       ...deviceRows,
     );
     devicesChanged += result.changes;
@@ -54,8 +52,9 @@ export async function writeWorkspace(store: Store, accountId: string, workspace:
     : await store.run("DELETE FROM workspace_devices WHERE account_id=?", accountId);
   devicesChanged += deleted.changes;
   metadata.deviceOrder = metadata.devices.map(device => device.id);
+  const deviceBundles = metadata.devices.flatMap(deviceFileReferences);
   metadata.devices = [];
-  metadata.storageVersion = 1;
+  metadata.storageVersion = 2;
   const value = JSON.stringify(metadata);
   const autoUpdates = metadata.skills.some(skill => skill.kind === "third-party" && skill.autoUpdate) ? 1 : 0;
   if (devicesChanged)
@@ -63,7 +62,7 @@ export async function writeWorkspace(store: Store, accountId: string, workspace:
   else
     await store.run("UPDATE accounts SET workspace=?,auto_updates=?,version=version+1 WHERE id=? AND (workspace<>? OR auto_updates<>?)", value, autoUpdates, accountId, value, autoUpdates);
 
-  const referencedBundles = new Set<string>();
+  const referencedBundles = new Set(deviceBundles);
   for (const item of [...metadata.skills, ...(metadata.instructions ?? []), ...(metadata.retiredSkills ?? []), ...(metadata.retiredInstructions ?? [])]) {
     const owners = [item, ...item.versions, ...("proposal" in item && item.proposal ? [item.proposal] : [])] as StoredFiles[];
     for (const owner of owners) {
@@ -87,10 +86,16 @@ export interface ReadWorkspaceOptions {
 export async function readWorkspaceWithOptions(store: Store, accountId: string, value: string, options: ReadWorkspaceOptions = {}): Promise<string> {
   const { devices = true, bundles: bundleMode = "all", preserveReferences = false } = options;
   const workspace = JSON.parse(value) as Workspace & { storageVersion?: number; deviceOrder?: string[] };
-  if (workspace.storageVersion === 1 && devices) {
-    const devices = await store.all<{payload:string}>("SELECT payload FROM workspace_devices WHERE account_id=? ORDER BY device_id", accountId);
-    const byId = new Map(devices.map(row => { const device = JSON.parse(row.payload) as Device; return [device.id, device] as const; }));
+  if ((workspace.storageVersion === 1 || workspace.storageVersion === 2) && devices) {
+    const rows = await store.all<{payload:string;receipts:string}>("SELECT payload,receipts FROM workspace_devices WHERE account_id=? ORDER BY device_id", accountId);
+    const byId = new Map(rows.map(row => { const device = JSON.parse(row.payload) as Device; device.receipts ??= JSON.parse(row.receipts); return [device.id, device] as const; }));
     workspace.devices = (workspace.deviceOrder ?? [...byId.keys()]).flatMap(id => byId.has(id) ? [byId.get(id)!] : []);
+  }
+  if (devices) {
+    // Legacy receipt APIs accepted extra fields. Only v2 references were created
+    // by this storage layer; legacy inline files must always win over such fields.
+    if (workspace.storageVersion === 2) await hydrateDeviceFiles(store, accountId, workspace.devices);
+    else discardDeviceFileReferences(workspace.devices);
   }
   const needed = new Set<string>();
   const activeItems = [...workspace.skills, ...(workspace.instructions ?? [])];
@@ -136,16 +141,18 @@ export async function readWorkspace(store: Store, accountId: string, value: stri
 }
 
 export async function migrateWorkspaces(store: Store) {
-  // Idempotent and transactional; the old row remains intact if migration fails.
-  await store.transaction(async transaction => {
-    const predicate = transaction.dialect === "postgres"
-      ? "workspace::jsonb->>'storageVersion' IS NULL AND jsonb_typeof(workspace::jsonb->'skills')='array' AND jsonb_typeof(workspace::jsonb->'devices')='array'"
-      : "json_extract(workspace,'$.storageVersion') IS NULL AND json_type(workspace,'$.skills')='array' AND json_type(workspace,'$.devices')='array'";
-    const accounts = await transaction.all<{id:string;workspace:string}>(`SELECT id,workspace FROM accounts WHERE ${predicate}${transaction.dialect === "postgres" ? " FOR UPDATE" : ""}`);
-    for (const account of accounts) {
-      const value = JSON.parse(account.workspace);
-      if (value.storageVersion === 1 || !Array.isArray(value.skills) || !Array.isArray(value.devices)) continue;
-      await writeWorkspace(transaction, account.id, value);
-    }
+  // Lock and migrate one account at a time; never load every device blob at once.
+  const predicate = store.dialect === "postgres"
+    ? "COALESCE(workspace::jsonb->>'storageVersion','0') IN ('0','1') AND jsonb_typeof(workspace::jsonb->'skills')='array' AND jsonb_typeof(workspace::jsonb->'devices')='array'"
+    : "COALESCE(json_extract(workspace,'$.storageVersion'),0) IN (0,1) AND json_type(workspace,'$.skills')='array' AND json_type(workspace,'$.devices')='array'";
+  const accounts = await store.all<{id:string}>(`SELECT id FROM accounts WHERE ${predicate}`);
+  for (const account of accounts) await store.transaction(async transaction => {
+    const row = await transaction.get<{workspace:string}>(`SELECT workspace FROM accounts WHERE id=?${transaction.dialect === "postgres" ? " FOR UPDATE" : ""}`, account.id);
+    if (!row) return;
+    const saved = JSON.parse(row.workspace);
+    if (saved.storageVersion === 2) return;
+    // Keep published/history bundle references; only device snapshots need bodies.
+    const value = JSON.parse(await readWorkspaceWithOptions(transaction, account.id, row.workspace, { bundles: "dashboard", preserveReferences: true }));
+    await writeWorkspace(transaction, account.id, value);
   });
 }

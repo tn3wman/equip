@@ -47,6 +47,7 @@ import {
 import { readWorkspace, readWorkspaceWithOptions, writeWorkspace, migrateWorkspaces } from "./workspace-store.ts";
 import { PollCache } from "./poll-cache.ts";
 import { updateHeartbeat } from "./heartbeat.ts";
+import { hydrateDeviceFiles } from "./device-files.ts";
 import { PersistentRateLimiter, rateLimitKey } from "./rate-limit.ts";
 import { hasMergeMarkers } from "../shared/merge.ts";
 import { isReleaseVersion } from "../shared/release.ts";
@@ -641,9 +642,12 @@ export async function createApp(
     const key = JSON.stringify([accountId, row.device_id, desired ? "desired-device" : "device", desired ? row.desired_version : row.version]);
     let value = pollCache.get(key);
     if (value === undefined) {
-      const stored = await db.get<{payload:string}>("SELECT payload FROM workspace_devices WHERE account_id=? AND device_id=?", accountId, row.device_id);
+      const stored = await db.get<{payload:string;receipts?:string}>(`SELECT payload${desired ? "" : ",receipts"} FROM workspace_devices WHERE account_id=? AND device_id=?`, accountId, row.device_id);
       if (!stored) throw httpError(401, "invalid_token");
-      value = stored.payload;
+      const device = JSON.parse(stored.payload) as Device;
+      device.receipts = desired ? [] : JSON.parse(stored.receipts!);
+      if (!desired) await hydrateDeviceFiles(db, accountId, [device]);
+      value = JSON.stringify(device);
       pollCache.set(key, value);
     }
     const device = JSON.parse(value) as Device;

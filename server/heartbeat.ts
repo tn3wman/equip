@@ -1,11 +1,17 @@
 import type { Store } from "./storage.ts";
+import type { Device } from "../shared/types.ts";
+import { packDeviceFiles, saveFileBundles } from "./device-files.ts";
 
-/** Merge telemetry inside the database. No device files leave the database. */
+/** Keep receipt reports and file bodies out of the telemetry UPDATE. */
 export async function updateHeartbeat(store: Store, accountId: string, deviceId: string, patch: Record<string, unknown>, seen: string) {
-  const value = JSON.stringify(patch);
+  const compact = structuredClone(patch);
+  const bundles = new Map<string, string>();
+  packDeviceFiles(compact as Partial<Device>, bundles);
+  await saveFileBundles(store, accountId, bundles);
+  const value = JSON.stringify(compact);
   if (store.dialect === "postgres") {
-    // Materialize both large JSON values: PostgreSQL otherwise repeats parsing
-    // and recursive null stripping for every reference in the UPDATE.
+    // Compute each telemetry document once rather than repeating the merge
+    // and null stripping for every version counter.
     return store.run(`WITH incoming AS (SELECT ?::jsonb AS patch, ?::text AS seen),
       previous AS MATERIALIZED (
         SELECT account_id,device_id,payload::jsonb AS data FROM workspace_devices

@@ -41,7 +41,7 @@ test("opening an existing database adds version and compact device columns idemp
   );
   assert.deepEqual(
     (await second.all<{ name: string }>("PRAGMA table_info(workspace_devices)")).map(row => row.name),
-    ["account_id", "device_id", "payload", "version", "desired_version", "last_seen", "disconnected"],
+    ["account_id", "device_id", "payload", "receipts", "version", "desired_version", "last_seen", "disconnected"],
   );
   await second.close();
   await rm(root, { recursive: true, force: true });

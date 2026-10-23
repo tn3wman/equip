@@ -53,6 +53,8 @@ The hosted setup uses Vercel for the dashboard, Railway for the API, Supabase Po
 
 PostgreSQL queries have a 30-second client deadline, separate from the 10-second pool acquisition limit. Failed transaction connections are discarded without replaying writes. Health reports database readiness; a background update failure is logged and retried at the next scheduled tick.
 
+Device presence and configuration are stored separately from sync receipts. Local file snapshots are saved once per account and shared by matching receipts and instruction locations; account exports still include their full contents. Existing device reports migrate transactionally at startup. Stop older API processes before this first migration; pre-migration binaries cannot read the new report layout.
+
 Vercel deployments from `main` are disabled for now; preview branches remain enabled. The existing hosted preview is restricted to personal access. A public repository does not make that instance a public registration service.
 
 Connecting a computer installs into local agent destinations. Separately hosted agent sessions and account skill libraries require their supported import or publishing mechanism; unavailable integrations and native instruction limits are shown explicitly. Account uploads remain manual where no supported publishing API exists.

@@ -22,7 +22,7 @@ const schema = [
   "CREATE TABLE IF NOT EXISTS auth_rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at BIGINT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS email_authorizations (token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT NOT NULL, expires_at BIGINT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS skill_bundles (account_id TEXT NOT NULL, hash TEXT NOT NULL, files TEXT NOT NULL, PRIMARY KEY(account_id,hash), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
-  "CREATE TABLE IF NOT EXISTS workspace_devices (account_id TEXT NOT NULL, device_id TEXT NOT NULL, payload TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, desired_version INTEGER NOT NULL DEFAULT 0, last_seen TEXT NOT NULL DEFAULT '', disconnected INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id,device_id), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
+  "CREATE TABLE IF NOT EXISTS workspace_devices (account_id TEXT NOT NULL, device_id TEXT NOT NULL, payload TEXT NOT NULL, receipts TEXT NOT NULL DEFAULT '[]', version INTEGER NOT NULL DEFAULT 0, desired_version INTEGER NOT NULL DEFAULT 0, last_seen TEXT NOT NULL DEFAULT '', disconnected INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id,device_id), FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE)",
 ];
 
 async function addColumn(store: Store, table: string, column: string, definition: string) {
@@ -170,6 +170,7 @@ async function initialize(store: Store) {
   const versionType = store.dialect === "postgres" ? "BIGINT" : "INTEGER";
   await addColumn(store, "accounts", "version", `${versionType} NOT NULL DEFAULT 0`);
   const addedAutoUpdates = await addColumn(store, "accounts", "auto_updates", "INTEGER NOT NULL DEFAULT 0");
+  await addColumn(store, "workspace_devices", "receipts", "TEXT NOT NULL DEFAULT '[]'");
   await addColumn(store, "workspace_devices", "version", `${versionType} NOT NULL DEFAULT 0`);
   await addColumn(store, "workspace_devices", "desired_version", `${versionType} NOT NULL DEFAULT 0`);
   const addedLastSeen = await addColumn(store, "workspace_devices", "last_seen", "TEXT NOT NULL DEFAULT ''");
