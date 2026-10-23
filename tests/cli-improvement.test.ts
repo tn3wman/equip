@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 const entry = fileURLToPath(new URL('../cli/index.ts', import.meta.url));
@@ -158,7 +159,8 @@ test('chunked CLI backup restores more than 10000 records and 2 MiB with tied fe
   const f=await fixture(t);
   const {baseline}=await seed(f);
   const {ImprovementStore}=await import('../cli/improvement/store.ts');
-  const store=await ImprovementStore.open(f.home);
+  // A shared timestamp exercises large tie groups on every operating system.
+  const store=new ImprovementStore(new DatabaseSync(join(f.home,'improvement','ledger.sqlite')),()=>new Date('2026-10-23T12:00:00Z'));
   try {
     store.transaction(()=>{
       for(let i=0;i<10020;i++)store.recordFeedback({id:`feedback-${i}`,runId:'cli-run',source:'user',verdict:i===10019?'delegate-again':'would-redo',reasons:[],note:i<142?'x'.repeat(16000):'Observed feedback'});
