@@ -1116,6 +1116,15 @@ export async function createApp(
   app.post("/api/instructions/:id/publish", ...mutate((req) => {
     const document = findInstructions(req);
     guardInstructionRevision(document, req.body?.expectedRevision);
+    // Draft saves do not change the published revision. Automation can compare
+    // the draft it read, including its absence, inside this account transaction.
+    if (req.body?.expectedDraft !== undefined) {
+      const expected = req.body.expectedDraft;
+      if (expected !== null) validateInstructionFiles(expected, document.filename);
+      if (expected === null ? document.draft !== undefined :
+        !document.draft || !sameFiles(expected, document.draft))
+        throw httpError(409, "The instruction draft changed. Review it before publishing.");
+    }
     const files = clone(req.body?.files ?? document.draft ?? document.files);
     validateInstructionFiles(files, document.filename);
     if (document.enabled && (req.workspace!.instructions ?? []).some(other =>
