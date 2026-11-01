@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { link, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { rename } from "node:fs/promises";
 
 // Windows refuses to rename over a file another process has open (a status
 // command, an editor, antivirus, or the indexer), reporting EPERM, EACCES, or
@@ -19,67 +18,42 @@ export async function renameReplacing(from: string, to: string, attempts = 20) {
   }
 }
 
-// An unreadable lock is held only while it may still be mid-creation by an older CLI.
-const ABANDONED_LOCK_MS = 10_000;
+const SQLITE_BUSY = 5;
 
 /**
- * Takes an exclusive lock file that always contains its owner. The owner is written to a
- * private file first and hard-linked into place, so the lock appears complete or not at all;
- * a process killed mid-acquisition can no longer leave an empty lock that breaks every later
- * sync. Returns the release function, or throws `busy` while a live process holds the lock.
+ * Takes an exclusive OS file lock (fcntl on macOS and Linux, LockFileEx on Windows) through
+ * Node's built-in SQLite. The kernel drops the lock when its process exits, however it dies,
+ * so a crashed holder never blocks the next caller and nothing ever reclaims a stale lock.
+ * Returns the release function, or undefined while another holder, in any process, has it.
  */
-export async function acquireLock(path: string, busy: string): Promise<() => Promise<void>> {
-  const token = randomUUID();
-  const staged = await stage(path, token);
+export function tryLock(path: string): (() => void) | undefined {
+  const db = new (sqlite().DatabaseSync)(path, { timeout: 0 });
   try {
-    if (await claim(staged, path)) return releaser(path, token);
-    if (!(await staleLock(path))) throw new Error(busy);
-    // Like the locks this replaces, two processes reclaiming the same stale lock in the same
-    // instant can both proceed; tn3wman/equip#28 tracks replacing this with an OS-level lock.
-    await rm(path, { force: true });
-    if (await claim(staged, path)) return releaser(path, token);
-    throw new Error(busy);
-  } finally {
-    await rm(staged, { force: true });
-  }
-}
-
-async function stage(path: string, token: string) {
-  const staged = `${path}.${randomUUID()}.tmp`;
-  await writeFile(staged, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), { mode: 0o600 });
-  return staged;
-}
-
-async function claim(staged: string, path: string) {
-  try {
-    await link(staged, path);
-    return true;
+    db.exec("PRAGMA journal_mode=OFF; BEGIN EXCLUSIVE");
+    return () => db.close();
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    db.close();
+    if (((error as { errcode?: number }).errcode ?? 0) % 256 === SQLITE_BUSY) return undefined;
     throw error;
   }
 }
 
-/** Removes the lock only while it is still this owner's, never a successor's. */
-function releaser(path: string, token: string) {
-  return async () => {
-    const holder = await readFile(path, "utf8").catch(() => "");
-    if (holder.includes(token)) await rm(path, { force: true });
-  };
+export function acquireLock(path: string, busy: string) {
+  const release = tryLock(path);
+  if (!release) throw new Error(busy);
+  return release;
 }
 
-async function staleLock(path: string) {
-  const text = await readFile(path, "utf8").catch(error => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  });
-  if (text === undefined) return true;
-  let pid: unknown;
-  try { pid = (JSON.parse(text) as { pid?: unknown }).pid; } catch {}
-  if (typeof pid === "number") {
-    try { process.kill(pid, 0); return false; }
-    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+// Loading node:sqlite prints an ExperimentalWarning on every CLI run; this use is stable.
+function sqlite() {
+  const emit = process.emitWarning;
+  process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
+    if (!String(warning).startsWith("SQLite is an experimental feature"))
+      (emit as (...args: unknown[]) => void).call(process, warning, ...rest);
+  }) as typeof process.emitWarning;
+  try {
+    return process.getBuiltinModule("node:sqlite");
+  } finally {
+    process.emitWarning = emit;
   }
-  const info = await stat(path).catch(() => undefined);
-  return !info || Date.now() - info.mtimeMs > ABANDONED_LOCK_MS;
 }

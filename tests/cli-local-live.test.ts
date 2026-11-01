@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { acquireLock } from "../cli/atomic.ts";
 import { createApp } from "../server/app.ts";
 
 async function runCli(args: string[], environment: Record<string, string>, approve?: (code: string) => Promise<void>, expectedExit = 0) {
@@ -252,12 +253,11 @@ test("local remove deletes through device authentication and other computers pre
     const queuedDraft = await request("/api/skills", { name: "queued-copy", title: "Queued copy", files: [{ path: "SKILL.md", content: queuedContent }] });
     await request(`/api/skills/${queuedDraft.id}/publish`, {});
     await runCli(["sync"], clients[0].environment, undefined, 1);
-    const lock = join(clients[0].home, "worker-sync.lock");
-    await writeFile(lock, JSON.stringify({ pid: process.pid }));
+    const release = acquireLock(join(clients[0].home, "worker-sync.lock.sqlite"), "busy");
     const queuedOutput = await runCli(["local", "remove", "queued-copy"], clients[0].environment);
     assert.match(queuedOutput, /active sync worker will finish local removal/);
     assert.equal(await readFile(join(clients[0].target, "queued-copy/SKILL.md"), "utf8"), queuedContent);
-    await rm(lock);
+    release();
     await runCli(["sync"], clients[0].environment, undefined, 1);
     assert.equal(await lstat(join(clients[0].target, "queued-copy")).catch(() => null), null);
   } finally {

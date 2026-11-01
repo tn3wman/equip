@@ -1,8 +1,9 @@
-import { link, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, platform as hostPlatform } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { tryLock } from "./atomic.ts";
 
 const xml = (value: string) =>
   value
@@ -207,70 +208,28 @@ export async function enableService(
 }
 /**
  * Serializes service lifecycle changes (install, upgrade, disconnect) across
- * processes through `service.lock`. With `wait`, polls until the lock is free;
- * otherwise returns undefined without running `work` while another live
- * process holds it. A lock file stays empty for a moment after creation, so
- * an empty one counts as held until it is stale. Each holder releases only the
- * lock carrying its own token.
+ * processes through an OS file lock. With `wait`, polls until the lock is free;
+ * otherwise returns undefined without running `work` while another holder has it.
  */
 export async function withServiceLock<T>(
   equipHome: string,
   work: () => Promise<T>,
   wait = false,
 ): Promise<T | undefined> {
-  const path = join(equipHome, "service.lock");
-  const token = randomUUID();
+  const path = join(equipHome, "service.lock.sqlite");
   await mkdir(equipHome, { recursive: true });
   const deadline = Date.now() + 120_000;
-  let lock;
-  while (!lock) {
-    lock = await open(path, "wx", 0o600).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "EEXIST") throw error;
-      return undefined;
-    });
-    if (lock) break;
-    // The holder may release between the failed open and these reads; retry.
-    const observed = await Promise.all([readFile(path, "utf8"), stat(path)]).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      },
-    );
-    if (!observed) continue;
-    const [owner, info] = observed;
-    // Empty or partial contents mean unknown ownership: held until stale.
-    let pid = 0;
-    try {
-      pid = Number(JSON.parse(owner).pid) || 0;
-    } catch {}
-    if (!(pid ? isAlive(pid) : Date.now() - info.mtimeMs < 60_000)) {
-      // Reclaim only the stale file observed above. Two processes reclaiming
-      // a crashed holder's lock in the same instant could still both proceed.
-      const current = await stat(path).catch(() => undefined);
-      if (current?.ino === info.ino && current.mtimeMs === info.mtimeMs)
-        await rm(path, { force: true });
-      continue;
-    }
+  let release;
+  while (!(release = tryLock(path))) {
     if (!wait) return undefined;
     if (Date.now() > deadline)
       throw new Error("Another Equip service change is still running; try again.");
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   try {
-    await lock.writeFile(JSON.stringify({ pid: process.pid, token }));
     return await work();
   } finally {
-    await lock.close();
-    const holder = await readFile(path, "utf8").catch(() => "");
-    if (holder.includes(token)) await rm(path, { force: true });
-  }
-}
-function isAlive(pid: number) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    release();
   }
 }
 

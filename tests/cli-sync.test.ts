@@ -8,6 +8,7 @@ import { dirname, join, relative } from "node:path";
 import test from "node:test";
 import type { DesiredState, Skill } from "../shared/types.ts";
 import { synchronize as synchronizeRaw } from "../cli/sync.ts";
+import { acquireLock } from "../cli/atomic.ts";
 import { sameFileHashes, sameInstalledFileHashes } from "../cli/file-state.ts";
 
 const synchronize = (
@@ -412,76 +413,15 @@ test("replace archives conflicts and removal deletes only unchanged owned instal
   await assert.rejects(readFile(join(target, "demo/SKILL.md")));
 });
 
-test("active lock prevents concurrent replay", async () => {
-  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
-  const home = join(root, "state");
-  await import("node:fs/promises").then((fs) =>
-    fs
-      .mkdir(home, { recursive: true })
-      .then(() =>
-        fs.writeFile(
-          join(home, "sync.lock"),
-          JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
-        ),
-      ),
-  );
-  await assert.rejects(
-    synchronize(
-      desired([skill("one")]),
-      [{ id: "codex", path: join(root, "agent") }],
-      home,
-    ),
-    /already running/,
-  );
-});
-
-test("stale interrupted lock is recovered", async () => {
-  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
-  const home = join(root, "state");
-  await import("node:fs/promises").then((fs) =>
-    fs
-      .mkdir(home, { recursive: true })
-      .then(() =>
-        fs.writeFile(
-          join(home, "sync.lock"),
-          JSON.stringify({ pid: 999999, createdAt: 1 }),
-        ),
-      ),
-  );
-  const receipts = await synchronize(
-    desired([skill("one")]),
-    [{ id: "codex", path: join(root, "agent") }],
-    home,
-  );
-  assert.equal(receipts[0].status, "synchronized");
-});
-
-test("an empty lock left by a killed process does not block later syncs", async () => {
+test("a held lock prevents concurrent replay until released", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const home = join(root, "state");
   await mkdir(home, { recursive: true });
-  // A process killed between creating the lock and writing its owner leaves an empty file.
-  const lock = join(home, "sync.lock");
-  await writeFile(lock, "");
-  const past = new Date(Date.now() - 60_000);
-  await fsPromises.utimes(lock, past, past);
-  const receipts = await synchronize(
-    desired([skill("one")]),
-    [{ id: "codex", path: join(root, "agent") }],
-    home,
-  );
-  assert.equal(receipts[0].status, "synchronized");
-});
-
-test("a freshly created empty lock still counts as held", async () => {
-  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
-  const home = join(root, "state");
-  await mkdir(home, { recursive: true });
-  await writeFile(join(home, "sync.lock"), "");
-  await assert.rejects(
-    synchronize(desired([skill("one")]), [{ id: "codex", path: join(root, "agent") }], home),
-    /already running/,
-  );
+  const release = acquireLock(join(home, "sync.lock.sqlite"), "busy");
+  const sync = () => synchronize(desired([skill("one")]), [{ id: "codex", path: join(root, "agent") }], home);
+  await assert.rejects(sync(), /already running/);
+  release();
+  assert.equal((await sync())[0].status, "synchronized");
 });
 
 test("invalid desired path fails without replacing last good files", async () => {
