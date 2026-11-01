@@ -20,7 +20,6 @@ export async function renameReplacing(from: string, to: string, attempts = 20) {
 }
 
 // An unreadable lock is held only while it may still be mid-creation by an older CLI.
-// The reclaim guard is held for a few file operations, so an older one is abandoned.
 const ABANDONED_LOCK_MS = 10_000;
 
 /**
@@ -34,28 +33,12 @@ export async function acquireLock(path: string, busy: string): Promise<() => Pro
   const staged = await stage(path, token);
   try {
     if (await claim(staged, path)) return releaser(path, token);
-    // Two processes can both observe the same stale lock. Reclaiming under a guard, and
-    // judging staleness again inside it, keeps the second from deleting the first's new lock.
-    const guard = `${path}.reclaim`;
-    const guardStaged = await stage(guard, token);
-    try {
-      if (!(await claim(guardStaged, guard))) {
-        const info = await stat(guard).catch(() => undefined);
-        if (info && Date.now() - info.mtimeMs <= ABANDONED_LOCK_MS) throw new Error(busy);
-        await rm(guard, { force: true });
-        if (!(await claim(guardStaged, guard))) throw new Error(busy);
-      }
-      try {
-        if (!(await staleLock(path))) throw new Error(busy);
-        await rm(path, { force: true });
-        if (!(await claim(staged, path))) throw new Error(busy);
-        return releaser(path, token);
-      } finally {
-        await rm(guard, { force: true });
-      }
-    } finally {
-      await rm(guardStaged, { force: true });
-    }
+    if (!(await staleLock(path))) throw new Error(busy);
+    // Like the locks this replaces, two processes reclaiming the same stale lock in the same
+    // instant can both proceed; tn3wman/equip#28 tracks replacing this with an OS-level lock.
+    await rm(path, { force: true });
+    if (await claim(staged, path)) return releaser(path, token);
+    throw new Error(busy);
   } finally {
     await rm(staged, { force: true });
   }

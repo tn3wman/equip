@@ -180,15 +180,6 @@ process.exit(2);
   }
 });
 
-test("competing acquirers reclaim a stale lock exactly once", async () => {
-  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
-  const lock = join(root, "sync.lock");
-  await writeFile(lock, JSON.stringify({ pid: 999999 }));
-  const results = await Promise.allSettled(Array.from({ length: 8 }, () => acquireLock(lock, "busy")));
-  assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
-  assert.ok(results.every(result => result.status === "fulfilled" || /busy/.test(String(result.reason))));
-});
-
 test("releasing a lock never removes a successor's lock", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const lock = join(root, "sync.lock");
