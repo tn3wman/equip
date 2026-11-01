@@ -4,7 +4,6 @@ import {
   cp,
   lstat,
   mkdir,
-  open,
   readFile,
   readdir,
   readlink,
@@ -24,7 +23,7 @@ import type {
   SkillFile,
 } from "../shared/types.ts";
 import type { RecoveryArchive } from "./recovery.ts";
-import { renameReplacing } from "./atomic.ts";
+import { acquireLock, renameReplacing } from "./atomic.ts";
 
 export interface AgentTarget {
   id: string;
@@ -930,28 +929,8 @@ export async function synchronize(
   archive?: RecoveryArchive,
 ): Promise<Receipt[]> {
   await mkdir(home, { recursive: true });
-  const lockPath = join(home, "sync.lock");
-  let lock;
+  const release = await acquireLock(join(home, "sync.lock"), "A synchronization is already running");
   try {
-    lock = await open(lockPath, "wx", 0o600);
-  } catch {
-    const owner = JSON.parse(
-      await readFile(lockPath, "utf8").catch(() => "{}"),
-    ) as { pid?: number };
-    let alive = false;
-    if (owner.pid)
-      try {
-        process.kill(owner.pid, 0);
-        alive = true;
-      } catch {}
-    if (alive) throw new Error("A synchronization is already running");
-    await rm(lockPath, { force: true });
-    lock = await open(lockPath, "wx", 0o600);
-  }
-  try {
-    await lock.writeFile(
-      JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
-    );
     try {
       await recover(home, archive);
     } catch (error) {
@@ -1337,7 +1316,6 @@ export async function synchronize(
       }
     return receipts;
   } finally {
-    await lock.close();
-    await rm(lockPath, { force: true });
+    await release();
   }
 }

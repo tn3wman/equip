@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, cp, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import type { DesiredState, InstructionFilename, InstructionLocation, Instructions, Receipt, SkillFile } from '../shared/types.ts';
 import { skillRevision } from '../shared/library.ts';
@@ -8,7 +8,7 @@ import { portableFilesRevision } from './file-state.ts';
 import { discoverConfigurationRoots, type ProfileDiscoveryOptions } from './profiles.ts';
 import type { RecoveryArchive } from './recovery.ts';
 import type { AgentTarget } from './sync.ts';
-import { renameReplacing } from './atomic.ts';
+import { acquireLock, renameReplacing } from './atomic.ts';
 
 const limit = 256 * 1024;
 interface Entry { skillId: string; agent: string; profile?: string; project?: string; path: string; filename: InstructionFilename; revision: string; hash: string; portableHash?: string; pointer?: string; observed?: boolean; originalBackup?: string; transaction?: string }
@@ -320,16 +320,8 @@ export async function syncLocalInstructions(home: string, locations: Instruction
 
 export async function synchronizeInstructions(desired: DesiredState, locations: InstructionLocation[], home: string, deviceId?: string, archive?:RecoveryArchive): Promise<Receipt[]> {
   await mkdir(home,{recursive:true});
-  const lockPath = join(home,'instructions-sync.lock');
-  let lock;
-  try {lock = await open(lockPath,'wx',0o600);}
-  catch {
-    const owner = await json<{pid?:number}>(lockPath,{});
-    if (owner.pid) {try {process.kill(owner.pid,0);throw new Error('Instruction synchronization is already running');} catch (e) {if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e;}}
-    await rm(lockPath,{force:true});lock = await open(lockPath,'wx',0o600);
-  }
+  const release = await acquireLock(join(home,'instructions-sync.lock'),'Instruction synchronization is already running');
   try {
-    await lock.writeFile(JSON.stringify({pid:process.pid}));
     const ledger = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
     const targetsFor = (doc: Instructions) => locations.filter(l =>
       !excludedDestination(desired, l) && instructionEnabled(doc,l,deviceId) &&
@@ -587,5 +579,5 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         if(!used)await rm(path,{recursive:true,force:true});
       }
     return receipts;
-  } finally {await lock.close();await rm(lockPath,{force:true});}
+  } finally {await release();}
 }

@@ -456,6 +456,34 @@ test("stale interrupted lock is recovered", async () => {
   assert.equal(receipts[0].status, "synchronized");
 });
 
+test("an empty lock left by a killed process does not block later syncs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
+  const home = join(root, "state");
+  await mkdir(home, { recursive: true });
+  // A process killed between creating the lock and writing its owner leaves an empty file.
+  const lock = join(home, "sync.lock");
+  await writeFile(lock, "");
+  const past = new Date(Date.now() - 60_000);
+  await fsPromises.utimes(lock, past, past);
+  const receipts = await synchronize(
+    desired([skill("one")]),
+    [{ id: "codex", path: join(root, "agent") }],
+    home,
+  );
+  assert.equal(receipts[0].status, "synchronized");
+});
+
+test("a freshly created empty lock still counts as held", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
+  const home = join(root, "state");
+  await mkdir(home, { recursive: true });
+  await writeFile(join(home, "sync.lock"), "");
+  await assert.rejects(
+    synchronize(desired([skill("one")]), [{ id: "codex", path: join(root, "agent") }], home),
+    /already running/,
+  );
+});
+
 test("invalid desired path fails without replacing last good files", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
   const target = join(root, "agent");

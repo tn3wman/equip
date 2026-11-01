@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -29,7 +29,7 @@ import { getDesired } from "./desired.ts";
 import { consolidate } from "./consolidate.ts";
 import type { RecoveryArchive } from "./recovery.ts";
 import { discoverInstructionLocations, supportedInstructionLocations, synchronizeInstructions, syncLocalInstructions } from "./instructions.ts";
-import { renameReplacing } from "./atomic.ts";
+import { acquireLock, renameReplacing } from "./atomic.ts";
 
 const exec = promisify(execFile);
 const run = (file: string, commandArgs: string[]) => exec(file, commandArgs);
@@ -340,19 +340,9 @@ async function maybeUpdate(s: State) {
 }
 async function runSync(s: State) {
   await mkdir(equipHome,{recursive:true});
-  const path = join(equipHome,'worker-sync.lock');
-  let lock;
-  try {lock = await open(path,'wx',0o600);}
-  catch {
-    const owner = JSON.parse(await readFile(path,'utf8').catch(() => '{}'));
-    if (owner.pid) {
-      try {process.kill(owner.pid,0);throw new Error('Equip synchronization is already running.');}
-      catch(error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;}
-    }
-    await rm(path,{force:true});lock=await open(path,'wx',0o600);
-  }
-  try {await lock.writeFile(JSON.stringify({pid:process.pid}));return await applyState(s);}
-  finally {await lock.close();await rm(path,{force:true});}
+  const release = await acquireLock(join(equipHome,'worker-sync.lock'),'Equip synchronization is already running.');
+  try {return await applyState(s);}
+  finally {await release();}
 }
 function receiptFailureSummary(desired: DesiredState, receipts: Receipt[]) {
   const names = new Map([
