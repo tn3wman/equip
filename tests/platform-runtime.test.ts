@@ -202,7 +202,8 @@ test("a killed holder never blocks, and racing processes get exactly one holder"
   const lock = join(root, "sync.lock.sqlite");
   const module = pathToFileURL(join(import.meta.dirname, "../cli/atomic.ts")).href;
   const source = `import(${JSON.stringify(module)}).then(({ tryLock }) => {
-    console.log(tryLock(${JSON.stringify(lock)}) ? "held" : "busy");
+    globalThis.release = tryLock(${JSON.stringify(lock)});
+    console.log(globalThis.release ? "held" : "busy");
     setInterval(() => {}, 1000);
   });`;
   const children: ChildProcess[] = [];
@@ -221,6 +222,8 @@ test("a killed holder never blocks, and racing processes get exactly one holder"
     await kill(children.pop()!);
     const outcomes = await Promise.all(Array.from({ length: 8 }, contend));
     assert.deepEqual(outcomes.sort(), ["busy", "busy", "busy", "busy", "busy", "busy", "busy", "held"]);
+    // The winner still holds it after every contender has answered.
+    assert.equal(tryLock(lock), undefined);
   } finally {
     await Promise.all(children.map(kill));
     await rm(root, { recursive: true, force: true });
