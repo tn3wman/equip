@@ -29,6 +29,14 @@ If a CLI update fails, `equip status` reports `lastUpdateError`. Skills continue
 
 `equip status` reports conflicted destinations in `lastError` and keeps `lastSync` at the last complete sweep. `equip sync` exits nonzero when any destination fails or conflicts.
 
+## T3 Code
+
+T3 uses its native Codex and Claude providers to load instructions and skills. Equip discovers their homes from T3's `providerInstances`, using `T3CODE_HOME/userdata/settings.json` when set and `~/.t3/userdata/settings.json` otherwise. Enabled providers with omitted enablement or default homes are included. An explicit provider home takes precedence over its `CODEX_HOME` or `CLAUDE_CONFIG_DIR` environment override. Codex shadow homes and their shared configuration homes are both discovered; linked skill directories remain one physical sync target.
+
+Global instructions synchronize as `AGENTS.md` for Codex and `CLAUDE.md` for Claude. Skills use the installed Vercel Skills integration's native destinations, including shared discovery where supported. There is no separate T3 copy of the policy or skill library. Project instructions stay local and additive. Restart a provider session after changing global instructions; a sync receipt proves the files are installed, not that an already-running agent has reloaded or obeyed them.
+
+Run `equip sync`, then inspect the device's instruction locations and receipts in Equip. A conflicting local file or an `AGENTS.override.md` takes review rather than silent replacement. Check the provider's effective home when a skill appears in an ordinary CLI but not in T3. T3 settings must be readable by the Equip worker on the same computer; nonstandard service data directories need `T3CODE_HOME` in the worker environment too. Detection reads home settings without copying provider credentials or changing T3 account selection.
+
 ## Local improvement loop
 
 CLI release 1.1.10 adds a local evidence ledger for task outcomes, explicit user feedback, and repeated baseline/candidate evaluations. It requires Node.js 22.20.0 or newer and uses built-in `node:sqlite` without new dependencies. Run `equip improve help` and confirm `feature: "improvement-loop"` before use; older CLIs may return status output instead.
