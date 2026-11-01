@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile, rename } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile, rename } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { acquireLock } from "../cli/atomic.ts";
 import { replaceExecutable, runNpmCommand } from "../cli/update.ts";
 import { powershellInstaller, shellInstaller } from "../server/installers.ts";
 
@@ -177,4 +178,37 @@ process.exit(2);
     await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("competing acquirers reclaim a stale lock exactly once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
+  const lock = join(root, "sync.lock");
+  await writeFile(lock, JSON.stringify({ pid: 999999 }));
+  const results = await Promise.allSettled(Array.from({ length: 8 }, () => acquireLock(lock, "busy")));
+  assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+  assert.ok(results.every(result => result.status === "fulfilled" || /busy/.test(String(result.reason))));
+});
+
+test("releasing a lock never removes a successor's lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
+  const lock = join(root, "sync.lock");
+  const release = await acquireLock(lock, "busy");
+  const successor = JSON.stringify({ pid: process.pid, token: "successor" });
+  await rm(lock);
+  await writeFile(lock, successor);
+  await release();
+  assert.equal(await readFile(lock, "utf8"), successor);
+});
+
+test("an abandoned empty lock is reclaimed, but a fresh one is still held", async () => {
+  const root = await mkdtemp(join(tmpdir(), "equip-test-"));
+  const lock = join(root, "sync.lock");
+  await writeFile(lock, "");
+  await assert.rejects(acquireLock(lock, "busy"), /busy/);
+  const past = new Date(Date.now() - 60_000);
+  await utimes(lock, past, past);
+  const release = await acquireLock(lock, "busy");
+  assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, process.pid);
+  await release();
+  await assert.rejects(stat(lock));
 });

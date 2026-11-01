@@ -20,7 +20,8 @@ export async function renameReplacing(from: string, to: string, attempts = 20) {
 }
 
 // An unreadable lock is held only while it may still be mid-creation by an older CLI.
-const UNREADABLE_LOCK_GRACE_MS = 10_000;
+// The reclaim guard is held for a few file operations, so an older one is abandoned.
+const ABANDONED_LOCK_MS = 10_000;
 
 /**
  * Takes an exclusive lock file that always contains its owner. The owner is written to a
@@ -29,23 +30,59 @@ const UNREADABLE_LOCK_GRACE_MS = 10_000;
  * sync. Returns the release function, or throws `busy` while a live process holds the lock.
  */
 export async function acquireLock(path: string, busy: string): Promise<() => Promise<void>> {
-  const staged = `${path}.${randomUUID()}.tmp`;
-  await writeFile(staged, JSON.stringify({ pid: process.pid, createdAt: Date.now() }), { mode: 0o600 });
+  const token = randomUUID();
+  const staged = await stage(path, token);
   try {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    if (await claim(staged, path)) return releaser(path, token);
+    // Two processes can both observe the same stale lock. Reclaiming under a guard, and
+    // judging staleness again inside it, keeps the second from deleting the first's new lock.
+    const guard = `${path}.reclaim`;
+    const guardStaged = await stage(guard, token);
+    try {
+      if (!(await claim(guardStaged, guard))) {
+        const info = await stat(guard).catch(() => undefined);
+        if (info && Date.now() - info.mtimeMs <= ABANDONED_LOCK_MS) throw new Error(busy);
+        await rm(guard, { force: true });
+        if (!(await claim(guardStaged, guard))) throw new Error(busy);
+      }
       try {
-        await link(staged, path);
-        return () => rm(path, { force: true });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         if (!(await staleLock(path))) throw new Error(busy);
         await rm(path, { force: true });
+        if (!(await claim(staged, path))) throw new Error(busy);
+        return releaser(path, token);
+      } finally {
+        await rm(guard, { force: true });
       }
+    } finally {
+      await rm(guardStaged, { force: true });
     }
-    throw new Error(busy);
   } finally {
     await rm(staged, { force: true });
   }
+}
+
+async function stage(path: string, token: string) {
+  const staged = `${path}.${randomUUID()}.tmp`;
+  await writeFile(staged, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), { mode: 0o600 });
+  return staged;
+}
+
+async function claim(staged: string, path: string) {
+  try {
+    await link(staged, path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+/** Removes the lock only while it is still this owner's, never a successor's. */
+function releaser(path: string, token: string) {
+  return async () => {
+    const holder = await readFile(path, "utf8").catch(() => "");
+    if (holder.includes(token)) await rm(path, { force: true });
+  };
 }
 
 async function staleLock(path: string) {
@@ -61,5 +98,5 @@ async function staleLock(path: string) {
     catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
   }
   const info = await stat(path).catch(() => undefined);
-  return !info || Date.now() - info.mtimeMs > UNREADABLE_LOCK_GRACE_MS;
+  return !info || Date.now() - info.mtimeMs > ABANDONED_LOCK_MS;
 }
