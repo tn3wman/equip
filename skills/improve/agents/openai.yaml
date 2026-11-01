@@ -1,3 +1,4 @@
 interface:
   display_name: "Improve"
   short_description: "Record outcomes and test agent workflow changes"
+  default_prompt: "Use $improve to record this run, diagnose a recurring agent failure, or test an instruction or skill change against its baseline."
