@@ -39,6 +39,11 @@ test('two computers install identical instruction revisions, update, rollback, a
  const removed=await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(removed[0].status,'synchronized');assert.equal(await lstat(a.path).catch(()=>null),null);
 });
 
+test('an empty instruction lock left by a killed process does not block later syncs',async t=>{
+ const {state,a}=await fixture(t);await mkdir(state,{recursive:true});
+ const lock=join(state,'instructions-sync.lock');await writeFile(lock,'');const past=new Date(Date.now()-60_000);await fsPromises.utimes(lock,past,past);
+ assert.equal((await synchronizeInstructions(desired(doc()),[a],state))[0].status,'synchronized');
+});
 test('matching preexisting instructions become owned managed links and are removed without backups',async t=>{
  const {state,a}=await fixture(t);const policy=doc('Original\n','AGENTS.md',0o640);await writeFile(a.path,'Original\n',{mode:0o640});
  let result=await synchronizeInstructions(desired(policy),[a],state);assert.equal(result[0].status,'synchronized');assert.ok((await lstat(a.path)).isSymbolicLink());
