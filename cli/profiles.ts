@@ -1,6 +1,6 @@
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import {
   getCompatibility,
   getDetectedAgents,
@@ -61,7 +61,18 @@ interface T3Profile {
   profile: string;
 }
 
-async function t3Profiles(home: string, settingsPath: string) {
+function homePath(home: string, value: string) {
+  const configured = value.trim();
+  return configured === "~" ? home : configured.startsWith("~/")
+    ? resolve(home, configured.slice(2)) : resolve(home, configured);
+}
+
+function t3Settings(home: string, environment: NodeJS.ProcessEnv, explicit?: string) {
+  return explicit ?? join(environment.T3CODE_HOME?.trim()
+    ? homePath(home, environment.T3CODE_HOME) : join(home, ".t3"), "userdata/settings.json");
+}
+
+async function t3Profiles(home: string, settingsPath: string, environment: NodeJS.ProcessEnv) {
   const settings = await readFile(settingsPath, "utf8")
     .then((content) => JSON.parse(content) as unknown)
     .catch((error) => {
@@ -80,34 +91,26 @@ async function t3Profiles(home: string, settingsPath: string) {
   for (const value of values) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     const instance = value as Record<string, unknown>;
-    if (instance.enabled !== true) continue;
-    const id =
-      instance.driver === "claudeAgent"
-        ? "claude-code"
-        : instance.driver === "codex"
-          ? "codex"
-          : undefined;
-    const config = instance.config;
-    const rawHome =
-      config && typeof config === "object" && !Array.isArray(config)
-        ? (config as Record<string, unknown>).homePath
-        : undefined;
-    if (!id || typeof rawHome !== "string" || !rawHome.trim()) continue;
-    const configured = rawHome.trim();
-    const root = configured.startsWith("~/")
-      ? resolve(home, configured.slice(2))
-      : isAbsolute(configured)
-        ? resolve(configured)
-        : resolve(home, configured);
-    const displayName =
-      typeof instance.displayName === "string"
-        ? instance.displayName.trim()
-        : "";
-    profiles.push({
-      id,
-      root,
-      profile: displayName || basename(root).replace(/^\.+/, "") || "custom",
-    });
+    if (instance.enabled === false) continue;
+    const specification = profileAgents.find(agent => instance.driver ===
+      (agent.id === "claude-code" ? "claudeAgent" : "codex"));
+    if (!specification) continue;
+    const config = instance.config && typeof instance.config === "object" && !Array.isArray(instance.config)
+      ? instance.config as Record<string, unknown> : {};
+    const configured = typeof config.homePath === "string" ? config.homePath.trim() : "";
+    const variables = Array.isArray(instance.environment) ? instance.environment : [];
+    const override = variables.find(value => value && typeof value === "object" &&
+      value.name === specification.variable && !value.valueRedacted && typeof value.value === "string");
+    const inherited = override ? override.value.trim() : environment[specification.variable]?.trim();
+    // Codex overlays share configuration/state from homePath but run in the
+    // shadow home. Keep both roots, with distinct instruction ledger identities.
+    const shadow = specification.id === "codex" && typeof config.shadowHomePath === "string"
+      ? config.shadowHomePath.trim() : "";
+    const shared = homePath(home, configured || (shadow ? specification.prefix : inherited || specification.prefix));
+    const displayName = typeof instance.displayName === "string" ? instance.displayName.trim() : "";
+    const profile = displayName || basename(shared).replace(/^\.+/, "") || "custom";
+    profiles.push({id:specification.id,root:shared,profile});
+    if (shadow) profiles.push({id:specification.id,root:homePath(home,shadow),profile:profile+" (shadow)"});
   }
   return profiles;
 }
@@ -124,7 +127,7 @@ export async function discoverConfigurationRoots(options: ProfileDiscoveryOption
   const environment = options.environment ?? (options.home ? {} : process.env);
   const [entries, configuredProfiles] = await Promise.all([
     readdir(home, { withFileTypes: true }).catch(() => []),
-    t3Profiles(home, options.t3SettingsPath ?? join(home, ".t3/userdata/settings.json")),
+    t3Profiles(home, t3Settings(home, environment, options.t3SettingsPath), environment),
   ]);
   const result: ConfigurationRoot[] = [];
   for (const specification of profileAgents) {
@@ -169,7 +172,8 @@ export async function discoverAgentProfiles(
     readdir(home, { withFileTypes: true }).catch(() => []),
     t3Profiles(
       home,
-      options.t3SettingsPath ?? join(home, ".t3/userdata/settings.json"),
+      t3Settings(home, environment, options.t3SettingsPath),
+      environment,
     ),
   ]);
   const specializedIds = new Set<string>(profileAgents.map((agent) => agent.id));

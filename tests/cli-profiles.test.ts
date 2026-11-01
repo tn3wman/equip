@@ -10,7 +10,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { discoverAgentProfiles } from "../cli/profiles.ts";
+import { discoverAgentProfiles, discoverConfigurationRoots } from "../cli/profiles.ts";
+import { discoverInstructionLocations, synchronizeInstructions } from "../cli/instructions.ts";
+import { skillRevision } from "../shared/library.ts";
+import type { Instructions } from "../shared/types.ts";
 import { synchronize } from "../cli/sync.ts";
 
 test("profile discovery finds conventional and suffixed agent homes", async () => {
@@ -260,4 +263,68 @@ test("a deleted profile is absent on the next scan and its clean ledger entry is
       .length,
     0,
   );
+});
+
+
+test("T3 custom data home, default enablement, and provider environment homes drive both discoveries", async t => {
+  const home = await mkdtemp(join(tmpdir(), "equip-t3-homes-"));
+  t.after(() => rm(home, {recursive:true,force:true}));
+  const data = join(home, "t3 custom");
+  const roots = ["codex-env", "claude-env", "claude-config", "ignored-env", "disabled"];
+  for (const root of roots) await mkdir(join(home, root, "skills"), {recursive:true});
+  await mkdir(join(data, "userdata"), {recursive:true});
+  await writeFile(join(data,"userdata/settings.json"), JSON.stringify({providerInstances:{
+    codex:{driver:"codex", displayName:"Code", config:{homePath:""}, environment:[{name:"CODEX_HOME", value:"~/codex-env"}]},
+    claude:{driver:"claudeAgent", enabled:true, displayName:"Chat", environment:[{name:"CLAUDE_CONFIG_DIR", value:"~/claude-env"}]},
+    configured:{driver:"claudeAgent", enabled:true, config:{homePath:"~/claude-config"}, environment:[{name:"CLAUDE_CONFIG_DIR", value:"~/ignored-env"}]},
+    disabled:{driver:"codex",enabled:false,config:{homePath:"~/disabled"}}
+  }}));
+  const options={home,environment:{T3CODE_HOME:"~/t3 custom"}};
+  const configs = await discoverConfigurationRoots(options);
+  const profiles = await discoverAgentProfiles(options);
+  for (const [id,root] of [["codex","codex-env"],["claude-code","claude-env"],["claude-code","claude-config"]]) {
+    assert.ok(configs.some(c=>c.id===id&&c.root===join(home,root)), root+" instructions");
+    assert.ok(profiles.some(c=>c.id===id&&c.globalPath===join(home,root,"skills")),root+" skills");
+  }
+  for (const root of ["ignored-env","disabled"]) assert.ok(!configs.some(c=>c.root===join(home,root)));
+  const override=join(home,"override.json");await writeFile(override,'{}');
+  assert.equal((await discoverConfigurationRoots({...options,t3SettingsPath:override})).length,0);
+});
+
+test("T3 Codex shared and effective shadow homes get distinct instruction identities and shared skill aliases", async t => {
+  const home=await mkdtemp(join(tmpdir(),"equip-t3-shadow-"));t.after(()=>rm(home,{recursive:true,force:true}));
+  const shared=join(home,"client-code"),shadow=join(home,"client-auth");
+  await mkdir(join(shared,"skills"),{recursive:true});await mkdir(shadow);
+  await symlink(join(shared,"skills"),join(shadow,"skills"));
+  const settings=join(home,"settings.json");await writeFile(settings,JSON.stringify({providerInstances:{work:{driver:"codex",enabled:true,displayName:"Work",config:{homePath:shared,shadowHomePath:shadow},environment:[{name:"CODEX_HOME",value:join(home,"ignored")} ]}}}));
+  const options={home,environment:{},t3SettingsPath:settings};
+  const configs=await discoverConfigurationRoots(options);
+  assert.ok(configs.some(c=>c.root===shared));assert.ok(configs.some(c=>c.root===shadow));
+  assert.equal(new Set(configs.map(c=>c.profile)).size,2,"distinct ledger identities");
+  const locations=await discoverInstructionLocations([],options);
+  const files=[{path:"AGENTS.md",content:"# Shared T3 policy\n"}];
+  const policy:Instructions={id:"t3-policy",title:"Policy",filename:"AGENTS.md",scope:"global",selected:true,enabled:true,revision:skillRevision(files),files,versions:[],targets:[],updatedAt:new Date().toISOString()};
+  const state=join(home,"equip-state");
+  const receipts=await synchronizeInstructions({generation:1,skills:[],resolutions:{},instructions:[policy]},locations,state);
+  assert.equal(receipts.length,2);assert.ok(receipts.every(r=>r.status==='synchronized'));
+  for(const root of [shared,shadow]) assert.equal(await readFile(join(root,"AGENTS.md"),"utf8"),files[0].content);
+  assert.equal(Object.keys(JSON.parse(await readFile(join(state,"instructions-ledger.json"),"utf8")).installs).length,2);
+  const profiles=(await discoverAgentProfiles(options)).filter(p=>p.id==='codex');
+  assert.equal(profiles.length,1);assert.deepEqual(profiles[0].aliases?.map(a=>a.path),[join(shared,'skills'),join(shadow,'skills')]);
+});
+
+
+test("empty T3 environment home overrides retain native defaults alongside worker homes", async t => {
+  const home=await mkdtemp(join(tmpdir(),"equip-t3-empty-"));t.after(()=>rm(home,{recursive:true,force:true}));
+  for(const root of ['.codex','.claude','worker-code','worker-chat']) await mkdir(join(home,root,'skills'),{recursive:true});
+  const settings=join(home,'settings.json');await writeFile(settings,JSON.stringify({providerInstances:{
+    code:{driver:'codex',environment:[{name:'CODEX_HOME',value:''}]},
+    chat:{driver:'claudeAgent',environment:[{name:'CLAUDE_CONFIG_DIR',value:''}]}
+  }}));
+  const options={home,t3SettingsPath:settings,environment:{CODEX_HOME:join(home,'worker-code'),CLAUDE_CONFIG_DIR:join(home,'worker-chat')}};
+  const roots=await discoverConfigurationRoots(options),profiles=await discoverAgentProfiles(options);
+  for(const root of ['.codex','.claude','worker-code','worker-chat']) {
+    assert.ok(roots.some(r=>r.root===join(home,root)));
+    assert.ok(profiles.some(p=>p.globalPath===join(home,root,'skills')));
+  }
 });
