@@ -320,7 +320,7 @@ export async function syncLocalInstructions(home: string, locations: Instruction
 
 export async function synchronizeInstructions(desired: DesiredState, locations: InstructionLocation[], home: string, deviceId?: string, archive?:RecoveryArchive): Promise<Receipt[]> {
   await mkdir(home,{recursive:true});
-  const release = await acquireLock(join(home,'instructions-sync.lock'),'Instruction synchronization is already running');
+  const release = acquireLock(join(home,'instructions-sync.lock.sqlite'),'Instruction synchronization is already running');
   try {
     const ledger = await json<Ledger>(ledgerPath(home),{installs:{},canonicals:{}});
     const targetsFor = (doc: Instructions) => locations.filter(l =>
@@ -579,5 +579,5 @@ export async function synchronizeInstructions(desired: DesiredState, locations: 
         if(!used)await rm(path,{recursive:true,force:true});
       }
     return receipts;
-  } finally {await release();}
+  } finally {release();}
 }

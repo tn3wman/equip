@@ -929,7 +929,7 @@ export async function synchronize(
   archive?: RecoveryArchive,
 ): Promise<Receipt[]> {
   await mkdir(home, { recursive: true });
-  const release = await acquireLock(join(home, "sync.lock"), "A synchronization is already running");
+  const release = acquireLock(join(home, "sync.lock.sqlite"), "A synchronization is already running");
   try {
     try {
       await recover(home, archive);
@@ -1316,6 +1316,6 @@ export async function synchronize(
       }
     return receipts;
   } finally {
-    await release();
+    release();
   }
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import test from "node:test";
-import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -259,24 +259,6 @@ test("Overlapping upgrades run one at a time and the loser leaves state and scri
   assert.equal(await readFile(definition.path, "utf8"), definition.content);
 });
 
-test("An upgrade releases only the lock it holds", async (t) => {
-  const { equipHome, definition, legacy } = await legacyWindowsInstall();
-  t.after(() => rm(equipHome, { recursive: true, force: true }));
-  const lockPath = join(equipHome, "service.lock");
-  const taken = JSON.stringify({ pid: process.pid, token: "another-holder" });
-  await upgrade(equipHome, definition, store(legacy), async () => { await writeFile(lockPath, taken); });
-  assert.equal(await readFile(lockPath, "utf8"), taken);
-});
-
-test("A lock left by a dead process does not block upgrades", async (t) => {
-  const { equipHome, definition, legacy } = await legacyWindowsInstall();
-  t.after(() => rm(equipHome, { recursive: true, force: true }));
-  await writeFile(join(equipHome, "service.lock"), JSON.stringify({ pid: 2 ** 22 + 12345 }));
-  const upgraded = await upgrade(equipHome, definition, store(legacy), recorder(() => false).run);
-  assert.equal(upgraded?.mode, "startup");
-  assert.equal(await exists(join(equipHome, "service.lock")), false);
-});
-
 test("An upgrade that finishes after disconnect unregisters its task and records nothing", async (t) => {
   const { equipHome, definition, legacy } = await legacyWindowsInstall();
   t.after(() => rm(equipHome, { recursive: true, force: true }));
@@ -287,18 +269,6 @@ test("An upgrade that finishes after disconnect unregisters its task and records
   const refusedState = store(legacy, false);
   await upgrade(equipHome, definition, refusedState, recorder(() => true).run);
   assert.equal(refusedState.removed(), 0);
-});
-
-test("A malformed lock is held while fresh and reclaimed once stale", async (t) => {
-  const equipHome = await mkdtemp(join(tmpdir(), "equip-lock-"));
-  t.after(() => rm(equipHome, { recursive: true, force: true }));
-  const lockPath = join(equipHome, "service.lock");
-  await writeFile(lockPath, '{"pid": 12');
-  assert.equal(await withServiceLock(equipHome, async () => "ran"), undefined);
-  const old = new Date(Date.now() - 120_000);
-  await utimes(lockPath, old, old);
-  assert.equal(await withServiceLock(equipHome, async () => "ran"), "ran");
-  assert.equal(await exists(lockPath), false);
 });
 
 test("Install and disconnect wait for an in-flight upgrade instead of interleaving", async (t) => {

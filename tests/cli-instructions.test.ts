@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { discoverInstructionLocations, supportedInstructionLocations, syncLocalInstructions, synchronizeInstructions } from '../cli/instructions.ts';
+import { acquireLock } from '../cli/atomic.ts';
 import { skillRevision } from '../shared/library.ts';
 import { instructionKey } from '../shared/instructions.ts';
 import type { DesiredState, Instructions, InstructionLocation } from '../shared/types.ts';
@@ -39,9 +40,10 @@ test('two computers install identical instruction revisions, update, rollback, a
  const removed=await synchronizeInstructions({...desired(v1),instructions:[]},[a],state);assert.equal(removed[0].status,'synchronized');assert.equal(await lstat(a.path).catch(()=>null),null);
 });
 
-test('an empty instruction lock left by a killed process does not block later syncs',async t=>{
+test('a held instruction lock blocks synchronization until released',async t=>{
  const {state,a}=await fixture(t);await mkdir(state,{recursive:true});
- const lock=join(state,'instructions-sync.lock');await writeFile(lock,'');const past=new Date(Date.now()-60_000);await fsPromises.utimes(lock,past,past);
+ const release=acquireLock(join(state,'instructions-sync.lock.sqlite'),'busy');
+ await assert.rejects(synchronizeInstructions(desired(doc()),[a],state),/already running/);release();
  assert.equal((await synchronizeInstructions(desired(doc()),[a],state))[0].status,'synchronized');
 });
 test('matching preexisting instructions become owned managed links and are removed without backups',async t=>{

@@ -340,9 +340,9 @@ async function maybeUpdate(s: State) {
 }
 async function runSync(s: State) {
   await mkdir(equipHome,{recursive:true});
-  const release = await acquireLock(join(equipHome,'worker-sync.lock'),'Equip synchronization is already running.');
+  const release = acquireLock(join(equipHome,'worker-sync.lock.sqlite'),'Equip synchronization is already running.');
   try {return await applyState(s);}
-  finally {await release();}
+  finally {release();}
 }
 function receiptFailureSummary(desired: DesiredState, receipts: Receipt[]) {
   const names = new Map([

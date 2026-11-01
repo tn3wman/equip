@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile, rename } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { acquireLock } from "../cli/atomic.ts";
+import { tryLock } from "../cli/atomic.ts";
 import { replaceExecutable, runNpmCommand } from "../cli/update.ts";
 import { powershellInstaller, shellInstaller } from "../server/installers.ts";
 
@@ -180,26 +181,51 @@ process.exit(2);
   }
 });
 
-test("releasing a lock never removes a successor's lock", async () => {
+test("a lock is exclusive in one process until released", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
-  const lock = join(root, "sync.lock");
-  const release = await acquireLock(lock, "busy");
-  const successor = JSON.stringify({ pid: process.pid, token: "successor" });
-  await rm(lock);
-  await writeFile(lock, successor);
-  await release();
-  assert.equal(await readFile(lock, "utf8"), successor);
+  try {
+    const lock = join(root, "sync.lock.sqlite");
+    const release = tryLock(lock);
+    assert.ok(release);
+    assert.equal(tryLock(lock), undefined);
+    release();
+    const next = tryLock(lock);
+    assert.ok(next);
+    next();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
-test("an abandoned empty lock is reclaimed, but a fresh one is still held", async () => {
+test("a killed holder never blocks, and racing processes get exactly one holder", async () => {
   const root = await mkdtemp(join(tmpdir(), "equip-test-"));
-  const lock = join(root, "sync.lock");
-  await writeFile(lock, "");
-  await assert.rejects(acquireLock(lock, "busy"), /busy/);
-  const past = new Date(Date.now() - 60_000);
-  await utimes(lock, past, past);
-  const release = await acquireLock(lock, "busy");
-  assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, process.pid);
-  await release();
-  await assert.rejects(stat(lock));
+  const lock = join(root, "sync.lock.sqlite");
+  const module = pathToFileURL(join(import.meta.dirname, "../cli/atomic.ts")).href;
+  const source = `import(${JSON.stringify(module)}).then(({ tryLock }) => {
+    globalThis.release = tryLock(${JSON.stringify(lock)});
+    console.log(globalThis.release ? "held" : "busy");
+    setInterval(() => {}, 1000);
+  });`;
+  const children: ChildProcess[] = [];
+  const contend = () => new Promise<string>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", "-e", source], { stdio: ["ignore", "pipe", "inherit"] });
+    children.push(child);
+    child.once("error", reject);
+    child.stdout!.once("data", data => resolve(String(data).trim()));
+  });
+  const kill = (child: ChildProcess) => new Promise(resolve => {
+    child.once("exit", resolve);
+    child.kill("SIGKILL");
+  });
+  try {
+    assert.equal(await contend(), "held");
+    await kill(children.pop()!);
+    const outcomes = await Promise.all(Array.from({ length: 8 }, contend));
+    assert.deepEqual(outcomes.sort(), ["busy", "busy", "busy", "busy", "busy", "busy", "busy", "held"]);
+    // The winner still holds it after every contender has answered.
+    assert.equal(tryLock(lock), undefined);
+  } finally {
+    await Promise.all(children.map(kill));
+    await rm(root, { recursive: true, force: true });
+  }
 });
