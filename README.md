@@ -83,3 +83,7 @@ Device presence and configuration are stored separately from sync receipts. Loca
 Vercel deployments from `main` are disabled for now; preview branches remain enabled. The existing hosted preview is restricted to personal access. A public repository does not make that instance a public registration service.
 
 Connecting a computer installs into local agent destinations. Separately hosted agent sessions and account skill libraries require their supported import or publishing mechanism; unavailable integrations and native instruction limits are shown explicitly. Account uploads remain manual where no supported publishing API exists.
+
+## License
+
+Equip's source is [MIT licensed](LICENSE).
